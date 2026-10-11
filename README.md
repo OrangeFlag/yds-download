@@ -381,3 +381,14 @@ MiB = 1 048 576 байт; KiB = 1024 байта. `--bandwidth-limit` огран�
 Без флага сохраняется фиксированная параллельность, по умолчанию 2. `--no-auto-concurrency` явно отключает автоматический режим. В очереди: `"tuning": {"auto_concurrency": true, "download_concurrency": 4}`. Скорость 82–93 Мбит/с соответствует примерно 9,8–11,1 МиБ/с.
 
 Документация: https://aria2.github.io/manual/en/html/aria2c.html#cmdoption-optimize-concurrent-downloads
+
+### Личные файлы по публичной ссылке
+
+Для опубликованной папки целиком (включая файлы в корне и подпапки) или одного файла:
+
+```sh
+mkdir -p /absolute/path/backup/folder
+./start.sh /absolute/path/backup/folder --source PUBLIC_URL --root
+```
+
+Для каждой ссылки используйте отдельную папку назначения: состояние привязано к источнику. OAuth не нужен. Сохраняются прежние SHA-256 проверки, продолжение и Range-восстановление. Логи и метаданные находятся в `.download/`; личные файлы и состояние не отправляются в Git. Режим `--root` несовместим с публикацией отчётов о курсах. Каталог для этого режима создаётся командой `python3 download.py catalog --source PUBLIC_URL --root --output catalog.json`.

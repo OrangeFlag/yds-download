@@ -71,8 +71,11 @@ def children(source, path='/'):
             raise RuntimeError('Incomplete directory listing: ' + path)
 
 
-def catalog(source):
+def catalog(source, root_mode=False):
     root = api(source)
+    if root_mode:
+        return dict(source=source, title=root['name'], root=True,
+                    courses=[dict(name='.', enabled=True, url=source)])
     return dict(source=source, title=root['name'], courses=[
         dict(name=item['name'], enabled=True,
              url=source.rstrip('/') + '/' + urllib.parse.quote(item['name'], safe=''))
@@ -98,6 +101,11 @@ def select_courses(data, include, exclude):
 
 
 def files(source, path):
+    if path == '/.':
+        root = api(source)
+        if root['type'] == 'file':
+            return [dict(root, path='/' + root['name'])]
+        path = '/'
     result = []
     for item in children(source, path):
         if item['type'] == 'dir':
@@ -505,11 +513,13 @@ def main():
     listing = commands.add_parser('catalog', help='Generate an editable course catalog')
     listing.add_argument('--source', required=True)
     listing.add_argument('--output', required=True, type=Path)
+    listing.add_argument('--root', action='store_true', help='Select the whole published folder or file')
     fetching = commands.add_parser('download', help='Download selected courses sequentially')
     source = fetching.add_mutually_exclusive_group(required=True)
     source.add_argument('--source')
     source.add_argument('--catalog', type=Path)
     fetching.add_argument('--destination', required=True, type=Path)
+    fetching.add_argument('--root', action='store_true', help='Download the whole published folder or file')
     fetching.add_argument('--include', action='append', help='Exact course name; repeatable')
     fetching.add_argument('--exclude', action='append', default=[], help='Exact course name; repeatable')
     fetching.add_argument('--retry-check', action='store_true', help='Retry independent missing ranges of previous failures before ordinary courses')
@@ -532,7 +542,7 @@ def main():
     os.umask(0o077)
     try:
         if args.command == 'catalog':
-            data = catalog(args.source)
+            data = catalog(args.source, args.root)
             write_json(args.output, data)
             print(f"{data['title']}: {len(data['courses'])} courses → {args.output}")
             return 0
@@ -560,11 +570,15 @@ def main():
         if args.retries < 0:
             raise ValueError('--retries must be non-negative')
         tuning = resolve({name: getattr(args, name) for name in OPTIONS})
-        data = json.loads(args.catalog.read_text(encoding='utf-8')) if args.catalog else catalog(args.source)
+        data = json.loads(args.catalog.read_text(encoding='utf-8')) if args.catalog else catalog(args.source, args.root)
+        if args.root and args.catalog and not data.get('root'):
+            raise ValueError('--root requires a root catalog')
+        if data.get('root') and (args.report_repo or [row['name'] for row in data['courses']] != ['.']):
+            raise ValueError('Root catalogs must contain only . and cannot publish course reports')
         chosen = select_courses(data, args.include, args.exclude)
         if not chosen:
             raise ValueError('No courses selected')
-        if args.catalog:
+        if args.catalog and not data.get('root'):
             available = {item['name'] for item in catalog(data['source'])['courses']}
             if {PurePosixPath(name).parts[0] for name in chosen} - available:
                 raise ValueError('Selected courses no longer exist in the source folder')

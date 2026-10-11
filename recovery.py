@@ -52,7 +52,7 @@ def promote_partial(root, event):
     if (event.get('downloaded_bytes') or 0) * 2 <= event['size']:
         return False
     original_path = Path(event['path'])
-    if (not original_path.is_absolute() or len(original_path.parts) < 3
+    if (not original_path.is_absolute() or len(original_path.parts) < 2
             or '..' in original_path.parts or original_path.parts[1] in ('.download', 'corrupted')):
         raise ValueError('Unsafe recovered destination')
     original = root.joinpath(*original_path.parts[1:])
@@ -293,7 +293,7 @@ def reconcile_course(root, course):
                 local = Path(row['local'])
                 if local.exists() and (local.stat().st_size, local.stat().st_mtime_ns) == (row['size'], row['mtime_ns']):
                     proofs[row['path']] = row
-    prefix = '/' + course + '/'
+    prefix = '/' if course == '.' else '/' + course + '/'
     expected = [row for path, row in proofs.items() if path.startswith(prefix)]
     for manifest in sorted(state.glob('*-manifest.json'), key=lambda path: path.stat().st_mtime_ns, reverse=True):
         rows = json.loads(manifest.read_text())
