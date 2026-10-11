@@ -59,6 +59,7 @@ def update_report(destination, repo, mark, git_push=False, message=None):
             if key not in terminal or event['time'] > terminal[key]['time']:
                 terminal[key] = event
     changes = []
+    reports = []
     totals = {}
     for card in sorted((repo / 'courses').glob('*.md')):
         original = card.read_text(encoding='utf-8')
@@ -112,7 +113,7 @@ def update_report(destination, repo, mark, git_push=False, message=None):
         valid = sum(status == 'valid' for _, status, _ in results)
         failed = [result for result in results if result[1] in ('missing', 'partial', 'invalid')]
         pending = sum(status in ('pending', 'unknown') for _, status, _ in results)
-        report = [BEGIN, '## Результат скачивания', '',
+        report = ['## Результат скачивания', '',
                   f'- Отметка владельца копии: **{mark}**',
                   f'- Подтверждено SHA-256: **{valid}/{len(results)}** файлов.',
                   f'- Не скачано после всех попыток: **{len(failed)}**.',
@@ -124,7 +125,7 @@ def update_report(destination, repo, mark, git_push=False, message=None):
                 label = dict(missing='нет файла', partial='частичная загрузка', invalid='повреждён')[status]
                 report.append(f'- `{name}` — {label}; {event["detail"]}; попытка {event["attempt"]}.')
             report.append('')
-        report.append(END)
+        reports.append((state / 'catalog-reports' / card.name, '\n'.join(report) + '\n'))
         updated = ''.join(rows)
         own_complete = bool(results) and valid == len(results)
         other_complete = bool(results) and all(
@@ -133,11 +134,7 @@ def update_report(destination, repo, mark, git_push=False, message=None):
             for line in updated.splitlines() if line.startswith('| `'))
         status = 'копия есть' if own_complete or other_complete else 'не все видео есть, какие-то не удается скачать'
         updated = re.sub(r'^\*\*Статус:\*\*.*$', '**Статус:** ' + status, updated, flags=re.M)
-        block = '\n'.join(report) + '\n'
-        if BLOCK.search(updated):
-            updated = BLOCK.sub(lambda match: block, updated)
-        else:
-            updated = updated.rstrip() + '\n\n' + block
+        updated = BLOCK.sub('', updated).rstrip() + '\n'
         if updated != original:
             changes.append((card, updated))
             if year_match and old_status and old_status[1] != status:
@@ -173,6 +170,11 @@ def update_report(destination, repo, mark, git_push=False, message=None):
     paths = [str(path.relative_to(repo)) for path, _ in changes]
     if git_push and dirty.intersection(paths):
         raise RuntimeError('Report would include existing edits: ' + ', '.join(sorted(dirty.intersection(paths))))
+    for path, body in reports:
+        path.parent.mkdir(exist_ok=True)
+        temporary = path.with_name(path.name + '.tmp')
+        temporary.write_text(body, encoding='utf-8')
+        temporary.replace(path)
     for path, updated in changes:
         temporary = path.with_name(path.name + '.tmp')
         temporary.write_text(updated, encoding='utf-8')
