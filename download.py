@@ -134,7 +134,7 @@ def list_course(source, course):
             time.sleep(60)
 
 
-def download(data, courses, root, retries=2):
+def download(data, courses, root, retries=2, report_repo=None, mark=None):
     if not shutil.which('aria2c'):
         raise RuntimeError('Install aria2c first')
     root.mkdir(parents=True, exist_ok=True)
@@ -231,6 +231,12 @@ def download(data, courses, root, retries=2):
                              total=len(entries), verified=len(entries) - len(course_failed),
                              failed=len(course_failed), time=datetime.now().astimezone().isoformat())
         write_json(status_path, course_status)
+        if report_repo:
+            try:
+                from report import update_report
+                update_report(root, report_repo, mark)
+            except (OSError, ValueError, KeyError) as error:
+                print(f'REPORT ERROR: {error}', flush=True)
         print(('COURSE VERIFIED COMPLETE: ' if complete else 'COURSE FINISHED WITH ERRORS: ') + course, flush=True)
         write_json(state / 'summary.json', dict(verified=verified, failed=len(failed),
                    last_finished_course=course, complete=False))
@@ -255,6 +261,12 @@ def main():
     fetching.add_argument('--include', action='append', help='Exact course name; repeatable')
     fetching.add_argument('--exclude', action='append', default=[], help='Exact course name; repeatable')
     fetching.add_argument('--retries', type=int, default=2, help='Retries after the first attempt (default: 2)')
+    fetching.add_argument('--report-repo', type=Path, help='Update course cards after each course')
+    fetching.add_argument('--mark', help='Custom copy owner mark for reports')
+    reporting = commands.add_parser('report', help='Update backup course cards from download results')
+    reporting.add_argument('--destination', required=True, type=Path)
+    reporting.add_argument('--repo', required=True, type=Path)
+    reporting.add_argument('--mark', required=True)
     args = parser.parse_args()
     os.umask(0o077)
     try:
@@ -263,6 +275,12 @@ def main():
             write_json(args.output, data)
             print(f"{data['title']}: {len(data['courses'])} courses → {args.output}")
             return 0
+        if args.command == 'report':
+            from report import update_report
+            update_report(args.destination.resolve(), args.repo.resolve(), args.mark)
+            return 0
+        if args.report_repo and not args.mark:
+            raise ValueError('--report-repo requires --mark')
         if args.retries < 0:
             raise ValueError('--retries must be non-negative')
         data = json.loads(args.catalog.read_text(encoding='utf-8')) if args.catalog else catalog(args.source)
@@ -273,7 +291,7 @@ def main():
             available = {item['name'] for item in catalog(data['source'])['courses']}
             if set(chosen) - available:
                 raise ValueError('Selected courses no longer exist in the source folder')
-        return download(data, chosen, args.destination.resolve(), args.retries)
+        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark)
     except (ValueError, KeyError, OSError, RuntimeError) as error:
         parser.exit(2, f'Error: {error}\n')
 

@@ -1,0 +1,150 @@
+"""Update existing backup course cards from verified downloader events."""
+import json
+from pathlib import Path
+import re
+import unicodedata
+
+BEGIN = '<!-- yds-download:begin -->'
+END = '<!-- yds-download:end -->'
+BLOCK = re.compile(re.escape(BEGIN) + r'.*?' + re.escape(END) + r'\n?', re.S)
+
+
+def normalized(value):
+    return unicodedata.normalize('NFC', value)
+
+
+def update_report(destination, repo, mark):
+    if not mark or any(c in mark for c in '|\n\r'):
+        raise ValueError('Mark must be nonempty and contain no pipes or line breaks')
+    state = destination / '.download'
+    source = json.loads((state / 'source.json').read_text(encoding='utf-8'))['source'].rstrip('/')
+    text = (state / 'events.jsonl').read_text(encoding='utf-8')
+    events = {}
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            if index == len(lines) - 1 and not text.endswith('\n'):
+                continue
+            raise
+        events[normalized(event['path'])] = event
+    terminal = {}
+    for path in (destination / 'corrupted').glob('**/failed.json'):
+        for event in json.loads(path.read_text(encoding='utf-8')):
+            key = normalized(event['path'])
+            if key not in terminal or event['time'] > terminal[key]['time']:
+                terminal[key] = event
+    changes = []
+    totals = {}
+    for card in sorted((repo / 'courses').glob('*.md')):
+        original = card.read_text(encoding='utf-8')
+        year_match = re.search(r'^- Год: (\d+)$', original, re.M)
+        old_status = re.search(r'^\*\*Статус:\*\* (.+)$', original, re.M)
+        if year_match and old_status:
+            counts = totals.setdefault(year_match[1], [0, 0])
+            counts[0 if old_status[1] == 'копия есть' else 1] += 1
+        source_match = re.search(r'^- Источник: .*\((https?://[^)]+)\)', original, re.M)
+        path_match = re.search(r'^- Путь: `(.+)`$', original, re.M)
+        if not source_match or not path_match or source_match[1].rstrip('/') != source:
+            continue
+        prefix = '/' + path_match[1].strip('/') + '/'
+        rows = original.splitlines(keepends=True)
+        results = []
+        for index, line in enumerate(rows):
+            if not line.startswith('| `'):
+                continue
+            cells = re.split(r'(?<!\\)\|', line.strip())[1:-1]
+            if len(cells) != 5:
+                raise ValueError('Unexpected file table: ' + str(card))
+            name = cells[0].strip()[1:-1].replace('\\|', '|')
+            event = events.get(normalized(prefix + name))
+            status = 'unknown'
+            if event:
+                status = event['status']
+                local = destination.joinpath(*Path(event['path']).parts[1:])
+                if status == 'valid' and (not local.exists() or local.stat().st_size != event['size']
+                                         or Path(str(local) + '.aria2').exists()):
+                    status = 'missing'
+                final = terminal.get(normalized(event['path']))
+                if status != 'valid' and (not final or final['time'] < event['time']):
+                    status = 'pending'
+            copies = [cell.strip() for cell in cells[2:]]
+            if status == 'valid' and mark not in copies:
+                if '' not in copies:
+                    raise ValueError('All copy columns occupied: ' + str(card) + ': ' + name)
+                copies[copies.index('')] = mark
+            elif event and status != 'valid':
+                copies = ['' if value == mark else value for value in copies]
+            if copies != [cell.strip() for cell in cells[2:]]:
+                rows[index] = f'| {cells[0].strip()} | {cells[1].strip()} | ' + ' | '.join(copies) + ' |\n'
+            results.append((name, status, event))
+        observed = [result for result in results if result[2]]
+        if not observed:
+            continue
+        valid = sum(status == 'valid' for _, status, _ in results)
+        failed = [result for result in results if result[1] in ('missing', 'partial', 'invalid')]
+        pending = sum(status in ('pending', 'unknown') for _, status, _ in results)
+        report = [BEGIN, '## Результат скачивания', '',
+                  f'- Отметка владельца копии: **{mark}**',
+                  f'- Подтверждено SHA-256: **{valid}/{len(results)}** файлов.',
+                  f'- Не скачано после всех попыток: **{len(failed)}**.',
+                  f'- Ещё не проверено / ожидает повтора: **{pending}**.',
+                  '- Последняя запись проверки: ' + max(event['time'] for _, _, event in observed), '']
+        if failed:
+            report.extend(['### Неудачи', ''])
+            for name, status, event in failed:
+                label = dict(missing='нет файла', partial='частичная загрузка', invalid='повреждён')[status]
+                report.append(f'- `{name}` — {label}; {event["detail"]}; попытка {event["attempt"]}.')
+            report.append('')
+        report.append(END)
+        updated = ''.join(rows)
+        own_complete = bool(results) and valid == len(results)
+        other_complete = bool(results) and all(
+            any(cell.strip() and cell.strip() != mark for cell in
+                re.split(r'(?<!\\)\|', line.strip())[3:-1])
+            for line in updated.splitlines() if line.startswith('| `'))
+        status = 'копия есть' if own_complete or other_complete else 'не все видео есть, какие-то не удается скачать'
+        updated = re.sub(r'^\*\*Статус:\*\*.*$', '**Статус:** ' + status, updated, flags=re.M)
+        block = '\n'.join(report) + '\n'
+        if BLOCK.search(updated):
+            updated = BLOCK.sub(lambda match: block, updated)
+        else:
+            updated = updated.rstrip() + '\n\n' + block
+        if updated != original:
+            changes.append((card, updated))
+            if year_match and old_status and old_status[1] != status:
+                counts = totals[year_match[1]]
+                counts[0 if old_status[1] == 'копия есть' else 1] -= 1
+                counts[0 if status == 'копия есть' else 1] += 1
+    for card, updated in changes:
+        temporary = card.with_name(card.name + '.tmp')
+        temporary.write_text(updated, encoding='utf-8')
+        temporary.replace(card)
+    readme = repo / 'README.md'
+    if changes and readme.exists():
+        original = readme.read_text(encoding='utf-8')
+        updated = original
+        for card, body in changes:
+            status = re.search(r'^\*\*Статус:\*\* (.+)$', body, re.M)[1]
+            pattern = r'(^- .*\(courses/' + re.escape(card.name) + r'\).*?\. )(копия есть|не все видео есть, какие-то не удается скачать)(\.)$'
+            updated = re.sub(pattern, lambda match: match[1] + status + match[3], updated, flags=re.M)
+        ok = sum(counts[0] for counts in totals.values())
+        gap = sum(counts[1] for counts in totals.values())
+        updated = re.sub(r'Копия есть: \*\*\d+\*\*\. Не все видео есть: \*\*\d+\*\*\.',
+                         f'Копия есть: **{ok}**. Не все видео есть: **{gap}**.', updated)
+        for year, counts in totals.items():
+            pattern = r'^\| ' + re.escape(year) + r' \|.*$'
+            def year_row(match):
+                cells = match[0].split('|')
+                cells[-3], cells[-2] = f' {counts[0]} ', f' {counts[1]} '
+                return '|'.join(cells)
+            updated = re.sub(pattern, year_row, updated, flags=re.M)
+        if updated != original:
+            temporary = readme.with_name(readme.name + '.tmp')
+            temporary.write_text(updated, encoding='utf-8')
+            temporary.replace(readme)
+    print(f'REPORT: {len(changes)} course cards updated; mark={mark}', flush=True)
+    return len(changes)
