@@ -127,7 +127,7 @@ def record(state, item, course, attempt, status, detail):
                  size=item['size'], sha256=item['sha256'])
     local = state.parent.joinpath(*PurePosixPath(item['path']).parts[1:])
     from progress import progress
-    event.update(progress(local, item['size'], valid=status == 'valid'))
+    event.update(progress(local, item['size'], valid=status == 'valid', sha256=item['sha256']))
     if status == 'valid':
         event['mtime_ns'] = local.stat().st_mtime_ns
     with (state / 'events.jsonl').open('a', encoding='utf-8') as log:
@@ -145,9 +145,9 @@ def list_course(source, course):
             time.sleep(60)
 
 
-def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep_check=False):
-    if not shutil.which('aria2c'):
-        raise RuntimeError('Install aria2c first')
+def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep_check=False, retry_corrupted=False):
+    if not all(shutil.which(name) for name in ('aria2c', 'ffprobe', 'cp')):
+        raise RuntimeError('Install aria2c, ffmpeg/ffprobe and coreutils first')
     root.mkdir(parents=True, exist_ok=True)
     state = root / '.download'
     state.mkdir(mode=0o700, exist_ok=True)
@@ -160,6 +160,10 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
     identity = state / 'source.json'
     if identity.exists() and json.loads(identity.read_text(encoding='utf-8'))['source'] != source:
         raise ValueError('Use a separate destination for a different public folder/year')
+    write_json(identity, dict(source=source, title=data['title']))
+    if retry_corrupted:
+        from recovery import recover_corrupted
+        recover_corrupted(root, source, retries, True, report_repo, mark, git_push)
     history_path = state / 'course-history.json'
     history = json.loads(history_path.read_text()) if history_path.exists() else {}
     for path in state.glob('*-status.json'):
@@ -291,6 +295,17 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                                 raise FileExistsError(out)
                             src.rename(out)
                     event['corrupted_path'] = str(broken.relative_to(root))
+                    try:
+                        from recovery import finish_recovery
+                        finish_recovery(root, event, item, retries)
+                    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+                        event['recovery_error'] = str(error)
+                        print('RECOVERY ERROR: ' + item['path'] + '; ' + type(error).__name__, flush=True)
+                    if event.get('range_recovered_complete'):
+                        verified += 1
+                        continue
+                    with (state / 'events.jsonl').open('a') as log:
+                        log.write(json.dumps(event, ensure_ascii=False) + '\n')
                     course_failed.append(event)
                     failed.append(event)
                     write_json(root / 'corrupted' / 'failed.json', failed)
@@ -334,11 +349,14 @@ def main():
     fetching.add_argument('--destination', required=True, type=Path)
     fetching.add_argument('--include', action='append', help='Exact course name; repeatable')
     fetching.add_argument('--exclude', action='append', default=[], help='Exact course name; repeatable')
+    fetching.add_argument('--retry-corrupted', action='store_true', help='Retry independent missing ranges of previous failures before ordinary courses')
     fetching.add_argument('--deep-check', action='store_true', help='Reprocess finished courses and recheck existing files with SHA-256')
     fetching.add_argument('--retries', type=int, default=2, help='Retries after the first attempt (default: 2)')
     fetching.add_argument('--report-repo', type=Path, help='Update course cards after each course')
     fetching.add_argument('--mark', help='Custom copy owner mark for reports')
     fetching.add_argument('--git-push', action='store_true', help='Commit and push reports after each course')
+    salvage = commands.add_parser('recover', help='Retain videos with over 50 percent available time next to originals')
+    salvage.add_argument('--destination', required=True, type=Path)
     damaged = commands.add_parser('corrupted', help='Save corrupted download progress and list retained files over 30 percent')
     damaged.add_argument('--destination', required=True, type=Path)
     reporting = commands.add_parser('report', help='Update backup course cards from download results')
@@ -353,6 +371,14 @@ def main():
             data = catalog(args.source)
             write_json(args.output, data)
             print(f"{data['title']}: {len(data['courses'])} courses → {args.output}")
+            return 0
+        if args.command == 'recover':
+            from recovery import recover_corrupted
+            root = args.destination.resolve()
+            lock = (root / '.download/download.lock').open('a')
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            source = json.loads((root / '.download/source.json').read_text())['source']
+            recover_corrupted(root, source)
             return 0
         if args.command == 'corrupted':
             from progress import corrupted_report
@@ -377,7 +403,7 @@ def main():
             available = {item['name'] for item in catalog(data['source'])['courses']}
             if {PurePosixPath(name).parts[0] for name in chosen} - available:
                 raise ValueError('Selected courses no longer exist in the source folder')
-        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep_check)
+        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep_check, args.retry_corrupted)
     except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(2, f'Error: {error}\n')
 

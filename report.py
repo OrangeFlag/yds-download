@@ -52,6 +52,22 @@ def update_report(destination, repo, mark, git_push=False, message=None):
                 stat = local.stat()
                 if stat.st_size == copy['size'] and stat.st_mtime_ns == copy['mtime_ns'] and not Path(str(local) + '.aria2').exists():
                     external[normalized(copy['path'])] = copy
+    partial = {}
+    known_partial = set()
+    registry = state / 'partial-copies.json'
+    if registry.exists():
+        for copy in json.loads(registry.read_text()):
+            if copy['source'].rstrip('/') != source:
+                continue
+            key = normalized(copy['path'])
+            known_partial.add(key)
+            local = (destination / copy['recovered_path']).resolve()
+            if not local.is_relative_to(destination.resolve()):
+                raise ValueError('Unsafe partial copy path')
+            if local.exists():
+                stat = local.stat()
+                if stat.st_size == copy['local_size'] and stat.st_mtime_ns == copy['mtime_ns'] and copy['available_time_percent'] > 50:
+                    partial[key] = copy
     terminal = {}
     for path in (destination / 'corrupted').glob('**/failed.json'):
         for event in json.loads(path.read_text(encoding='utf-8')):
@@ -73,7 +89,7 @@ def update_report(destination, repo, mark, git_push=False, message=None):
         if not source_match or not path_match or source_match[1].rstrip('/') != source:
             continue
         prefix = '/' + path_match[1].strip('/') + '/'
-        if not any(key.startswith(normalized(prefix)) for key in events.keys() | external.keys()):
+        if not any(key.startswith(normalized(prefix)) for key in events.keys() | external.keys() | known_partial):
             continue
         rows = original.splitlines(keepends=True)
         results = []
@@ -86,7 +102,8 @@ def update_report(destination, repo, mark, git_push=False, message=None):
             name = cells[0].strip()[1:-1].replace('\\|', '|')
             key = normalized(prefix + name)
             local_copy = external.get(key)
-            event = local_copy or events.get(key)
+            partial_copy = partial.get(key)
+            event = local_copy or events.get(key) or partial_copy
             status = 'unknown'
             if event:
                 status = event['status']
@@ -104,7 +121,19 @@ def update_report(destination, repo, mark, git_push=False, message=None):
                 copies[copies.index('')] = mark
             elif event and status != 'valid':
                 copies = ['' if value == mark else value for value in copies]
+            partial_prefix = mark + ' (partially available;'
+            if key in known_partial:
+                label = (f'{partial_prefix} байты {partial_copy["downloaded_percent"]:.2f}%; '
+                         f'время {partial_copy["available_time_percent"]:.2f}%)') if partial_copy else ''
+                previous = next((i for i, value in enumerate(copies) if value.startswith(partial_prefix)), None)
+                if previous is not None:
+                    copies[previous] = label
+                elif label:
+                    if '' not in copies:
+                        raise ValueError('All copy columns occupied: ' + str(card) + ': ' + name)
+                    copies[copies.index('')] = label
             if copies != [cell.strip() for cell in cells[2:]]:
+
                 rows[index] = f'| {cells[0].strip()} | {cells[1].strip()} | ' + ' | '.join(copies) + ' |\n'
             results.append((name, status, event))
         observed = [result for result in results if result[2]]
@@ -123,16 +152,18 @@ def update_report(destination, repo, mark, git_push=False, message=None):
             report.extend(['### Неудачи', ''])
             for name, status, event in failed:
                 label = dict(missing='нет файла', partial='частичная загрузка', invalid='повреждён')[status]
-                saved = terminal.get(normalized(event['path']), event)
+                saved = partial.get(normalized(event['path'])) or terminal.get(normalized(event['path']), event)
                 percent = saved.get('downloaded_percent')
                 fraction = f'; сохранено {percent:.2f}% ({saved["downloaded_bytes"]}/{saved["size"]} байт)' if percent is not None else ''
+                if 'available_time_percent' in saved:
+                    fraction += f'; доступно по времени {saved["available_time_percent"]:.2f}%'
                 report.append(f'- `{name}` — {label}; {event["detail"]}; попытка {event["attempt"]}{fraction}.')
             report.append('')
         reports.append((state / 'catalog-reports' / card.name, '\n'.join(report) + '\n'))
         updated = ''.join(rows)
         own_complete = bool(results) and valid == len(results)
         other_complete = bool(results) and all(
-            any(cell.strip() and cell.strip() != mark and 'полнота не проверена' not in cell for cell in
+            any(cell.strip() and cell.strip() != mark and 'полнота не проверена' not in cell and 'partially available' not in cell.lower() for cell in
                 re.split(r'(?<!\\)\|', line.strip())[3:-1])
             for line in updated.splitlines() if line.startswith('| `'))
         status = 'копия есть' if own_complete or other_complete else 'не все видео есть, какие-то не удается скачать'

@@ -6,7 +6,7 @@ if (( $# < 3 )); then
   echo '   or: ./start.sh DESTINATION --catalog /absolute/path/catalog.json'
   exit 2
 fi
-command -v python3 aria2c systemd-run >/dev/null
+command -v python3 aria2c ffprobe cp systemd-run >/dev/null
 python3 -c 'import sys; assert sys.version_info >= (3, 11), "Python 3.11+ required"'
 repo_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 destination=$(realpath -e -- "$1")

@@ -40,6 +40,8 @@ def main():
         command = ['python3', str(Path(__file__).with_name('download.py')), 'download',
                    '--catalog', job['catalog'], '--destination', job['destination'],
                    '--retries', str(data.get('retries', 2))]
+        if data.get('retry_corrupted', False):
+            command += ['--retry-corrupted']
         if data.get('deep_check', False):
             command += ['--deep-check']
         if data.get('report_repo'):

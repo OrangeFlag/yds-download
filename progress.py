@@ -4,7 +4,7 @@ from pathlib import Path
 import struct
 
 
-def received_bytes(control, expected):
+def received_ranges(control, expected):
     # aria2 HTTP control format v1; in-flight blocks are 16 KiB (Piece.h).
     data = control.read_bytes()
     offset = 0
@@ -22,14 +22,15 @@ def received_bytes(control, expected):
         bits = data[offset:offset + size]
         offset += size
         indices = [i for i in range(count) if bits[i // 8] & (128 >> (i % 8))]
-        return sum(min(block, length - i * block) for i in indices), set(indices)
+        return set(indices)
     version, extension, hash_length = read('>HII')
     if (version, extension, hash_length) != (1, 0, 0):
         raise ValueError('Unsupported aria2 HTTP control format')
     piece, total, uploaded = read('>IQQ')
     if not piece or total != expected:
         raise ValueError('aria2 size mismatch')
-    received, completed = bitmap(total, piece)
+    completed = bitmap(total, piece)
+    ranges = [(i * piece, min((i + 1) * piece, total)) for i in completed]
     count, = read('>I')
     seen = set()
     for _ in range(count):
@@ -37,14 +38,46 @@ def received_bytes(control, expected):
         if index in seen or index in completed or index * piece >= total or length != min(piece, total - index * piece):
             raise ValueError('Invalid aria2 in-flight piece')
         seen.add(index)
-        partial, _ = bitmap(length, 16 * 1024)
-        received += partial
-    if offset != len(data) or received > total:
+        partial = bitmap(length, 16 * 1024)
+        ranges.extend((index * piece + i * 16384,
+                       index * piece + min((i + 1) * 16384, length)) for i in partial)
+    if offset != len(data):
         raise ValueError('Invalid aria2 control length')
-    return received
+    return merge_ranges(ranges)
 
 
-def progress(path, expected, valid=False):
+def merge_ranges(ranges):
+    merged = []
+    for start, end in sorted(ranges):
+        if end <= start:
+            continue
+        if merged and start <= merged[-1][1] + 1.001e-6:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return merged
+
+
+def received_bytes(control, expected):
+    return sum(end - start for start, end in received_ranges(control, expected))
+
+
+def saved_ranges(path, expected, sha256):
+    control = Path(str(path) + ".aria2")
+    ranges = received_ranges(control, expected) if control.exists() else []
+    journal = Path(str(path) + ".ranges.json")
+    if journal.exists():
+        data = json.loads(journal.read_text())
+        if data["size"] != expected or data["sha256"] != sha256:
+            raise ValueError("Range journal source mismatch")
+        for start, end in data["ranges"]:
+            if not isinstance(start, int) or not isinstance(end, int) or not 0 <= start < end <= expected:
+                raise ValueError("Invalid saved range")
+            ranges.append([start, end])
+    return merge_ranges(ranges)
+
+
+def progress(path, expected, valid=False, sha256=None):
     control = Path(str(path) + '.aria2')
     result = dict(local_size=path.stat().st_size if path.exists() else 0,
                   downloaded_bytes=None, downloaded_percent=None, progress_source='unknown')
@@ -52,13 +85,13 @@ def progress(path, expected, valid=False):
         result.update(downloaded_bytes=0, downloaded_percent=0.0, progress_source='missing')
     elif valid:
         result.update(downloaded_bytes=expected, downloaded_percent=100.0, progress_source='sha256')
-    elif control.exists():
+    elif control.exists() or Path(str(path) + ".ranges.json").exists():
         try:
-            received = received_bytes(control, expected)
+            received = sum(end - start for start, end in saved_ranges(path, expected, sha256))
             result.update(downloaded_bytes=received,
                           downloaded_percent=round(100 * received / expected, 4) if expected else 100.0,
-                          progress_source='aria2-control')
-        except (OSError, ValueError, struct.error) as error:
+                          progress_source='range-journal' if Path(str(path) + '.ranges.json').exists() else 'aria2-control')
+        except (OSError, ValueError, KeyError, TypeError, struct.error) as error:
             result['progress_error'] = str(error)
     return result
 
@@ -76,8 +109,8 @@ def corrupted_report(root):
             path = root / relative if relative else manifest.parent.joinpath(*Path(event['path']).parts[1:])
             if not path.resolve().is_relative_to(folder):
                 raise ValueError('Unsafe corrupted path')
-            if 'downloaded_bytes' not in event:
-                event.update(progress(path, event['size']))
+            if path.exists() or 'downloaded_bytes' not in event:
+                event.update(progress(path, event['size'], sha256=event['sha256']))
                 changed = True
             # Retain original progress if a body was subsequently moved/removed.
             row = dict(event, retained=path.exists(), corrupted_path=str(path.relative_to(root)))
@@ -87,7 +120,7 @@ def corrupted_report(root):
     items = list(rows.values())
     folder.mkdir(exist_ok=True)
     write_json(folder / 'progress.json', items)
-    lines = ['Сохранённые неудачные загрузки; процент из aria2, не из размера MP4.', '']
+    lines = ['Сохранённые неудачные загрузки; процент из aria2 и Range-журнала, не из размера MP4.', '']
     for event in sorted(items, key=lambda row: -(row.get('downloaded_percent') or 0)):
         percent = event.get('downloaded_percent')
         value = f'{percent:.2f}%' if percent is not None else 'неизвестно'
