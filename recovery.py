@@ -122,7 +122,7 @@ def retry_ranges(root, event, item, retries):
         start, end = bounds
         with rate_lock:
             time.sleep(max(0, next_request - time.monotonic()))
-            next_request = time.monotonic() + 1 / 6
+            next_request = time.monotonic() + 1 / 12
         if stopping.is_set():
             return bounds, None, 'Interrupted'
         request = urllib.request.Request(item['file'], headers={'Range': f'bytes={start}-{end - 1}', 'Accept-Encoding': 'identity'})
@@ -195,13 +195,14 @@ def retry_ranges(root, event, item, retries):
                 ranges = merge_ranges(ranges + [saved])
             outcomes.append(dict(start=bounds[0], end=bounds[1], saved_bytes=len(data) if data else 0, error=error))
         # Consume completed requests immediately so Ctrl+C cannot lose later successful chunks.
-        pool = ThreadPoolExecutor(max_workers=8)
+        workers = 16
+        pool = ThreadPoolExecutor(max_workers=workers)
         futures = set()
         try:
             pending = iter(missing)
-            for bounds in missing[:8]:
+            for bounds in missing[:workers]:
                 futures.add(pool.submit(fetch, bounds))
-            for _ in missing[:8]:
+            for _ in missing[:workers]:
                 next(pending)
             while futures:
                 completed, _ = wait(futures, return_when=FIRST_COMPLETED)
