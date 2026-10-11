@@ -388,6 +388,9 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                 '--continue=true', '--always-resume=true', '--check-integrity=true',
                 '--auto-file-renaming=false', '--allow-overwrite=true',
                 f"--max-concurrent-downloads={tuning['download_concurrency']}",
+                '--optimize-concurrent-downloads=' + (
+                    f"{tuning['auto_concurrency_a']:g}:{tuning['auto_concurrency_b']:g}"
+                    if tuning['auto_concurrency'] else 'false'),
                 f"--max-connection-per-server={tuning['connections']}", f"--split={tuning['split']}",
                 f"--min-split-size={tuning['min_split_size_mib']}M", '--file-allocation=none',
                 f"--disk-cache={tuning['disk_cache_mib']}M",

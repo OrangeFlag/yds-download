@@ -1,9 +1,13 @@
 """Shared CLI and semester-queue tuning; sizes have explicit binary units."""
 import math
+import argparse
 
 # name: default, minimum, maximum (None = unbounded), description
 OPTIONS = {
-    'download_concurrency': (2, 1, None, 'Simultaneous files'),
+    'download_concurrency': (2, 1, None, 'Maximum simultaneous files'),
+    'auto_concurrency': (False, None, None, 'Let aria2 adapt file concurrency within the maximum'),
+    'auto_concurrency_a': (1.0, 1, None, 'aria2 concurrency coefficient A'),
+    'auto_concurrency_b': (2.0, 0, None, 'aria2 concurrency coefficient B'),
     'connections': (4, 1, 16, 'Connections per server per file'),
     'split': (4, 1, None, 'Download splits per file'),
     'min_split_size_mib': (4, 1, 1024, 'Minimum aria2 split size, MiB'),
@@ -37,6 +41,11 @@ def resolve(values=None):
     for name, (default, minimum, maximum, _) in OPTIONS.items():
         value = values.get(name, default)
         kind = type(default)
+        if kind is bool:
+            if not isinstance(value, bool):
+                raise ValueError(f'Invalid {name}: expected bool')
+            result[name] = value
+            continue
         if (isinstance(value, bool) or not isinstance(value, (int, float))
                 or not math.isfinite(value) or (kind is int and not isinstance(value, int))
                 or value < minimum or (maximum is not None and value > maximum)):
@@ -52,10 +61,19 @@ def resolve(values=None):
 def add_arguments(parser):
     group = parser.add_argument_group('Download and Range tuning')
     for name, (default, _, _, help_text) in OPTIONS.items():
-        group.add_argument('--' + name.replace('_', '-'), type=type(default), default=default,
-                           help=f'{help_text} (default: {default:g})')
+        flag = '--' + name.replace('_', '-')
+        if isinstance(default, bool):
+            group.add_argument(flag, action=argparse.BooleanOptionalAction, default=default,
+                               help=f'{help_text} (default: {default})')
+        else:
+            group.add_argument(flag, type=type(default), default=default,
+                               help=f'{help_text} (default: {default:g})')
 
 
 def arguments(values):
-    return ['--' + name.replace('_', '-') + '=' + str(value)
-            for name, value in resolve(values).items()]
+    result = []
+    for name, value in resolve(values).items():
+        flag = name.replace('_', '-')
+        result.append(('--' if value else '--no-') + flag if isinstance(value, bool)
+                      else '--' + flag + '=' + str(value))
+    return result

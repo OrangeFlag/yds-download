@@ -188,12 +188,13 @@ class ResumeChecks(unittest.TestCase):
             local.write_bytes(self.content)
             return 0
         tuning = dict(download_concurrency=1, connections=2, split=3, disk_cache_mib=128,
-                      bandwidth_limit=1048576, auto_save_interval=15, timeout=45)
+                      bandwidth_limit=1048576, auto_save_interval=15, timeout=45,
+                      auto_concurrency=True, auto_concurrency_a=1.0, auto_concurrency_b=2.0)
         with patch.object(download.subprocess, 'call', side_effect=transfer):
             self.assertEqual(self.run_download(tuning=tuning), 0)
         for flag in ('--max-concurrent-downloads=1', '--max-connection-per-server=2',
                      '--split=3', '--disk-cache=128M', '--max-overall-download-limit=1048576',
-                     '--auto-save-interval=15', '--timeout=45'):
+                     '--auto-save-interval=15', '--timeout=45', '--optimize-concurrent-downloads=1:2'):
             self.assertIn(flag, calls[0])
         saved = json.loads((self.state / 'settings.json').read_text())['tuning']
         for key, value in tuning.items():
@@ -225,7 +226,8 @@ class ResumeChecks(unittest.TestCase):
     def test_invalid_tuning_is_rejected(self):
         for values in (dict(range_workers=0), dict(connections=17), dict(timeout=-1),
                        dict(range_rps=float('nan')), dict(range_rps=float('inf')),
-                       dict(download_concurrency=True), dict(split=1.5),
+                       dict(download_concurrency=True), dict(split=1.5), dict(auto_concurrency=1),
+                       dict(auto_concurrency_a=0), dict(auto_concurrency_b=-1),
                        dict(range_linear_block_size_kib=2048), dict(unknown=3)):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 settings.resolve(values)
@@ -234,13 +236,15 @@ class ResumeChecks(unittest.TestCase):
         queue = self.root / 'queue.json'
         job = dict(title='test', catalog='catalog.json', destination=str(self.root),
                    tuning=dict(range_workers=1), state='pending')
-        download.write_json(queue, dict(archives=[job], tuning=dict(range_workers=2, disk_cache_mib=128)))
+        download.write_json(queue, dict(archives=[job], tuning=dict(range_workers=2, disk_cache_mib=128, auto_concurrency=True)))
         calls = []
         with patch('sys.argv', ['semester_queue.py', str(queue)]), \
                 patch.object(semester_queue.subprocess, 'call', side_effect=lambda cmd: calls.append(cmd) or 0):
             semester_queue.main()
         self.assertIn('--range-workers=1', calls[0])
         self.assertIn('--disk-cache-mib=128', calls[0])
+        self.assertIn('--auto-concurrency', calls[0])
+        self.assertNotIn('--no-auto-concurrency', calls[0])
         self.assertNotIn('--range-workers=2', calls[0])
 
     def test_no_transfer_does_not_require_reserved_disk_space(self):
