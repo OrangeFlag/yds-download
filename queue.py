@@ -32,7 +32,7 @@ def main():
                 raise RuntimeError('Current archive did not finish; queue remains paused')
     data = json.loads(path.read_text())
     for job in data['archives']:
-        if not job.get('enabled', True) or job.get('state') == 'finished':
+        if not job.get('enabled', True) or (job.get('state') == 'finished' and not data.get('deep_check', False)):
             continue
         job['state'] = 'running'
         write_json(path, data)
@@ -40,6 +40,8 @@ def main():
         command = ['python3', str(Path(__file__).with_name('download.py')), 'download',
                    '--catalog', job['catalog'], '--destination', job['destination'],
                    '--retries', str(data.get('retries', 2))]
+        if data.get('deep_check', False):
+            command += ['--deep-check']
         if data.get('report_repo'):
             command += ['--report-repo', data['report_repo'], '--mark', data['mark']]
         if data.get('git_push'):
