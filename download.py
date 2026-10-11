@@ -126,6 +126,8 @@ def record(state, item, course, attempt, status, detail):
                  path=item['path'], attempt=attempt, status=status, detail=detail,
                  size=item['size'], sha256=item['sha256'])
     local = state.parent.joinpath(*PurePosixPath(item['path']).parts[1:])
+    from progress import progress
+    event.update(progress(local, item['size'], valid=status == 'valid'))
     if status == 'valid':
         event['mtime_ns'] = local.stat().st_mtime_ns
     with (state / 'events.jsonl').open('a', encoding='utf-8') as log:
@@ -337,6 +339,8 @@ def main():
     fetching.add_argument('--report-repo', type=Path, help='Update course cards after each course')
     fetching.add_argument('--mark', help='Custom copy owner mark for reports')
     fetching.add_argument('--git-push', action='store_true', help='Commit and push reports after each course')
+    damaged = commands.add_parser('corrupted', help='Save corrupted download progress and list retained files over 30 percent')
+    damaged.add_argument('--destination', required=True, type=Path)
     reporting = commands.add_parser('report', help='Update backup course cards from download results')
     reporting.add_argument('--destination', required=True, type=Path)
     reporting.add_argument('--repo', required=True, type=Path)
@@ -349,6 +353,11 @@ def main():
             data = catalog(args.source)
             write_json(args.output, data)
             print(f"{data['title']}: {len(data['courses'])} courses → {args.output}")
+            return 0
+        if args.command == 'corrupted':
+            from progress import corrupted_report
+            for event in corrupted_report(args.destination):
+                print(f"{event['downloaded_percent']:.2f}% — {event['path']} — {event['corrupted_path']}")
             return 0
         if args.command == 'report':
             from report import update_report

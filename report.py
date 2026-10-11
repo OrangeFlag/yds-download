@@ -123,7 +123,10 @@ def update_report(destination, repo, mark, git_push=False, message=None):
             report.extend(['### Неудачи', ''])
             for name, status, event in failed:
                 label = dict(missing='нет файла', partial='частичная загрузка', invalid='повреждён')[status]
-                report.append(f'- `{name}` — {label}; {event["detail"]}; попытка {event["attempt"]}.')
+                saved = terminal.get(normalized(event['path']), event)
+                percent = saved.get('downloaded_percent')
+                fraction = f'; сохранено {percent:.2f}% ({saved["downloaded_bytes"]}/{saved["size"]} байт)' if percent is not None else ''
+                report.append(f'- `{name}` — {label}; {event["detail"]}; попытка {event["attempt"]}{fraction}.')
             report.append('')
         reports.append((state / 'catalog-reports' / card.name, '\n'.join(report) + '\n'))
         updated = ''.join(rows)
