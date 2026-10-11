@@ -41,6 +41,17 @@ def update_report(destination, repo, mark, git_push=False, message=None):
                 continue
             raise
         events[normalized(event['path'])] = event
+    external = {}
+    registry = state / 'local-copies.json'
+    if registry.exists():
+        for copy in json.loads(registry.read_text(encoding='utf-8')):
+            if copy['source'].rstrip('/') != source or copy['status'] != 'valid':
+                continue
+            local = Path(copy['local'])
+            if local.exists():
+                stat = local.stat()
+                if stat.st_size == copy['size'] and stat.st_mtime_ns == copy['mtime_ns'] and not Path(str(local) + '.aria2').exists():
+                    external[normalized(copy['path'])] = copy
     terminal = {}
     for path in (destination / 'corrupted').glob('**/failed.json'):
         for event in json.loads(path.read_text(encoding='utf-8')):
@@ -61,6 +72,8 @@ def update_report(destination, repo, mark, git_push=False, message=None):
         if not source_match or not path_match or source_match[1].rstrip('/') != source:
             continue
         prefix = '/' + path_match[1].strip('/') + '/'
+        if not any(key.startswith(normalized(prefix)) for key in events.keys() | external.keys()):
+            continue
         rows = original.splitlines(keepends=True)
         results = []
         for index, line in enumerate(rows):
@@ -70,11 +83,13 @@ def update_report(destination, repo, mark, git_push=False, message=None):
             if len(cells) != 5:
                 raise ValueError('Unexpected file table: ' + str(card))
             name = cells[0].strip()[1:-1].replace('\\|', '|')
-            event = events.get(normalized(prefix + name))
+            key = normalized(prefix + name)
+            local_copy = external.get(key)
+            event = local_copy or events.get(key)
             status = 'unknown'
             if event:
                 status = event['status']
-                local = destination.joinpath(*Path(event['path']).parts[1:])
+                local = Path(local_copy['local']) if local_copy else destination.joinpath(*Path(event['path']).parts[1:])
                 if status == 'valid' and (not local.exists() or local.stat().st_size != event['size']
                                          or Path(str(local) + '.aria2').exists()):
                     status = 'missing'
