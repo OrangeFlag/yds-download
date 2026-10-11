@@ -32,18 +32,20 @@ def main():
                 raise RuntimeError('Current archive did not finish; queue remains paused')
     data = json.loads(path.read_text())
     for job in data['archives']:
-        if not job.get('enabled', True) or (job.get('state') == 'finished' and not data.get('deep_check', False)):
+        if not job.get('enabled', True) or (job.get('state') == 'finished' and not (data.get('deep', False) or data.get('retry_check', False))):
             continue
-        job['state'] = 'running'
-        write_json(path, data)
+        previous_state = job.get('state', 'pending')
+        if not (data.get('deep') and not data.get('retry_check')):
+            job['state'] = 'running'
+            write_json(path, data)
         print('ARCHIVE START: ' + job['title'], flush=True)
         command = ['python3', str(Path(__file__).with_name('download.py')), 'download',
                    '--catalog', job['catalog'], '--destination', job['destination'],
                    '--retries', str(data.get('retries', 2))]
-        if data.get('retry_corrupted', False):
-            command += ['--retry-corrupted']
-        if data.get('deep_check', False):
-            command += ['--deep-check']
+        if data.get('retry_check', False):
+            command += ['--retry-check']
+        if data.get('deep', False):
+            command += ['--deep']
         if data.get('report_repo'):
             command += ['--report-repo', data['report_repo'], '--mark', data['mark']]
         if data.get('git_push'):
@@ -54,7 +56,7 @@ def main():
             job['state'] = 'blocked'
             write_json(path, data)
             raise RuntimeError('Download stopped: ' + job['title'] + '; exit=' + str(code))
-        job['state'] = 'finished'
+        job['state'] = previous_state if data.get('deep') and not data.get('retry_check') else 'finished'
         write_json(path, data)
         print('ARCHIVE FINISHED: ' + job['title'] + '; exit=' + str(code), flush=True)
     print('ALL ARCHIVES PROCESSED', flush=True)

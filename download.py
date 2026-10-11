@@ -134,8 +134,8 @@ def read_events(path, repair=False):
     return events
 
 
-def inspect(root, item, course):
-    path = target(root, item, course)
+def inspect(root, item, course, path=None):
+    path = path if path is not None else target(root, item, course)
     if not path.exists():
         return 'missing', 'No local file'
     if Path(str(path) + '.aria2').exists():
@@ -149,11 +149,13 @@ def inspect(root, item, course):
     return 'valid', 'SHA-256 verified'
 
 
-def record(state, item, course, attempt, status, detail):
+def record(state, item, course, attempt, status, detail, local=None):
     event = dict(time=datetime.now().astimezone().isoformat(), course=course,
                  path=item['path'], attempt=attempt, status=status, detail=detail,
                  size=item['size'], sha256=item['sha256'])
-    local = state.parent.joinpath(*PurePosixPath(item['path']).parts[1:])
+    if local is not None:
+        event['local'] = str(local)
+    local = local if local is not None else state.parent.joinpath(*PurePosixPath(item['path']).parts[1:])
     from progress import progress
     event.update(progress(local, item['size'], valid=status == 'valid', sha256=item['sha256']))
     if status == 'valid':
@@ -176,7 +178,7 @@ def list_course(source, course, retries=2):
             time.sleep(60)
 
 
-def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep_check=False, retry_corrupted=False):
+def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False):
     if not all(shutil.which(name) for name in ('aria2c', 'cp')):
         raise RuntimeError('Install aria2c and coreutils first')
     root.mkdir(parents=True, exist_ok=True)
@@ -194,10 +196,10 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
     write_json(identity, dict(source=source, title=data['title']))
     read_events(state / 'events.jsonl', repair=True)
     recovered = {}
-    if retry_corrupted:
+    if retry_check:
         from recovery import recover_corrupted
         recovered = {event['path']: event for event in recover_corrupted(
-            root, source, retries, True, report_repo, mark, git_push, courses=courses)}
+            root, source, retries, True, report_repo, mark, git_push, courses=courses, force=True)}
     history_path = state / 'course-history.json'
     history = json.loads(history_path.read_text()) if history_path.exists() else {}
     for path in state.glob('*-status.json'):
@@ -209,7 +211,7 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
             if previous.get('time', '') >= history.get(name, {}).get('time', ''):
                 history[name] = previous
     write_json(history_path, history)
-    recovery_courses = [] if retry_corrupted else [
+    recovery_courses = [] if retry_check or deep else [
         course for course in courses if history.get(course, {}).get('state') == 'running']
     if recovery_courses:
         from recovery import recover_corrupted
@@ -217,14 +219,14 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
             root, source, retries, True, courses=recovery_courses)}
     events = {event['path']: event for event in read_events(state / 'events.jsonl')}
     registry = state / 'local-copies.json'
-    if registry.exists() and not deep_check:
-        for event in json.loads(registry.read_text()):
-            if event['source'].rstrip('/') == source.rstrip('/') and event['status'] == 'valid':
-                local = Path(event['local'])
-                if (local.exists() and local.stat().st_size == event['size']
-                        and local.stat().st_mtime_ns == event['mtime_ns']
-                        and not Path(str(local) + '.aria2').exists()):
-                    events[event['path']] = event
+    local_copies = json.loads(registry.read_text()) if registry.exists() else []
+    for event in local_copies:
+        if event['source'].rstrip('/') == source.rstrip('/') and (deep or event['status'] == 'valid'):
+            local = Path(event['local'])
+            if deep or (local.exists() and local.stat().st_size == event['size']
+                    and local.stat().st_mtime_ns == event['mtime_ns']
+                    and not Path(str(local) + '.aria2').exists()):
+                events[event['path']] = event
     write_json(state / 'catalog.json', data)
     write_json(state / 'courses.json', courses)
     lines = [data['title'] + ' — порядок скачивания', 'Источник: ' + source,
@@ -246,7 +248,8 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
         print(f'COURSE {index}/{len(courses)}: {course}', flush=True)
         status_path = state / f'{index:02d}-status.json'
         previous = history.get(course, {})
-        if not deep_check and previous.get('state') == 'finished' and previous.get('source') == source:
+        if (not deep and previous.get('state') == 'finished' and previous.get('source') == source
+                and not (retry_check and previous.get('failed'))):
             write_json(status_path, previous)
             verified += previous['verified']
             print(f'COURSE SKIPPED: {course}; already processed; verified={previous["verified"]}; failed={previous["failed"]}', flush=True)
@@ -254,9 +257,10 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
         failed = [event for event in failed if event['course'] != course]
         running = dict(previous, course=course, source=source, complete=False, state='running',
                        time=datetime.now().astimezone().isoformat())
-        history[course] = running
-        write_json(history_path, history)
-        write_json(status_path, running)
+        if not (deep and not retry_check):
+            history[course] = running
+            write_json(history_path, history)
+            write_json(status_path, running)
         entries = list_course(source, course, retries)
         for item in entries:
             target(root, item, course)
@@ -274,9 +278,24 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                 continue
             local = target(root, item, course)
             cached = events.get(item['path'], {})
-            if cached.get('local'):
+            if cached.get('local') and (deep or cached.get('status') == 'valid'):
                 local = Path(cached['local'])
-            if ((not deep_check or archived) and cached.get('status') == 'valid'
+            if deep and not retry_check:
+                status, detail = inspect(root, item, course, local)
+                event = record(state, item, course, 0, status, detail, local=local)
+                for copy in local_copies:
+                    if (copy['path'] == item['path'] and copy['source'].rstrip('/') == source.rstrip('/')
+                            and Path(copy['local']) == local):
+                        copy.update(event)
+                if registry.exists():
+                    write_json(registry, local_copies)
+                if status == 'valid':
+                    verified += 1
+                else:
+                    course_failed.append(event)
+                    failed.append(event)
+                continue
+            if ((not deep or archived) and cached.get('status') == 'valid'
                     and cached.get('sha256') == item['sha256'] and cached.get('size') == item['size']
                     and local.exists() and local.stat().st_size == item['size']
                     and ('mtime_ns' not in cached or local.stat().st_mtime_ns == cached['mtime_ns'])
@@ -284,6 +303,18 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                 verified += 1
                 print('FILE SKIPPED: ' + item['path'] + '; previously SHA-256 verified', flush=True)
             else:
+                if deep and local.exists() and not Path(str(local) + '.aria2').exists():
+                    status, detail = inspect(root, item, course, local)
+                    event = record(state, item, course, 0, status, detail, local=local)
+                    for copy in local_copies:
+                        if (copy['path'] == item['path'] and copy['source'].rstrip('/') == source.rstrip('/')
+                            and Path(copy['local']) == local):
+                            copy.update(event)
+                    if registry.exists():
+                        write_json(registry, local_copies)
+                    if status == 'valid':
+                        verified += 1
+                        continue
                 pending.append(item)
         needed = sum(max(0, item['size'] - (target(root, item, course).stat().st_size
                      if target(root, item, course).exists() else 0)) for item in pending)
@@ -356,7 +387,8 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                     write_json(broken_root / 'failed.json', failed)
             pending = remaining
         complete = not course_failed
-        course_status = dict(course=course, source=source, complete=complete, state='finished',
+        course_status = dict(course=course, source=source, complete=complete,
+                             state=previous.get('state', 'pending') if deep and not retry_check else 'finished',
                              total=len(entries), verified=len(entries) - len(course_failed),
                              failed=len(course_failed), time=datetime.now().astimezone().isoformat())
         write_json(status_path, course_status)
@@ -393,8 +425,8 @@ def main():
     fetching.add_argument('--destination', required=True, type=Path)
     fetching.add_argument('--include', action='append', help='Exact course name; repeatable')
     fetching.add_argument('--exclude', action='append', default=[], help='Exact course name; repeatable')
-    fetching.add_argument('--retry-corrupted', action='store_true', help='Retry independent missing ranges of previous failures before ordinary courses')
-    fetching.add_argument('--deep-check', action='store_true', help='Reprocess finished courses and recheck existing files with SHA-256')
+    fetching.add_argument('--retry-check', action='store_true', help='Retry independent missing ranges of previous failures before ordinary courses')
+    fetching.add_argument('--deep', action='store_true', help='Verify local SHA-256 without downloading; combine with --retry-check to repair')
     fetching.add_argument('--retries', type=int, default=2, help='Retries after the first attempt (default: 2)')
     fetching.add_argument('--report-repo', type=Path, help='Update course cards after each course')
     fetching.add_argument('--mark', help='Custom copy owner mark for reports')
@@ -447,7 +479,7 @@ def main():
             available = {item['name'] for item in catalog(data['source'])['courses']}
             if {PurePosixPath(name).parts[0] for name in chosen} - available:
                 raise ValueError('Selected courses no longer exist in the source folder')
-        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep_check, args.retry_corrupted)
+        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep, args.retry_check)
     except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(2, f'Error: {error}\n')
 

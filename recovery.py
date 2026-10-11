@@ -286,6 +286,23 @@ def reconcile_course(root, course):
 
 
 def finish_recovery(root, event, item=None, retries=2, _redownload=True):
+    from download import write_json
+    ledger_path = root / '.download/recovery-state.json'
+    ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
+    ledger[event['path']] = dict(state='running', event=dict(event))
+    write_json(ledger_path, ledger)
+    try:
+        result = _finish_recovery(root, event, item, retries, _redownload)
+    except ValueError:
+        ledger[event['path']] = dict(state='finished', event=dict(event))
+        write_json(ledger_path, ledger)
+        raise
+    ledger[event['path']] = dict(state='finished', event=dict(event))
+    write_json(ledger_path, ledger)
+    return result
+
+
+def _finish_recovery(root, event, item=None, retries=2, _redownload=True):
     from download import record, target, write_json
     path = body_path(root, event)
     if item:
@@ -336,7 +353,7 @@ def finish_recovery(root, event, item=None, retries=2, _redownload=True):
     return promote_partial(root, event)
 
 
-def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, mark=None, git_push=False, courses=None):
+def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, mark=None, git_push=False, courses=None, force=False):
     from download import files, write_json, read_events
     root = root.resolve()
     candidates = {}
@@ -361,6 +378,8 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                 local = Path(row['local'])
                 if local.exists() and (local.stat().st_size, local.stat().st_mtime_ns) == (row['size'], row['mtime_ns']):
                     valid[row['path']] = row
+    ledger_path = root / '.download/recovery-state.json'
+    ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
     metadata = {}
     results = []
     for _, event in candidates.values():
@@ -373,6 +392,20 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                     and not Path(str(local) + '.aria2').exists())
         if retry and complete:
             reconcile_course(root, event['course'])
+            continue
+        ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
+        saved = ledger.get(event['path'])
+        if saved and (saved['event']['size'], saved['event']['sha256']) == (event['size'], event['sha256']):
+            event = dict(saved['event'])
+            if retry and not force and saved['state'] == 'finished':
+                results.append(event)
+                print('RECOVERY SKIPPED: ' + event['path'] + '; attempt already finished', flush=True)
+                continue
+        elif not saved and retry and not force and event.get('range_attempts'):
+            # Previous completed passes predate the per-file ledger.
+            ledger[event['path']] = dict(state='finished', event=dict(event))
+            write_json(ledger_path, ledger)
+            results.append(event)
             continue
         archived = body_path(root, event)
         original = root.joinpath(*Path(event['path']).parts[1:])
@@ -391,6 +424,10 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                     metadata[course] = {row['path']: row for row in files(source, '/' + course)}
                 item = metadata[course].get(event['path'])
                 if item is None:
+                    event['recovery_error'] = 'File no longer listed in source'
+                    ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
+                    ledger[event['path']] = dict(state='finished', event=dict(event))
+                    write_json(ledger_path, ledger)
                     raise ValueError('File no longer listed in source')
             finish_recovery(root, event, item, retries)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:

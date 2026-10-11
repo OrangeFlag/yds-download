@@ -183,17 +183,16 @@ class ReviewRegression(unittest.TestCase):
         counts = json.loads((self.state / 'course-history.json').read_text())['Course']
         self.assertEqual((counts['verified'], counts['failed'], counts['complete']), (1, 0, True))
 
-    def test_interrupted_deep_check_resumes_ordinary_download(self):
+    def test_interrupted_deep_preserves_finished_course(self):
         status = dict(total=1, verified=1, failed=0, complete=True, state='finished',
                       course='Course', source=self.source, time='2026-01-01')
         download.write_json(self.state / 'course-history.json', {'Course': status})
         download.write_json(self.state / '01-status.json', status)
         with patch.object(download, 'list_course', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
-                download.download(dict(source=self.source, title='test'), ['Course'], self.root, deep_check=True)
-        with patch.object(download, 'list_course', side_effect=RuntimeError('Resume reached unfinished course')):
-            with self.assertRaisesRegex(RuntimeError, 'Resume reached'):
-                download.download(dict(source=self.source, title='test'), ['Course'], self.root)
+                download.download(dict(source=self.source, title='test'), ['Course'], self.root, deep=True)
+        with patch.object(download, 'list_course', side_effect=AssertionError('Deep reopened finished course')):
+            self.assertEqual(download.download(dict(source=self.source, title='test'), ['Course'], self.root), 0)
 
     def test_legacy_running_without_timestamp_is_resumed(self):
         finished = dict(total=1, verified=1, failed=0, complete=True, state='finished',

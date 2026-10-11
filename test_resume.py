@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import download
 import recovery
+import semester_queue
 from test_regressions import Response
 
 
@@ -79,13 +80,102 @@ class ResumeChecks(unittest.TestCase):
     def test_explicit_retry_does_not_repeat_running_range_recovery(self):
         with patch.object(download.OPENER, 'open', side_effect=self.fail_range), \
                 patch.object(recovery, 'promote_partial', return_value=False):
-            self.assertEqual(self.run_download(retry_corrupted=True), 1)
+            self.assertEqual(self.run_download(retry_check=True), 1)
         self.assertEqual(len(self.requests), 2)
 
     def test_finished_archive_needs_explicit_retry(self):
         self.status('finished')
         with patch.object(download.OPENER, 'open', side_effect=AssertionError('Finished archive retried')):
             self.assertEqual(self.run_download(), 1)
+
+    def test_completed_attempt_is_skipped_after_running_restart(self):
+        with patch.object(download.OPENER, 'open', side_effect=self.fail_range), \
+                patch.object(recovery, 'promote_partial', return_value=False):
+            self.assertEqual(self.run_download(), 1)
+            first = len(self.requests)
+            self.status('running')
+            self.assertEqual(self.run_download(), 1)
+            self.assertEqual(len(self.requests), first)
+            self.assertEqual(self.run_download(retry_check=True), 1)
+            self.assertGreater(len(self.requests), first)
+
+    def test_interrupted_recovery_remains_resumable(self):
+        with patch.object(recovery, 'retry_ranges', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                recovery.finish_recovery(self.root, self.event, self.item, 0)
+        ledger = json.loads((self.state / 'recovery-state.json').read_text())
+        self.assertEqual(ledger[self.item['path']]['state'], 'running')
+        with patch.object(download.OPENER, 'open', side_effect=self.serve):
+            self.assertEqual(self.run_download(), 0)
+
+    def test_legacy_completed_ranges_not_replayed(self):
+        self.event['range_attempts'] = [dict(status='failed')]
+        download.write_json(self.body.parents[1] / 'failed.json', [self.event])
+        with patch.object(download.OPENER, 'open', side_effect=AssertionError('Legacy replay')):
+            self.assertEqual(self.run_download(), 1)
+        self.assertEqual(json.loads((self.state / 'recovery-state.json').read_text())[self.item['path']]['state'], 'finished')
+
+    def test_deep_only_checks_local_missing_without_ranges(self):
+        self.status('finished')
+        with patch.object(download.OPENER, 'open', side_effect=AssertionError('Deep fetched content')):
+            self.assertEqual(self.run_download(deep=True), 1)
+        self.assertFalse((self.state / 'recovery-state.json').exists())
+
+    def test_deep_external_copy_checks_sha_and_updates_registry(self):
+        external = self.root / 'external.mp4'
+        external.write_bytes(b'B' * 128)
+        copy = dict(self.event, source=self.source, local=str(external), status='valid',
+                    mtime_ns=external.stat().st_mtime_ns)
+        download.write_json(self.state / 'local-copies.json', [copy])
+        self.status('finished')
+        with patch.object(download.OPENER, 'open', side_effect=AssertionError('Deep fetched content')):
+            self.assertEqual(self.run_download(deep=True), 1)
+        self.assertEqual(json.loads((self.state / 'local-copies.json').read_text())[0]['status'], 'invalid')
+        self.assertEqual(external.read_bytes(), b'B' * 128)
+        external.write_bytes(self.content)
+        with patch.object(download.OPENER, 'open', side_effect=AssertionError('Deep fetched content')):
+            self.assertEqual(self.run_download(deep=True), 0)
+        repaired = json.loads((self.state / 'local-copies.json').read_text())[0]
+        self.assertEqual(repaired['status'], 'valid')
+        self.assertEqual(repaired['local'], str(external))
+
+    def test_deep_missing_unstarted_course_stays_pending(self):
+        (self.state / 'course-history.json').unlink()
+        with patch.object(download.OPENER, 'open', side_effect=AssertionError('Deep fetched content')):
+            self.assertEqual(self.run_download(deep=True), 1)
+        history = json.loads((self.state / 'course-history.json').read_text())
+        self.assertEqual(history['Course']['state'], 'pending')
+
+    def test_retry_check_does_not_rehash_ready_original(self):
+        original = self.root / 'Course/video.mp4'
+        original.parent.mkdir()
+        original.write_bytes(self.content)
+        download.record(self.state, self.item, 'Course', 0, 'valid', 'verified')
+        self.status('finished')
+        with patch.object(download.hashlib, 'file_digest', side_effect=AssertionError('Unexpected SHA read')), \
+                patch.object(download.OPENER, 'open', side_effect=AssertionError('Ready file downloaded')):
+            self.assertEqual(self.run_download(retry_check=True), 0)
+
+    def test_queue_flags_are_independent_and_deep_preserves_state(self):
+        queue = self.root / 'queue.json'
+        for deep, retry in ((True, False), (False, True), (True, True)):
+            job = dict(title='test', catalog='catalog.json', destination=str(self.root), state='pending')
+            download.write_json(queue, dict(archives=[job], deep=deep, retry_check=retry))
+            calls = []
+            with patch('sys.argv', ['semester_queue.py', str(queue)]), \
+                    patch.object(semester_queue.subprocess, 'call', side_effect=lambda cmd: calls.append(cmd) or 1):
+                semester_queue.main()
+            self.assertEqual('--deep' in calls[0], deep)
+            self.assertEqual('--retry-check' in calls[0], retry)
+            self.assertEqual(json.loads(queue.read_text())['archives'][0]['state'], 'pending' if deep and not retry else 'finished')
+
+    def test_changed_identity_does_not_use_completed_recovery(self):
+        old = dict(self.event, sha256='0' * 64)
+        download.write_json(self.state / 'recovery-state.json', {
+            self.item['path']: dict(state='finished', event=old)})
+        with patch.object(download.OPENER, 'open', side_effect=self.serve):
+            self.assertEqual(self.run_download(), 0)
+        self.assertEqual(self.requests, [(64, 128)])
 
     def test_api_does_not_retry_permanent_404(self):
         error = urllib.error.HTTPError('https://example.invalid', 404, 'Gone', {}, None)
