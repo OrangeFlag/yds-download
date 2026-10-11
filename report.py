@@ -163,6 +163,11 @@ def update_report(destination, repo, mark, git_push=False, message=None):
                 cells[-3], cells[-2] = f' {counts[0]} ', f' {counts[1]} '
                 return '|'.join(cells)
             updated = re.sub(pattern, year_row, updated, flags=re.M)
+        def total_row(match):
+            cells = match[0].split('|')
+            cells[-3], cells[-2] = f' **{ok}** ', f' **{gap}** '
+            return '|'.join(cells)
+        updated = re.sub(r'^\| \*\*Всего\*\* \|.*$', total_row, updated, flags=re.M)
         if updated != original:
             changes.append((readme, updated))
     paths = [str(path.relative_to(repo)) for path, _ in changes]
