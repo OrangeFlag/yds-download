@@ -243,6 +243,34 @@ class ResumeChecks(unittest.TestCase):
         self.assertIn('--disk-cache-mib=128', calls[0])
         self.assertNotIn('--range-workers=2', calls[0])
 
+    def test_no_transfer_does_not_require_reserved_disk_space(self):
+        original = self.root / 'Course/video.mp4'
+        original.parent.mkdir()
+        original.write_bytes(self.content)
+        download.record(self.state, self.item, 'Course', 0, 'valid', 'verified')
+        with patch.object(download.shutil, 'disk_usage', return_value=type('Space', (), {'free': 100})()), \
+                patch.object(download.OPENER, 'open', side_effect=AssertionError('No transfer needed')):
+            self.assertEqual(self.run_download(deep=True), 0)
+
+    def test_low_rps_rate_wait_is_interruptible_in_short_sleeps(self):
+        sleeps = []
+        with patch.object(download.OPENER, 'open', side_effect=self.fail_range), \
+                patch.object(recovery.time, 'sleep', side_effect=sleeps.append):
+            recovery.retry_ranges(self.root, self.event, self.item, 0,
+                                  dict(range_rps=0.01, range_retry_delay=0))
+        self.assertGreater(len(sleeps), 10)
+        self.assertTrue(all(0 <= duration <= 0.25 for duration in sleeps))
+
+    def test_local_only_recover_preserves_unfinished_network_attempt(self):
+        download.write_json(self.state / 'recovery-state.json', {
+            self.item['path']: dict(state='running', event=self.event)})
+        with patch.object(download.OPENER, 'open', side_effect=AssertionError('Offline made request')):
+            recovery.recover_corrupted(self.root, self.source)
+        self.assertEqual(json.loads((self.state / 'recovery-state.json').read_text())[self.item['path']]['state'], 'running')
+        with patch.object(download.OPENER, 'open', side_effect=self.serve):
+            self.assertEqual(self.run_download(), 0)
+        self.assertEqual(self.requests, [(64, 128)])
+
     def test_api_does_not_retry_permanent_404(self):
         error = urllib.error.HTTPError('https://example.invalid', 404, 'Gone', {}, None)
         attempts = []

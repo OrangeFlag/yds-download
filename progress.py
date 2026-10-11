@@ -79,6 +79,8 @@ def saved_ranges(path, expected, sha256):
         data = json.loads(journal.read_text())
         if data["size"] != expected or data["sha256"] != sha256:
             raise ValueError("Range journal source mismatch")
+        if data.get("control_imported"):
+            ranges = []
         for start, end in data["ranges"]:
             if not isinstance(start, int) or not isinstance(end, int) or not 0 <= start < end <= expected:
                 raise ValueError("Invalid saved range")

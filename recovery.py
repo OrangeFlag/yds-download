@@ -66,7 +66,8 @@ def promote_partial(root, event):
         stat = destination.stat()
         if (stat.st_size, stat.st_mtime_ns) != (old['local_size'], old['mtime_ns']):
             raise FileExistsError('Partial copy changed locally: ' + str(destination))
-        if not old.get('sha256_mismatch') and (old.get('downloaded_bytes') or 0) >= (event.get('downloaded_bytes') or 0):
+        if (not old.get('sha256_mismatch') and (old['size'], old['sha256']) == (event['size'], event['sha256'])
+                and (old.get('downloaded_bytes') or 0) >= (event.get('downloaded_bytes') or 0)):
             return True
     if destination.exists() and not old:
         raise FileExistsError('Unregistered partial copy: ' + str(destination))
@@ -92,6 +93,7 @@ def new_recovery_body(root, event, reason):
         event.pop(key, None)
     event['restart_reason'] = reason
     event.update(progress(body_path(root, event), event['size'], sha256=event['sha256']))
+    recovery_state(root, event, 'running')
     write_json(archive / 'failed.json', [event])
 
 
@@ -111,7 +113,7 @@ def retry_ranges(root, event, item, retries, tuning=None):
     cursor = json.loads(journal.read_text()).get('salvage_cursor', 0) if journal.exists() else 0
     additional = [list(bounds) for bounds in ranges]
     # Drop proofs past the retained body before a new write can extend it again.
-    write_json(journal, dict(size=event['size'], sha256=event['sha256'], ranges=additional, salvage_cursor=cursor))
+    write_json(journal, dict(size=event['size'], sha256=event['sha256'], ranges=additional, salvage_cursor=cursor, control_imported=True))
     total = event['size']
     missing_bytes = total - sum(end - start for start, end in ranges)
     if shutil.disk_usage(root).free < missing_bytes + tuning['free_space_mib'] * 1024 ** 2:
@@ -123,7 +125,13 @@ def retry_ranges(root, event, item, retries, tuning=None):
         nonlocal next_request
         start, end = bounds
         with rate_lock:
-            time.sleep(max(0, next_request - time.monotonic()))
+            delay = max(0, next_request - time.monotonic())
+            while delay > 0:
+                if stopping.is_set():
+                    return bounds, None, 'Interrupted'
+                pause = min(delay, 0.25)
+                time.sleep(pause)
+                delay -= pause
             next_request = time.monotonic() + 1 / tuning['range_rps']
         if stopping.is_set():
             return bounds, None, 'Interrupted'
@@ -199,7 +207,7 @@ def retry_ranges(root, event, item, retries, tuning=None):
                 with path.open('r+b' if path.exists() else 'w+b') as stream:
                     stream.seek(saved[0]); stream.write(data); stream.flush(); os.fsync(stream.fileno())
                 additional = merge_ranges(additional + [saved])
-                write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor))
+                write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor, control_imported=True))
                 ranges = merge_ranges(ranges + [saved])
             outcomes.append(dict(start=bounds[0], end=bounds[1], saved_bytes=len(data) if data else 0, error=error))
         # Consume completed requests immediately so Ctrl+C cannot lose later successful chunks.
@@ -231,7 +239,7 @@ def retry_ranges(root, event, item, retries, tuning=None):
             pool.shutdown(wait=True, cancel_futures=True)
         if fine:
             cursor = missing[-1][1] % total
-            write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor))
+            write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor, control_imported=True))
         attempts.append(dict(attempt=attempt, ranges=outcomes, unprobed=unprobed, fine=fine))
         failed_count = sum(row['saved_bytes'] < row['end'] - row['start'] for row in outcomes)
         remaining_span = max((row['end'] - row['start'] - row['saved_bytes'] for row in outcomes), default=0)
@@ -288,20 +296,24 @@ def reconcile_course(root, course):
             write_json(path, status)
 
 
-def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None):
+def recovery_state(root, event, state):
     from download import write_json
-    ledger_path = root / '.download/recovery-state.json'
-    ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
-    ledger[event['path']] = dict(state='running', event=dict(event))
-    write_json(ledger_path, ledger)
+    path = root / '.download/recovery-state.json'
+    ledger = json.loads(path.read_text()) if path.exists() else {}
+    ledger[event['path']] = dict(state=state, event=dict(event))
+    write_json(path, ledger)
+
+
+def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None):
+    if item is None:
+        return _finish_recovery(root, event, item, retries, _redownload, tuning)
+    recovery_state(root, event, 'running')
     try:
         result = _finish_recovery(root, event, item, retries, _redownload, tuning)
     except ValueError:
-        ledger[event['path']] = dict(state='finished', event=dict(event))
-        write_json(ledger_path, ledger)
+        recovery_state(root, event, 'finished')
         raise
-    ledger[event['path']] = dict(state='finished', event=dict(event))
-    write_json(ledger_path, ledger)
+    recovery_state(root, event, 'finished')
     return result
 
 
@@ -356,7 +368,7 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
     return promote_partial(root, event)
 
 
-def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, mark=None, git_push=False, courses=None, force=False, tuning=None):
+def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, mark=None, git_push=False, courses=None, force=False, tuning=None, deep=False):
     from download import files, write_json, read_events
     root = root.resolve()
     candidates = {}
@@ -387,6 +399,14 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
     results = []
     for _, event in candidates.values():
         known = valid.get(event['path'], {})
+        if retry and deep:
+            from download import inspect_copies
+            checked = inspect_copies(root, event, event['course'], known, source)
+            if checked['status'] == 'valid':
+                checked['range_recovered_complete'] = True
+                results.append(checked)
+                reconcile_course(root, event['course'])
+                continue
         local = Path(known['local']) if known.get('local') else root.joinpath(*Path(event['path']).parts[1:])
         complete = (known.get('status') == 'valid' and known.get('sha256') == event['sha256']
                     and known.get('size') == event['size'] and local.exists()
@@ -439,6 +459,8 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
             if isinstance(error, OSError):
                 try:
                     finish_recovery(root, event)
+                    if retry:
+                        recovery_state(root, event, 'finished')
                 except (OSError, ValueError, KeyError, subprocess.SubprocessError) as local_error:
                     event['local_recovery_error'] = str(local_error)
         if retry and not event.get('range_recovered_complete'):
@@ -449,7 +471,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                 log.write(json.dumps(event, ensure_ascii=False) + '\n')
         results.append(event)
         write_json(root / '.download/range-retry.json', results)
-    by_path = {row['corrupted_path']: row for row in results}
+    by_path = {row['corrupted_path']: row for row in results if row.get('corrupted_path')}
     for manifest in (root / 'corrupted').glob('**/failed.json'):
         rows = json.loads(manifest.read_text())
         changed = False

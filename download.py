@@ -167,6 +167,63 @@ def record(state, item, course, attempt, status, detail, local=None):
     return event
 
 
+def inspect_copies(root, item, course, cached, source):
+    state = root / '.download'
+    registry = state / 'local-copies.json'
+    copies = json.loads(registry.read_text()) if registry.exists() else []
+    matching = [copy for copy in copies if copy['path'] == item['path']
+                and copy['source'].rstrip('/') == source.rstrip('/')]
+    locations = [root.joinpath(*PurePosixPath(item['path']).parts[1:])]
+    if cached.get('local'):
+        locations.append(Path(cached['local']))
+    locations.extend(Path(copy['local']) for copy in matching)
+    result = None
+    for local in dict.fromkeys(locations):
+        status, detail = inspect(root, item, course, local)
+        event = record(state, item, course, 0, status, detail, local=local)
+        for copy in matching:
+            if Path(copy['local']) == local:
+                copy.update(event)
+        if result is None or (result['status'] != 'valid' and status != 'missing'):
+            result = event
+    if registry.exists():
+        write_json(registry, copies)
+    # The final proof must win over a missing alternative in the event log.
+    if result is not event:
+        with (state / 'events.jsonl').open('a') as log:
+            log.write(json.dumps(result, ensure_ascii=False) + '\n')
+    return result
+
+
+def bind_resume(root, entries, previous, events, deep_only):
+    state = root / '.download'
+    path = state / 'resume-identities.json'
+    identities = json.loads(path.read_text()) if path.exists() else {}
+    for item in entries:
+        local = root.joinpath(*PurePosixPath(item['path']).parts[1:])
+        control = Path(str(local) + '.aria2')
+        old = identities.get(item['path'], previous.get(item['path'], events.get(item['path'], {})))
+        changed = old and (old.get('size'), old.get('sha256')) != (item['size'], item['sha256'])
+        unbound = control.exists() and not old
+        if (changed or unbound) and (local.exists() or control.exists()):
+            if deep_only:
+                identities[item['path']] = old
+                continue
+            archive = root / 'corrupted' / (datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '-source-change')
+            archive.mkdir(parents=True)
+            write_json(archive / 'source-change.json', dict(path=item['path'], previous=old,
+                       current={key: item[key] for key in ('size', 'sha256')}))
+            retained = archive.joinpath(*PurePosixPath(item['path']).parts[1:])
+            retained.parent.mkdir(parents=True, exist_ok=True)
+            for suffix in ('', '.aria2', '.ranges.json'):
+                existing = Path(str(local) + suffix)
+                if existing.exists():
+                    existing.rename(Path(str(retained) + suffix))
+            print('SOURCE CHANGED / UNBOUND RESUME PRESERVED: ' + item['path'], flush=True)
+        identities[item['path']] = {key: item[key] for key in ('size', 'sha256')}
+    write_json(path, identities)
+
+
 def list_course(source, course, retries=2, retry_delay=60):
     for attempt in range(retries + 1):
         try:
@@ -202,7 +259,7 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
     if retry_check:
         from recovery import recover_corrupted
         recovered = {event['path']: event for event in recover_corrupted(
-            root, source, retries, True, report_repo, mark, git_push, courses=courses, force=True, tuning=tuning)}
+            root, source, retries, True, report_repo, mark, git_push, courses=courses, force=True, tuning=tuning, deep=deep)}
     history_path = state / 'course-history.json'
     history = json.loads(history_path.read_text()) if history_path.exists() else {}
     for path in state.glob('*-status.json'):
@@ -267,6 +324,10 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
         entries = list_course(source, course, retries, tuning['listing_retry_delay'])
         for item in entries:
             target(root, item, course)
+        previous_entries = {}
+        for manifest in sorted(state.glob('*-manifest.json'), key=lambda path: path.stat().st_mtime_ns):
+            previous_entries.update({row['path']: row for row in json.loads(manifest.read_text())})
+        bind_resume(root, entries, previous_entries, events, deep and not retry_check)
         write_json(state / f'{index:02d}-manifest.json', [
             {k: item[k] for k in ('path', 'size', 'sha256')} for item in entries])
         print(f"FILES {len(entries)}; SIZE {sum(x['size'] for x in entries)/1024**3:.2f} GiB", flush=True)
@@ -284,15 +345,8 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
             if cached.get('local') and (deep or cached.get('status') == 'valid'):
                 local = Path(cached['local'])
             if deep and not retry_check:
-                status, detail = inspect(root, item, course, local)
-                event = record(state, item, course, 0, status, detail, local=local)
-                for copy in local_copies:
-                    if (copy['path'] == item['path'] and copy['source'].rstrip('/') == source.rstrip('/')
-                            and Path(copy['local']) == local):
-                        copy.update(event)
-                if registry.exists():
-                    write_json(registry, local_copies)
-                if status == 'valid':
+                event = inspect_copies(root, item, course, cached, source)
+                if event['status'] == 'valid':
                     verified += 1
                 else:
                     course_failed.append(event)
@@ -306,22 +360,15 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                 verified += 1
                 print('FILE SKIPPED: ' + item['path'] + '; previously SHA-256 verified', flush=True)
             else:
-                if deep and local.exists() and not Path(str(local) + '.aria2').exists():
-                    status, detail = inspect(root, item, course, local)
-                    event = record(state, item, course, 0, status, detail, local=local)
-                    for copy in local_copies:
-                        if (copy['path'] == item['path'] and copy['source'].rstrip('/') == source.rstrip('/')
-                            and Path(copy['local']) == local):
-                            copy.update(event)
-                    if registry.exists():
-                        write_json(registry, local_copies)
-                    if status == 'valid':
+                if deep:
+                    event = inspect_copies(root, item, course, cached, source)
+                    if event['status'] == 'valid':
                         verified += 1
                         continue
                 pending.append(item)
         needed = sum(max(0, item['size'] - (target(root, item, course).stat().st_size
                      if target(root, item, course).exists() else 0)) for item in pending)
-        if shutil.disk_usage(root).free < needed + tuning['free_space_mib'] * 1024 ** 2:
+        if pending and shutil.disk_usage(root).free < needed + tuning['free_space_mib'] * 1024 ** 2:
             raise RuntimeError('Insufficient free space for the course')
         for attempt in range(1, retries + 2):
             if not pending:

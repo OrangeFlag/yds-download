@@ -4,6 +4,7 @@ from concurrent.futures import wait as wait_for_requests
 import json
 from pathlib import Path
 import tempfile
+import struct
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -393,6 +394,167 @@ class ReviewRegression(unittest.TestCase):
         self.assertEqual(sorted((r['start'], r['end']) for r in second['ranges']),
                          [(0, 8 * 1024 ** 2), (8 * 1024 ** 2, 16 * 1024 ** 2)])
         self.assertGreater(sum(end - start for start, end in ranges), 15 * 1024 ** 2)
+
+
+    def test_stale_control_ranges_do_not_reappear_after_body_grows(self):
+        block = 65536
+        self.content = b'A' * (20 * block)
+        self.item.update(size=len(self.content), sha256=hashlib.sha256(self.content).hexdigest())
+        self.event.update(size=self.item['size'], sha256=self.item['sha256'])
+        self.body.write_bytes(self.content[:6 * block])
+        control = (struct.pack('>HIIIQQI', 1, 0, 0, block, self.item['size'], 0, 3)
+                   + bytes([255, 240, 0]) + struct.pack('>I', 0))
+        Path(str(self.body) + '.aria2').write_bytes(control)
+        def serve(request, timeout):
+            start = int(request.get_header('Range')[6:].split('-')[0])
+            if start < 16 * block:
+                raise urllib.error.HTTPError(request.full_url, 500, 'Unavailable', {}, None)
+            return self.serve(request, timeout)
+        with patch.object(download, 'files', return_value=[self.item]), \
+                patch.object(download.OPENER, 'open', side_effect=serve):
+            self.assertFalse(recovery.finish_recovery(self.root, self.event, self.item, retries=0))
+        self.assertEqual(self.event['downloaded_bytes'], 10 * block)
+        self.assertEqual(progress.saved_ranges(self.body, self.item['size'], self.item['sha256']),
+                         [[0, 6 * block], [16 * block, 20 * block]])
+        self.assertFalse((self.state / 'partial-copies.json').exists())
+        self.assertEqual(Path(str(self.body) + '.aria2').read_bytes(), control)
+
+    def test_changed_source_does_not_resume_or_promote_old_control(self):
+        original = self.root / 'Course/video.mp4'
+        original.parent.mkdir()
+        retained = self.content[:3 * self.item['size'] // 4]
+        original.write_bytes(retained)
+        control = (struct.pack('>HIIIQQI', 1, 0, 0, self.item['size'] // 4,
+                               self.item['size'], 0, 1)
+                   + bytes([224]) + struct.pack('>I', 0))
+        Path(str(original) + '.aria2').write_bytes(control)
+        download.write_json(self.state / '01-manifest.json', [{
+            key: self.item[key] for key in ('path', 'size', 'sha256')}])
+        self.content = b'B' * self.item['size']
+        self.item['sha256'] = hashlib.sha256(self.content).hexdigest()
+        def aria(*args, **kwargs):
+            self.assertFalse(original.exists(), 'Old source bytes reached the new aria2 queue')
+            self.assertFalse(Path(str(original) + '.aria2').exists())
+            return 1
+        error = urllib.error.HTTPError('https://example.invalid', 500, 'Unavailable', {}, None)
+        with patch.object(download, 'files', return_value=[self.item]), \
+                patch.object(download.subprocess, 'call', side_effect=aria), \
+                patch.object(download.OPENER, 'open', side_effect=error):
+            self.assertEqual(download.download(dict(source=self.source, title='test'),
+                                             ['Course'], self.root, retries=0), 1)
+        bodies = list((self.root / 'corrupted').glob('**/video.mp4'))
+        self.assertTrue(any(body.read_bytes() == retained for body in bodies))
+        controls = list((self.root / 'corrupted').glob('**/video.mp4.aria2'))
+        self.assertTrue(any(path.read_bytes() == control for path in controls))
+        registry = self.state / 'partial-copies.json'
+        copies = json.loads(registry.read_text()) if registry.exists() else []
+        self.assertFalse(any(copy['sha256'] == self.item['sha256'] for copy in copies))
+
+    def test_interrupted_unknown_body_resumes_new_retained_ranges(self):
+        self.body.write_bytes(b'Untrusted old body')
+        half = self.item['size'] // 2
+        def prefix(request, timeout):
+            return Response(0, half, self.item['size'], self.content[:half])
+        with patch.object(download, 'files', side_effect=[[self.item], KeyboardInterrupt]), \
+                patch.object(download.OPENER, 'open', side_effect=prefix):
+            with self.assertRaises(KeyboardInterrupt):
+                recovery.finish_recovery(self.root, self.event, self.item, retries=0)
+        new_body = recovery.body_path(self.root, self.event)
+        self.assertNotEqual(new_body, self.body)
+        self.assertEqual(new_body.read_bytes(), self.content[:half])
+        bodies_before = set((self.root / 'corrupted').glob('**/video.mp4'))
+        starts = []
+        def serve(request, timeout):
+            starts.append(int(request.get_header('Range')[6:].split('-')[0]))
+            return self.serve(request, timeout)
+        with patch.object(download, 'files', return_value=[self.item]), \
+                patch.object(download.OPENER, 'open', side_effect=serve):
+            recovery.recover_corrupted(self.root, self.source, retries=0, retry=True)
+        self.assertEqual(starts, [half])
+        self.assertEqual(set((self.root / 'corrupted').glob('**/video.mp4')), bodies_before)
+        self.assertEqual((self.root / 'Course/video.mp4').read_bytes(), self.content)
+        self.assertEqual(self.body.read_bytes(), b'Untrusted old body')
+
+    def test_deep_retry_checks_restored_original_before_archive_failure(self):
+        self.body.write_bytes(self.content[:self.item['size'] // 2])
+        self.journal(self.body, [[0, self.item['size'] // 2]])
+        original = self.root / 'Course/video.mp4'
+        original.parent.mkdir()
+        original.write_bytes(self.content)
+        error = urllib.error.HTTPError('https://example.invalid', 500, 'Unavailable', {}, None)
+        with patch.object(download, 'files', return_value=[self.item]), \
+                patch.object(download.OPENER, 'open', side_effect=error), \
+                patch.object(download.subprocess, 'call', side_effect=AssertionError('Ready file requeued')):
+            self.assertEqual(download.download(dict(source=self.source, title='test'),
+                                             ['Course'], self.root, retries=0, deep=True, retry_check=True), 0)
+        latest = download.read_events(self.state / 'events.jsonl')[-1]
+        self.assertEqual(latest['status'], 'valid')
+        self.assertEqual(latest['sha256'], self.item['sha256'])
+        self.assertEqual(original.read_bytes(), self.content)
+        status = json.loads((self.state / '01-status.json').read_text())
+        self.assertTrue(status['complete'])
+
+    def test_deep_missing_external_copy_keeps_valid_root_original(self):
+        original = self.root / 'Course/video.mp4'
+        original.parent.mkdir()
+        original.write_bytes(self.content)
+        download.record(self.state, self.item, 'Course', 0, 'valid', 'SHA verified')
+        copy = dict(self.event, source=self.source, status='valid',
+                    local=str(self.root / 'removed-external.mp4'), mtime_ns=0)
+        download.write_json(self.state / 'local-copies.json', [copy])
+        with patch.object(download, 'files', return_value=[self.item]), \
+                patch.object(download.OPENER, 'open', side_effect=AssertionError('Deep downloaded')):
+            self.assertEqual(download.download(dict(source=self.source, title='test'),
+                                             ['Course'], self.root, retries=0, deep=True), 0)
+        latest = download.read_events(self.state / 'events.jsonl')[-1]
+        self.assertEqual(latest['status'], 'valid')
+        self.assertEqual(latest['sha256'], self.item['sha256'])
+        self.assertEqual(Path(latest.get('local', str(original))), original)
+        self.assertEqual(json.loads((self.state / 'local-copies.json').read_text())[0]['status'], 'missing')
+
+    def test_new_source_partial_replaces_old_higher_coverage(self):
+        self.body.write_bytes(self.content)
+        self.journal(self.body, [[0, 3 * self.item['size'] // 4]])
+        recovery.promote_partial(self.root, self.event)
+        old_body = self.body
+        new_content = b'B' * self.item['size']
+        self.item['sha256'] = hashlib.sha256(new_content).hexdigest()
+        new_event = dict(self.event, sha256=self.item['sha256'], corrupted_path='corrupted/new/Course/video.mp4')
+        new_body = self.root / new_event['corrupted_path']
+        new_body.parent.mkdir(parents=True)
+        new_body.write_bytes(new_content)
+        self.journal(new_body, [[0, 3 * self.item['size'] // 5]])
+        self.assertTrue(recovery.promote_partial(self.root, new_event))
+        published = json.loads((self.state / 'partial-copies.json').read_text())[0]
+        self.assertEqual(published['sha256'], self.item['sha256'])
+        self.assertEqual((self.root / published['recovered_path']).read_bytes(), new_content)
+        self.assertEqual(old_body.read_bytes(), self.content)
+
+    def test_report_does_not_claim_old_source_external_or_partial(self):
+        self.body.write_bytes(self.content)
+        self.journal(self.body, [[0, 3 * self.item['size'] // 4]])
+        recovery.promote_partial(self.root, self.event)
+        external = self.root / 'external.mp4'
+        external.write_bytes(self.content)
+        download.write_json(self.state / 'local-copies.json', [dict(self.event, source=self.source,
+                            status='valid', local=str(external), mtime_ns=external.stat().st_mtime_ns)])
+        repo = self.root / 'repo'
+        (repo / 'courses').mkdir(parents=True)
+        card = repo / 'courses/course.md'
+        card.write_text('- Год: 2026\n- Источник: [disk](' + self.source + ')\n- Путь: `Course`\n'
+                        '**Статус:** копия есть\n'
+                        '| Файл | Размер | Копия 1 | Копия 2 | Копия 3 |\n'
+                        '| --- | --- | --- | --- | --- |\n'
+                        '| `video.mp4` | 1 | Walterit | Other | |\n')
+        new_item = dict(self.item, sha256=hashlib.sha256(b'B' * self.item['size']).hexdigest())
+        download.write_json(self.state / '01-manifest.json', [new_item])
+        download.record(self.state, new_item, 'Course', 1, 'missing', 'new source unavailable')
+        report.update_report(self.root, repo, 'Walterit')
+        self.assertIn('|  | Other |  |', card.read_text())
+        self.assertNotIn('partially available;', card.read_text())
+        self.assertEqual(external.read_bytes(), self.content)
+        partial = json.loads((self.state / 'partial-copies.json').read_text())[0]
+        self.assertTrue((self.root / partial['recovered_path']).exists())
 
 
 if __name__ == '__main__':

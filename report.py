@@ -32,11 +32,17 @@ def update_report(destination, repo, mark, git_push=False, message=None):
     events = {}
     for event in read_events(state / 'events.jsonl'):
         events[normalized(event['path'])] = event
+    expected = dict(events)
+    for manifest in sorted(state.glob('*-manifest.json'), key=lambda path: path.stat().st_mtime_ns):
+        expected.update({normalized(row['path']): row for row in json.loads(manifest.read_text())})
+    def same_identity(row):
+        identity = expected.get(normalized(row['path']))
+        return identity is None or (identity['size'], identity['sha256']) == (row['size'], row['sha256'])
     external = {}
     registry = state / 'local-copies.json'
     if registry.exists():
         for copy in json.loads(registry.read_text(encoding='utf-8')):
-            if copy['source'].rstrip('/') != source or copy['status'] != 'valid':
+            if copy['source'].rstrip('/') != source or copy['status'] != 'valid' or not same_identity(copy):
                 continue
             local = Path(copy['local'])
             if local.exists():
@@ -59,7 +65,7 @@ def update_report(destination, repo, mark, git_push=False, message=None):
                 stat = local.stat()
                 if (stat.st_size == copy['local_size'] and stat.st_mtime_ns == copy['mtime_ns']
                         and (copy.get('downloaded_bytes') or 0) * 2 > copy['size']
-                        and not copy.get('sha256_mismatch')):
+                        and not copy.get('sha256_mismatch') and same_identity(copy)):
                     partial[key] = copy
     terminal = {}
     for path in (destination / 'corrupted').glob('**/failed.json'):
@@ -101,7 +107,7 @@ def update_report(destination, repo, mark, git_push=False, message=None):
             if event:
                 status = event['status']
                 local = Path(local_copy['local']) if local_copy else destination.joinpath(*Path(event['path']).parts[1:])
-                if status == 'valid' and (not local.exists() or local.stat().st_size != event['size']
+                if status == 'valid' and (not same_identity(event) or not local.exists() or local.stat().st_size != event['size']
                                          or ('mtime_ns' in event and local.stat().st_mtime_ns != event['mtime_ns'])
                                          or Path(str(local) + '.aria2').exists()):
                     status = 'missing'
