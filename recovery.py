@@ -1,88 +1,21 @@
-"""Retry independent ranges and retain partial videos with usable timeline coverage."""
-from bisect import bisect_right
+"""Retry independent ranges and retain partial videos by confirmed byte coverage."""
 from datetime import datetime
 import hashlib
 import http.client
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from threading import Lock
+from threading import Event, Lock
 import urllib.request
 from progress import merge_ranges, saved_ranges, progress
 
 SUFFIX = ' (partially available)'
-
-
-def timeline(path, event):
-    ranges = saved_ranges(path, event['size'], event['sha256'])
-    if not ranges:
-        raise ValueError('No confirmed saved blocks')
-    starts = [start for start, end in ranges]
-    with tempfile.TemporaryFile() as output:
-        result = subprocess.run(['ffprobe', '-v', 'quiet', '-show_packets', '-show_streams',
-                                 '-show_format', '-show_entries',
-                                 'format=duration:stream=index,codec_type:packet=stream_index,pts_time,duration_time,pos,size,flags',
-                                 '-of', 'json', str(path)], stdout=output, stderr=subprocess.DEVNULL, timeout=60)
-        if result.returncode:
-            raise ValueError('ffprobe cannot read the video container')
-        output.seek(0)
-        data = json.load(output)
-    duration = float(data.get('format', {}).get('duration', 0))
-    if not 0 < duration < float('inf'):
-        raise ValueError('Original duration unavailable')
-    streams = data.get('streams', [])
-    video = next((stream['index'] for stream in streams if stream['codec_type'] == 'video'), None)
-    audio = next((stream['index'] for stream in streams if stream['codec_type'] == 'audio'), None)
-    if video is None:
-        raise ValueError('No video stream')
-    intervals = {video: []}
-    if audio is not None:
-        intervals[audio] = []
-    decoding = False
-    logical_size = path.stat().st_size
-    for packet in data.get('packets', []):
-        stream = packet['stream_index']
-        if stream not in intervals or not all(key in packet for key in ('pos', 'size', 'pts_time', 'duration_time')):
-            continue
-        position, size = int(packet['pos']), int(packet['size'])
-        index = bisect_right(starts, position) - 1
-        flags = packet.get('flags', '')
-        intact = index >= 0 and position + size <= min(ranges[index][1], logical_size) and 'C' not in flags
-        if stream == video:
-            if not intact:
-                decoding = False
-            elif 'K' in flags:
-                decoding = True
-            intact = intact and decoding
-        if intact:
-            start = max(0.0, float(packet['pts_time']))
-            end = min(duration, float(packet['pts_time']) + float(packet['duration_time']))
-            if end > start:
-                intervals[stream].append([start, end])
-    available = merge_ranges(intervals[video])
-    if audio is not None:
-        sound = merge_ranges(intervals[audio])
-        shared = []
-        i = j = 0
-        while i < len(available) and j < len(sound):
-            start = max(available[i][0], sound[j][0])
-            end = min(available[i][1], sound[j][1])
-            if end > start:
-                shared.append([start, end])
-            if available[i][1] < sound[j][1]:
-                i += 1
-            else:
-                j += 1
-        available = merge_ranges(shared)
-    seconds = sum(end - start for start, end in available)
-    return dict(duration_seconds=duration, available_seconds=seconds,
-                available_time_percent=100 * seconds / duration, available_intervals=available,
-                time_method='saved video packets from keyframes intersected with saved audio packets')
 
 
 def body_path(root, event):
@@ -106,15 +39,19 @@ def copy_saved(source, destination):
 
 def promote_partial(root, event):
     from download import write_json
+    if event.get('sha256_mismatch'):
+        return False
     path = body_path(root, event)
     if not path.exists() or path.stat().st_size == 0:
         return False
     event.update(progress(path, event['size'], sha256=event['sha256']))
-    event.update(timeline(path, event))
-    if event['available_time_percent'] <= 50:
+    for key in ('duration_seconds', 'available_seconds', 'available_time_percent', 'available_intervals', 'time_method', 'timeline_error'):
+        event.pop(key, None)
+    if (event.get('downloaded_bytes') or 0) * 2 <= event['size']:
         return False
     original_path = Path(event['path'])
-    if not original_path.is_absolute() or '..' in original_path.parts or original_path.parts[1] in ('.download', 'corrupted'):
+    if (not original_path.is_absolute() or len(original_path.parts) < 3
+            or '..' in original_path.parts or original_path.parts[1] in ('.download', 'corrupted')):
         raise ValueError('Unsafe recovered destination')
     original = root.joinpath(*original_path.parts[1:])
     if not original.resolve().is_relative_to(root) or not original.parent.resolve().is_relative_to(root):
@@ -128,7 +65,7 @@ def promote_partial(root, event):
         stat = destination.stat()
         if (stat.st_size, stat.st_mtime_ns) != (old['local_size'], old['mtime_ns']):
             raise FileExistsError('Partial copy changed locally: ' + str(destination))
-        if old['available_seconds'] >= event['available_seconds']:
+        if not old.get('sha256_mismatch') and (old.get('downloaded_bytes') or 0) >= (event.get('downloaded_bytes') or 0):
             return True
     if destination.exists() and not old:
         raise FileExistsError('Unregistered partial copy: ' + str(destination))
@@ -140,24 +77,43 @@ def promote_partial(root, event):
     copies = [row for row in copies if not (row['source'] == source and row['path'] == event['path'])]
     copies.append(copy)
     write_json(registry, copies)
-    print(f'PARTIALLY AVAILABLE: {event["path"]}; bytes={event["downloaded_percent"]:.2f}%; time={event["available_time_percent"]:.2f}%', flush=True)
+    print(f'PARTIALLY AVAILABLE: {event["path"]}; bytes={event["downloaded_percent"]:.2f}%', flush=True)
     return True
 
 
+def new_recovery_body(root, event, reason):
+    from download import write_json
+    archive = root / 'corrupted' / (datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '-recovery')
+    archive.mkdir(parents=True)
+    event.setdefault('preserved_archive_paths', []).append(event['corrupted_path'])
+    event['corrupted_path'] = str(archive.joinpath(*Path(event['path']).parts[1:]).relative_to(root))
+    for key in ('sha256_mismatch', 'recovery_error', 'available_seconds', 'available_time_percent', 'available_intervals', 'time_method', 'range_attempts'):
+        event.pop(key, None)
+    event['restart_reason'] = reason
+    event.update(progress(body_path(root, event), event['size'], sha256=event['sha256']))
+    write_json(archive / 'failed.json', [event])
+
+
 def retry_ranges(root, event, item, retries):
-    from download import OPENER, write_json
+    from download import OPENER, write_json, files
     if item['size'] != event['size'] or item['sha256'] != event['sha256']:
         raise ValueError('Source file changed; refuse to combine ranges')
     path = body_path(root, event)
     path.parent.mkdir(parents=True, exist_ok=True)
     ranges = saved_ranges(path, event['size'], event['sha256'])
+    if path.exists() and path.stat().st_size and not ranges:
+        new_recovery_body(root, event, 'No trusted ranges in existing body; retain it separately')
+        path = body_path(root, event)
+        path.parent.mkdir(parents=True, exist_ok=True)
     journal = Path(str(path) + '.ranges.json')
     additional = json.loads(journal.read_text())['ranges'] if journal.exists() else []
+    cursor = json.loads(journal.read_text()).get('salvage_cursor', 0) if journal.exists() else 0
     total = event['size']
     missing_bytes = total - sum(end - start for start, end in ranges)
     if shutil.disk_usage(root).free < missing_bytes + 1024 ** 3:
         raise RuntimeError('Insufficient disk space for range recovery')
     rate_lock = Lock()
+    stopping = Event()
     next_request = 0.0
     def fetch(bounds):
         nonlocal next_request
@@ -165,25 +121,42 @@ def retry_ranges(root, event, item, retries):
         with rate_lock:
             time.sleep(max(0, next_request - time.monotonic()))
             next_request = time.monotonic() + 1 / 6
+        if stopping.is_set():
+            return bounds, None, 'Interrupted'
         request = urllib.request.Request(item['file'], headers={'Range': f'bytes={start}-{end - 1}', 'Accept-Encoding': 'identity'})
         try:
             with OPENER.open(request, timeout=30) as response:
-                expected = f'bytes {start}-{end - 1}/{total}'
-                if response.status != 206 or response.headers.get('Content-Range') != expected:
+                served = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', response.headers.get('Content-Range', ''))
+                if (response.status != 206 or not served or int(served[1]) != start
+                        or not start <= int(served[2]) < end or int(served[3]) != total
+                        or response.headers.get('Content-Encoding', 'identity') != 'identity'):
                     return bounds, None, 'Range not honoured'
+                length = int(served[2]) - start + 1
+                data = bytearray()
+                error = None
                 try:
-                    data = response.read(end - start)
-                except http.client.IncompleteRead as error:
-                    data = error.partial
-                if len(data) > end - start:
+                    while len(data) < length and not stopping.is_set():
+                        chunk = response.read1(min(64 * 1024, length - len(data)))
+                        if not chunk:
+                            break
+                        data.extend(chunk)
+                except http.client.IncompleteRead as failure:
+                    data.extend(failure.partial)
+                    error = 'Incomplete response'
+                except (OSError, http.client.HTTPException) as failure:
+                    error = type(failure).__name__
+                if len(data) > length:
                     return bounds, None, 'Oversized response'
-                return bounds, data or None, None if len(data) == end - start else 'Incomplete response'
+                return bounds, data or None, error or (None if len(data) == length else 'Incomplete response')
         except (OSError, http.client.HTTPException) as error:
             return bounds, None, 'HTTP ' + str(error.code) if hasattr(error, 'code') else type(error).__name__
     attempts = []
-    for attempt in range(1, retries + 2):
+    for attempt in range(1, retries + 3):
         # Backend block geometry is unpublished; refine failed intervals by observed responses.
         block = max(64 * 1024, 16 * 1024 ** 2 // (4 ** min(attempt - 1, 4)))
+        fine = attempt == retries + 2
+        if fine:
+            block = 64 * 1024
         missing = []
         position = 0
         for start, end in ranges + [[total, total]]:
@@ -194,90 +167,177 @@ def retry_ranges(root, event, item, retries):
             position = end
         if not missing:
             break
+        unprobed = 0
+        if fine:
+            # Bound the cost of an unavailable multi-GiB file; later runs continue this scan.
+            missing = [bounds for bounds in missing if bounds[0] >= cursor] + [bounds for bounds in missing if bounds[0] < cursor]
+            unprobed = max(0, len(missing) - 256)
+            missing = missing[:256]
         if attempt > 1:
             time.sleep(10)
+        source = json.loads((root / '.download/source.json').read_text())['source']
+        fresh = next((row for row in files(source, '/' + event['course']) if row['path'] == event['path']), None)
+        if not fresh or (fresh['size'], fresh['sha256']) != (event['size'], event['sha256']):
+            raise ValueError('Source file changed or disappeared; refuse to combine ranges')
+        item = fresh
         outcomes = []
+        def save_result(future):
+            nonlocal additional, ranges
+            bounds, data, error = future.result()
+            if data is not None:
+                saved = [bounds[0], bounds[0] + len(data)]
+                with path.open('r+b' if path.exists() else 'w+b') as stream:
+                    stream.seek(saved[0]); stream.write(data); stream.flush(); os.fsync(stream.fileno())
+                additional = merge_ranges(additional + [saved])
+                write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor))
+                ranges = merge_ranges(ranges + [saved])
+            outcomes.append(dict(start=bounds[0], end=bounds[1], saved_bytes=len(data) if data else 0, error=error))
         # Consume completed requests immediately so Ctrl+C cannot lose later successful chunks.
         pool = ThreadPoolExecutor(max_workers=8)
+        futures = set()
         try:
             pending = iter(missing)
-            futures = {pool.submit(fetch, bounds) for bounds in missing[:8]}
+            for bounds in missing[:8]:
+                futures.add(pool.submit(fetch, bounds))
             for _ in missing[:8]:
                 next(pending)
             while futures:
                 completed, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for future in completed:
+                    save_result(future)
                     futures.remove(future)
-                    bounds, data, error = future.result()
-                    if data is not None:
-                        saved = [bounds[0], bounds[0] + len(data)]
-                        with path.open('r+b' if path.exists() else 'w+b') as stream:
-                            stream.seek(saved[0]); stream.write(data); stream.flush(); os.fsync(stream.fileno())
-                        additional = merge_ranges(additional + [saved])
-                        write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional))
-                        ranges = merge_ranges(ranges + [saved])
-                    outcomes.append(dict(start=bounds[0], end=bounds[1], saved_bytes=len(data) if data else 0, error=error))
                     bounds = next(pending, None)
                     if bounds is not None:
                         futures.add(pool.submit(fetch, bounds))
+        except KeyboardInterrupt:
+            stopping.set()
+            pool.shutdown(wait=True, cancel_futures=True)
+            for future in futures:
+                if not future.cancelled():
+                    save_result(future)
+            raise
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
-        attempts.append(dict(attempt=attempt, ranges=outcomes))
+        if fine:
+            cursor = missing[-1][1] % total
+            write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor))
+        attempts.append(dict(attempt=attempt, ranges=outcomes, unprobed=unprobed, fine=fine))
         event['range_attempts'] = attempts
         event.update(progress(path, total, sha256=event['sha256']))
-        print(f'RANGE PASS {attempt}/{retries + 1}: {event["path"]}; chunk={block}; saved={sum(row["saved_bytes"] > 0 for row in outcomes)}/{len(outcomes)}; bytes={event["downloaded_percent"]}', flush=True)
+        print(f'RANGE PASS {attempt}/{retries + 2}: {event["path"]}; chunk={block}; saved={sum(row["saved_bytes"] > 0 for row in outcomes)}/{len(outcomes)}; bytes={event["downloaded_percent"]}; unprobed={unprobed}', flush=True)
     return ranges
 
 
-def finish_recovery(root, event, item=None, retries=2):
+def reconcile_course(root, course):
+    from download import read_events, write_json
+    state = root / '.download'
+    history = state / 'course-history.json'
+    statuses = json.loads(history.read_text()) if history.exists() else {}
+    status = statuses.get(course)
+    if not status or status.get('state') != 'finished':
+        return
+    source = json.loads((state / 'source.json').read_text())['source'].rstrip('/')
+    proofs = {row['path']: row for row in read_events(state / 'events.jsonl')}
+    registry = state / 'local-copies.json'
+    if registry.exists():
+        for row in json.loads(registry.read_text()):
+            if row['source'].rstrip('/') == source and row['status'] == 'valid':
+                local = Path(row['local'])
+                if local.exists() and (local.stat().st_size, local.stat().st_mtime_ns) == (row['size'], row['mtime_ns']):
+                    proofs[row['path']] = row
+    prefix = '/' + course + '/'
+    expected = [row for path, row in proofs.items() if path.startswith(prefix)]
+    for manifest in sorted(state.glob('*-manifest.json'), key=lambda path: path.stat().st_mtime_ns, reverse=True):
+        rows = json.loads(manifest.read_text())
+        if len(rows) == status['total'] and all(row['path'].startswith(prefix) for row in rows):
+            expected = rows
+            break
+    if len(expected) != status['total']:
+        return
+    verified = 0
+    for row in expected:
+        proof = proofs.get(row['path'], {})
+        local = Path(proof['local']) if proof.get('local') else root.joinpath(*Path(row['path']).parts[1:])
+        if (proof.get('status') == 'valid' and proof.get('sha256') == row['sha256']
+                and proof.get('size') == row['size'] and local.exists()
+                and local.stat().st_size == row['size']
+                and ('mtime_ns' not in proof or local.stat().st_mtime_ns == proof['mtime_ns'])
+                and not Path(str(local) + '.aria2').exists()):
+            verified += 1
+    status.update(verified=verified, failed=status['total'] - verified,
+                  complete=verified == status['total'], time=datetime.now().astimezone().isoformat())
+    write_json(history, statuses)
+    for path in state.glob('*-status.json'):
+        previous = json.loads(path.read_text())
+        if previous.get('course') == course and previous.get('state') == 'finished':
+            write_json(path, status)
+
+
+def finish_recovery(root, event, item=None, retries=2, _redownload=True):
     from download import record, target, write_json
     path = body_path(root, event)
     if item:
         retry_ranges(root, event, item, retries)
+        path = body_path(root, event)
     ranges = saved_ranges(path, event['size'], event['sha256'])
     if ranges == [[0, event['size']]] and path.exists():
         with path.open('rb') as stream:
             digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if digest != event['sha256']:
+            rejected = dict(event, sha256_mismatch=True, recovery_error='SHA-256 mismatch: ' + digest)
+            for manifest in (root / 'corrupted').glob('**/failed.json'):
+                rows = json.loads(manifest.read_text())
+                changed = False
+                for index, row in enumerate(rows):
+                    relative = row.get('corrupted_path') or str(manifest.parent.joinpath(*Path(row['path']).parts[1:]).relative_to(root))
+                    if relative == event['corrupted_path']:
+                        rows[index] = rejected
+                        changed = True
+                if changed:
+                    write_json(manifest, rows)
+            registry = root / '.download/partial-copies.json'
+            if registry.exists():
+                copies = json.loads(registry.read_text())
+                for copy in copies:
+                    if copy['path'] == event['path'] and copy['sha256'] == event['sha256']:
+                        copy['sha256_mismatch'] = True
+                write_json(registry, copies)
+            event.update(rejected)
+            if not item or not _redownload:
+                raise ValueError('SHA-256 mismatch; archived body retained and not promoted')
+            # Retry in a separate body: no block hashes exist to locate the damaged bytes.
+            event.setdefault('sha256_rejected_paths', []).append(event['corrupted_path'])
+            new_recovery_body(root, event, 'SHA-256 mismatch; retry in a separate body')
+            return finish_recovery(root, event, item, retries, _redownload=False)
         if digest == event['sha256'] and item:
             destination = target(root, item, event['course'])
             copy_saved(path, destination)
             Path(str(destination) + '.aria2').unlink(missing_ok=True)
             record(root / '.download', item, event['course'], 0, 'valid', 'Recovered all ranges and SHA-256 verified')
-            history = root / '.download/course-history.json'
-            if history.exists():
-                statuses = json.loads(history.read_text())
-                status = statuses.get(event['course'])
-                if status:
-                    status['verified'] = min(status['total'], status['verified'] + 1)
-                    status['failed'] = max(0, status['failed'] - 1)
-                    status['complete'] = status['failed'] == 0 and status['verified'] == status['total']
-                    status['time'] = datetime.now().astimezone().isoformat()
-                    write_json(history, statuses)
-                    for old in (root / '.download').glob('*-status.json'):
-                        if json.loads(old.read_text()).get('course') == event['course']:
-                            write_json(old, status)
+            reconcile_course(root, event['course'])
             event['range_recovered_complete'] = True
             return True
     return promote_partial(root, event)
 
 
-def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, mark=None, git_push=False):
-    from download import files, write_json
+def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, mark=None, git_push=False, courses=None):
+    from download import files, write_json, read_events
     root = root.resolve()
     candidates = {}
     for manifest in (root / 'corrupted').glob('**/failed.json'):
         for row in json.loads(manifest.read_text()):
+            if courses is not None and row['course'] not in courses:
+                continue
             if 'corrupted_path' not in row:
                 row = dict(row, corrupted_path=str(manifest.parent.joinpath(*Path(row['path']).parts[1:]).relative_to(root)))
             path = body_path(root, row)
             amount = progress(path, row['size'], sha256=row['sha256']).get('downloaded_bytes') or 0
             previous = candidates.get(row['path'])
-            if previous is None or amount > previous[0] or (amount == previous[0] and row['time'] > previous[1]['time']):
+            rank = (not row.get('sha256_mismatch', False), amount, row['time'])
+            old_rank = (not previous[1].get('sha256_mismatch', False), previous[0], previous[1]['time']) if previous else None
+            if previous is None or rank > old_rank:
                 candidates[row['path']] = (amount, row)
-    valid = {}
-    for line in (root / '.download/events.jsonl').read_text().splitlines():
-        if line.strip():
-            row = json.loads(line); valid[row['path']] = row
+    valid = {row['path']: row for row in read_events(root / '.download/events.jsonl', repair=True)}
     registry = root / '.download/local-copies.json'
     if registry.exists():
         for row in json.loads(registry.read_text()):
@@ -290,9 +350,23 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
     for _, event in candidates.values():
         known = valid.get(event['path'], {})
         local = Path(known['local']) if known.get('local') else root.joinpath(*Path(event['path']).parts[1:])
-        complete = known.get('status') == 'valid' and local.exists() and local.stat().st_size == known['size'] and not Path(str(local) + '.aria2').exists()
+        complete = (known.get('status') == 'valid' and known.get('sha256') == event['sha256']
+                    and known.get('size') == event['size'] and local.exists()
+                    and local.stat().st_size == known['size']
+                    and ('mtime_ns' not in known or local.stat().st_mtime_ns == known['mtime_ns'])
+                    and not Path(str(local) + '.aria2').exists())
         if retry and complete:
+            reconcile_course(root, event['course'])
             continue
+        archived = body_path(root, event)
+        original = root.joinpath(*Path(event['path']).parts[1:])
+        # Finish an archive move interrupted between manifest, body and control writes.
+        control = Path(str(original) + '.aria2')
+        if retry and (control.exists() or (original.exists() and not archived.exists())):
+            archived.parent.mkdir(parents=True, exist_ok=True)
+            for src, out in ((original, archived), (control, Path(str(archived) + '.aria2'))):
+                if src.exists() and not out.exists():
+                    src.rename(out)
         try:
             item = None
             if retry:

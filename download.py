@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -26,8 +27,9 @@ def api(source, path='/', offset=0):
         try:
             with OPENER.open(url, timeout=40) as response:
                 return json.load(response)
-        except Exception:
-            if attempt == 4:
+        except Exception as error:
+            if (isinstance(error, urllib.error.HTTPError)
+                    and 400 <= error.code < 500 and error.code not in (408, 429)) or attempt == 4:
                 raise
             time.sleep(min(2 ** (attempt + 1), 30))
 
@@ -106,6 +108,32 @@ def write_json(path, data):
     temporary.replace(path)
 
 
+def read_events(path, repair=False):
+    if not path.exists():
+        return []
+    data = path.read_bytes()
+    lines = data.splitlines(keepends=True)
+    events = []
+    offset = 0
+    for index, line in enumerate(lines):
+        if line.strip():
+            try:
+                events.append(json.loads(line))
+            except (ValueError, UnicodeDecodeError):
+                if index != len(lines) - 1 or line.endswith(b'\n'):
+                    raise
+                if repair:
+                    with path.open('r+b') as stream:
+                        stream.truncate(offset)
+                break
+        offset += len(line)
+    # A complete last JSON object may still lack the separator for the next append.
+    if repair and data and not data.endswith(b'\n') and offset == len(data):
+        with path.open('ab') as stream:
+            stream.write(b'\n')
+    return events
+
+
 def inspect(root, item, course):
     path = target(root, item, course)
     if not path.exists():
@@ -136,18 +164,21 @@ def record(state, item, course, attempt, status, detail):
     return event
 
 
-def list_course(source, course):
-    while True:
+def list_course(source, course, retries=2):
+    for attempt in range(retries + 1):
         try:
             return sorted(files(source, '/' + course), key=lambda item: item['size'])
         except (OSError, RuntimeError) as error:
+            if (isinstance(error, urllib.error.HTTPError)
+                    and 400 <= error.code < 500 and error.code not in (408, 429)) or attempt == retries:
+                raise
             print(f'Listing error: {error}; retry in 60 seconds', flush=True)
             time.sleep(60)
 
 
 def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep_check=False, retry_corrupted=False):
-    if not all(shutil.which(name) for name in ('aria2c', 'ffprobe', 'cp')):
-        raise RuntimeError('Install aria2c, ffmpeg/ffprobe and coreutils first')
+    if not all(shutil.which(name) for name in ('aria2c', 'cp')):
+        raise RuntimeError('Install aria2c and coreutils first')
     root.mkdir(parents=True, exist_ok=True)
     state = root / '.download'
     state.mkdir(mode=0o700, exist_ok=True)
@@ -161,32 +192,30 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
     if identity.exists() and json.loads(identity.read_text(encoding='utf-8'))['source'] != source:
         raise ValueError('Use a separate destination for a different public folder/year')
     write_json(identity, dict(source=source, title=data['title']))
+    read_events(state / 'events.jsonl', repair=True)
+    recovered = {}
     if retry_corrupted:
         from recovery import recover_corrupted
-        recover_corrupted(root, source, retries, True, report_repo, mark, git_push)
+        recovered = {event['path']: event for event in recover_corrupted(
+            root, source, retries, True, report_repo, mark, git_push, courses=courses)}
     history_path = state / 'course-history.json'
     history = json.loads(history_path.read_text()) if history_path.exists() else {}
     for path in state.glob('*-status.json'):
         previous = json.loads(path.read_text())
-        if previous.get('source') == source and previous.get('state') == 'finished':
+        if previous.get('source') == source and previous.get('state') in ('finished', 'running'):
             name = previous['course']
+            if previous['state'] == 'running' and not previous.get('time'):
+                previous['time'] = datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat()
             if previous.get('time', '') >= history.get(name, {}).get('time', ''):
                 history[name] = previous
     write_json(history_path, history)
-    events = {}
-    if (state / 'events.jsonl').exists():
-        text = (state / 'events.jsonl').read_text()
-        lines = text.splitlines()
-        for index, line in enumerate(lines):
-            if not line.strip():
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                if index == len(lines) - 1 and not text.endswith('\n'):
-                    continue
-                raise
-            events[event['path']] = event
+    recovery_courses = [] if retry_corrupted else [
+        course for course in courses if history.get(course, {}).get('state') == 'running']
+    if recovery_courses:
+        from recovery import recover_corrupted
+        recovered = {event['path']: event for event in recover_corrupted(
+            root, source, retries, True, courses=recovery_courses)}
+    events = {event['path']: event for event in read_events(state / 'events.jsonl')}
     registry = state / 'local-copies.json'
     if registry.exists() and not deep_check:
         for event in json.loads(registry.read_text()):
@@ -196,7 +225,6 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                         and local.stat().st_mtime_ns == event['mtime_ns']
                         and not Path(str(local) + '.aria2').exists()):
                     events[event['path']] = event
-    write_json(identity, dict(source=source, title=data['title']))
     write_json(state / 'catalog.json', data)
     write_json(state / 'courses.json', courses)
     lines = [data['title'] + ' — порядок скачивания', 'Источник: ' + source,
@@ -224,20 +252,31 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
             print(f'COURSE SKIPPED: {course}; already processed; verified={previous["verified"]}; failed={previous["failed"]}', flush=True)
             continue
         failed = [event for event in failed if event['course'] != course]
-        write_json(status_path, dict(course=course, source=source, complete=False, state='running'))
-        entries = list_course(source, course)
+        running = dict(previous, course=course, source=source, complete=False, state='running',
+                       time=datetime.now().astimezone().isoformat())
+        history[course] = running
+        write_json(history_path, history)
+        write_json(status_path, running)
+        entries = list_course(source, course, retries)
         for item in entries:
             target(root, item, course)
         write_json(state / f'{index:02d}-manifest.json', [
             {k: item[k] for k in ('path', 'size', 'sha256')} for item in entries])
         print(f"FILES {len(entries)}; SIZE {sum(x['size'] for x in entries)/1024**3:.2f} GiB", flush=True)
         pending = []
+        course_failed = []
         for item in entries:
+            archived = recovered.get(item['path'])
+            if (archived and not archived.get('range_recovered_complete')
+                    and (archived['size'], archived['sha256']) == (item['size'], item['sha256'])):
+                course_failed.append(archived)
+                failed.append(archived)
+                continue
             local = target(root, item, course)
             cached = events.get(item['path'], {})
             if cached.get('local'):
                 local = Path(cached['local'])
-            if (not deep_check and cached.get('status') == 'valid'
+            if ((not deep_check or archived) and cached.get('status') == 'valid'
                     and cached.get('sha256') == item['sha256'] and cached.get('size') == item['size']
                     and local.exists() and local.stat().st_size == item['size']
                     and ('mtime_ns' not in cached or local.stat().st_mtime_ns == cached['mtime_ns'])
@@ -250,13 +289,12 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                      if target(root, item, course).exists() else 0)) for item in pending)
         if shutil.disk_usage(root).free < needed + 1024 ** 3:
             raise RuntimeError('Insufficient free space for the course')
-        course_failed = []
         for attempt in range(1, retries + 2):
             if not pending:
                 break
             if attempt > 1:
                 time.sleep(10)
-                fresh = {item['path']: item for item in list_course(source, course)}
+                fresh = {item['path']: item for item in list_course(source, course, retries)}
                 pending = [dict(item, file=fresh.get(item['path'], item)['file']) for item in pending]
             queue = []
             for item in pending:
@@ -288,13 +326,17 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                     destination = target(root, item, course)
                     broken = broken_root / destination.relative_to(root)
                     broken.parent.mkdir(parents=True, exist_ok=True)
+                    event['corrupted_path'] = str(broken.relative_to(root))
+                    course_failed.append(event)
+                    failed.append(event)
+                    write_json(root / 'corrupted' / 'failed.json', failed)
+                    write_json(broken_root / 'failed.json', failed)
                     for src, out in [(destination, broken),
                                      (Path(str(destination) + '.aria2'), Path(str(broken) + '.aria2'))]:
                         if src.exists():
                             if out.exists():
                                 raise FileExistsError(out)
                             src.rename(out)
-                    event['corrupted_path'] = str(broken.relative_to(root))
                     try:
                         from recovery import finish_recovery
                         finish_recovery(root, event, item, retries)
@@ -303,11 +345,13 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                         print('RECOVERY ERROR: ' + item['path'] + '; ' + type(error).__name__, flush=True)
                     if event.get('range_recovered_complete'):
                         verified += 1
+                        course_failed.remove(event)
+                        failed.remove(event)
+                        write_json(root / 'corrupted' / 'failed.json', failed)
+                        write_json(broken_root / 'failed.json', failed)
                         continue
                     with (state / 'events.jsonl').open('a') as log:
                         log.write(json.dumps(event, ensure_ascii=False) + '\n')
-                    course_failed.append(event)
-                    failed.append(event)
                     write_json(root / 'corrupted' / 'failed.json', failed)
                     write_json(broken_root / 'failed.json', failed)
             pending = remaining
@@ -355,7 +399,7 @@ def main():
     fetching.add_argument('--report-repo', type=Path, help='Update course cards after each course')
     fetching.add_argument('--mark', help='Custom copy owner mark for reports')
     fetching.add_argument('--git-push', action='store_true', help='Commit and push reports after each course')
-    salvage = commands.add_parser('recover', help='Retain videos with over 50 percent available time next to originals')
+    salvage = commands.add_parser('recover', help='Retain videos with over 50 percent confirmed bytes next to originals')
     salvage.add_argument('--destination', required=True, type=Path)
     damaged = commands.add_parser('corrupted', help='Save corrupted download progress and list retained files over 30 percent')
     damaged.add_argument('--destination', required=True, type=Path)

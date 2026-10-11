@@ -10,7 +10,10 @@ def received_ranges(control, expected):
     offset = 0
     def read(fmt):
         nonlocal offset
-        values = struct.unpack_from(fmt, data, offset)
+        try:
+            values = struct.unpack_from(fmt, data, offset)
+        except struct.error as error:
+            raise ValueError('Truncated aria2 control') from error
         offset += struct.calcsize(fmt)
         return values
     def bitmap(length, block):
@@ -64,7 +67,13 @@ def received_bytes(control, expected):
 
 def saved_ranges(path, expected, sha256):
     control = Path(str(path) + ".aria2")
-    ranges = received_ranges(control, expected) if control.exists() else []
+    ranges = []
+    if control.exists():
+        try:
+            ranges = received_ranges(control, expected)
+        except ValueError:
+            # Keep the broken control/body; only an independent journal can prove bytes.
+            pass
     journal = Path(str(path) + ".ranges.json")
     if journal.exists():
         data = json.loads(journal.read_text())
@@ -74,7 +83,8 @@ def saved_ranges(path, expected, sha256):
             if not isinstance(start, int) or not isinstance(end, int) or not 0 <= start < end <= expected:
                 raise ValueError("Invalid saved range")
             ranges.append([start, end])
-    return merge_ranges(ranges)
+    retained = path.stat().st_size if path.exists() else 0
+    return merge_ranges((start, min(end, retained)) for start, end in ranges)
 
 
 def progress(path, expected, valid=False, sha256=None):
@@ -87,6 +97,13 @@ def progress(path, expected, valid=False, sha256=None):
         result.update(downloaded_bytes=expected, downloaded_percent=100.0, progress_source='sha256')
     elif control.exists() or Path(str(path) + ".ranges.json").exists():
         try:
+            if control.exists():
+                try:
+                    received_ranges(control, expected)
+                except ValueError as error:
+                    result['progress_error'] = str(error)
+                    if not Path(str(path) + '.ranges.json').exists():
+                        raise
             received = sum(end - start for start, end in saved_ranges(path, expected, sha256))
             result.update(downloaded_bytes=received,
                           downloaded_percent=round(100 * received / expected, 4) if expected else 100.0,

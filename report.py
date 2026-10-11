@@ -16,6 +16,7 @@ def normalized(value):
 
 
 def update_report(destination, repo, mark, git_push=False, message=None):
+    from download import read_events
     if not mark or any(c in mark for c in '|\n\r'):
         raise ValueError('Mark must be nonempty and contain no pipes or line breaks')
     repo = repo.resolve()
@@ -28,18 +29,8 @@ def update_report(destination, repo, mark, git_push=False, message=None):
         dirty = set(subprocess.check_output(['git', '-C', str(repo), 'diff', '--name-only', '-z']).decode().split('\0'))
     state = destination / '.download'
     source = json.loads((state / 'source.json').read_text(encoding='utf-8'))['source'].rstrip('/')
-    text = (state / 'events.jsonl').read_text(encoding='utf-8')
     events = {}
-    lines = text.splitlines()
-    for index, line in enumerate(lines):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            if index == len(lines) - 1 and not text.endswith('\n'):
-                continue
-            raise
+    for event in read_events(state / 'events.jsonl'):
         events[normalized(event['path'])] = event
     external = {}
     registry = state / 'local-copies.json'
@@ -66,7 +57,9 @@ def update_report(destination, repo, mark, git_push=False, message=None):
                 raise ValueError('Unsafe partial copy path')
             if local.exists():
                 stat = local.stat()
-                if stat.st_size == copy['local_size'] and stat.st_mtime_ns == copy['mtime_ns'] and copy['available_time_percent'] > 50:
+                if (stat.st_size == copy['local_size'] and stat.st_mtime_ns == copy['mtime_ns']
+                        and (copy.get('downloaded_bytes') or 0) * 2 > copy['size']
+                        and not copy.get('sha256_mismatch')):
                     partial[key] = copy
     terminal = {}
     for path in (destination / 'corrupted').glob('**/failed.json'):
@@ -109,21 +102,27 @@ def update_report(destination, repo, mark, git_push=False, message=None):
                 status = event['status']
                 local = Path(local_copy['local']) if local_copy else destination.joinpath(*Path(event['path']).parts[1:])
                 if status == 'valid' and (not local.exists() or local.stat().st_size != event['size']
+                                         or ('mtime_ns' in event and local.stat().st_mtime_ns != event['mtime_ns'])
                                          or Path(str(local) + '.aria2').exists()):
                     status = 'missing'
                 final = terminal.get(normalized(event['path']))
                 if status != 'valid' and (not final or final['time'] < event['time']):
                     status = 'pending'
             copies = [cell.strip() for cell in cells[2:]]
+            partial_prefix = mark + ' (partially available;'
+            if status == 'valid':
+                for position, value in enumerate(copies):
+                    if value.startswith(partial_prefix):
+                        copies[position] = '' if mark in copies else mark
             if status == 'valid' and mark not in copies:
                 if '' not in copies:
                     raise ValueError('All copy columns occupied: ' + str(card) + ': ' + name)
                 copies[copies.index('')] = mark
             elif event and status != 'valid':
                 copies = ['' if value == mark else value for value in copies]
-            partial_prefix = mark + ' (partially available;'
             if key in known_partial:
-                label = f'{partial_prefix} время {partial_copy["available_time_percent"]:.2f}%)' if partial_copy else ''
+                label = (f'{partial_prefix} байтов {partial_copy["downloaded_percent"]:.2f}%)'
+                         if partial_copy and partial_copy.get('downloaded_percent') is not None and status != 'valid' else '')
                 previous = next((i for i, value in enumerate(copies) if value.startswith(partial_prefix)), None)
                 if previous is not None:
                     copies[previous] = label
@@ -154,8 +153,6 @@ def update_report(destination, repo, mark, git_push=False, message=None):
                 saved = partial.get(normalized(event['path'])) or terminal.get(normalized(event['path']), event)
                 percent = saved.get('downloaded_percent')
                 fraction = f'; сохранено {percent:.2f}% ({saved["downloaded_bytes"]}/{saved["size"]} байт)' if percent is not None else ''
-                if 'available_time_percent' in saved:
-                    fraction += f'; доступно по времени {saved["available_time_percent"]:.2f}%'
                 report.append(f'- `{name}` — {label}; {event["detail"]}; попытка {event["attempt"]}{fraction}.')
             report.append('')
         reports.append((state / 'catalog-reports' / card.name, '\n'.join(report) + '\n'))
