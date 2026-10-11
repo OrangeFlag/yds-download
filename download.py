@@ -134,7 +134,7 @@ def list_course(source, course):
             time.sleep(60)
 
 
-def download(data, courses, root):
+def download(data, courses, root, retries=2):
     if not shutil.which('aria2c'):
         raise RuntimeError('Install aria2c first')
     root.mkdir(parents=True, exist_ok=True)
@@ -153,7 +153,7 @@ def download(data, courses, root):
     write_json(state / 'catalog.json', data)
     write_json(state / 'courses.json', courses)
     lines = [data['title'] + ' — порядок скачивания', 'Источник: ' + source,
-             'Курсы последовательно; первая попытка + три повтора; неудачи: corrupted.', '']
+             f'Курсы последовательно; первая попытка + {retries} повтора; неудачи: corrupted.', '']
     for index, course in enumerate(courses, 1):
         lines.extend([f'{index:02d}. {course}', source.rstrip('/') + '/' +
                       urllib.parse.quote(course, safe=''), ''])
@@ -177,7 +177,7 @@ def download(data, courses, root):
         print(f"FILES {len(entries)}; SIZE {sum(x['size'] for x in entries)/1024**3:.2f} GiB", flush=True)
         pending = entries
         course_failed = []
-        for attempt in range(1, 5):
+        for attempt in range(1, retries + 2):
             if not pending:
                 break
             if attempt > 1:
@@ -208,7 +208,7 @@ def download(data, courses, root):
                 event = record(state, item, course, attempt, status, detail)
                 if status == 'valid':
                     verified += 1
-                elif attempt < 4:
+                elif attempt < retries + 1:
                     remaining.append(item)
                 else:
                     destination = target(root, item, course)
@@ -254,6 +254,7 @@ def main():
     fetching.add_argument('--destination', required=True, type=Path)
     fetching.add_argument('--include', action='append', help='Exact course name; repeatable')
     fetching.add_argument('--exclude', action='append', default=[], help='Exact course name; repeatable')
+    fetching.add_argument('--retries', type=int, default=2, help='Retries after the first attempt (default: 2)')
     args = parser.parse_args()
     os.umask(0o077)
     try:
@@ -262,6 +263,8 @@ def main():
             write_json(args.output, data)
             print(f"{data['title']}: {len(data['courses'])} courses → {args.output}")
             return 0
+        if args.retries < 0:
+            raise ValueError('--retries must be non-negative')
         data = json.loads(args.catalog.read_text(encoding='utf-8')) if args.catalog else catalog(args.source)
         chosen = select_courses(data, args.include, args.exclude)
         if not chosen:
@@ -270,7 +273,7 @@ def main():
             available = {item['name'] for item in catalog(data['source'])['courses']}
             if set(chosen) - available:
                 raise ValueError('Selected courses no longer exist in the source folder')
-        return download(data, chosen, args.destination.resolve())
+        return download(data, chosen, args.destination.resolve(), args.retries)
     except (ValueError, KeyError, OSError, RuntimeError) as error:
         parser.exit(2, f'Error: {error}\n')
 
