@@ -9,6 +9,7 @@ import subprocess
 import time
 from datetime import datetime
 from download import write_json
+from settings import arguments, resolve
 
 def main():
     os.umask(0o077)
@@ -19,6 +20,9 @@ def main():
     lock = path.with_suffix('.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     data = json.loads(path.read_text())
+    resolve(data.get('tuning', {}))
+    for job in data['archives']:
+        resolve({**data.get('tuning', {}), **job.get('tuning', {})})
     wait = data.get('wait_for')
     if wait:
         print('WAITING FOR CURRENT ARCHIVE: ' + wait['destination'], flush=True)
@@ -42,6 +46,7 @@ def main():
         command = ['python3', str(Path(__file__).with_name('download.py')), 'download',
                    '--catalog', job['catalog'], '--destination', job['destination'],
                    '--retries', str(data.get('retries', 2))]
+        command += arguments({**data.get('tuning', {}), **job.get('tuning', {})})
         if data.get('retry_check', False):
             command += ['--retry-check']
         if data.get('deep', False):

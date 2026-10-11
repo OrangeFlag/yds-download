@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from threading import Event, Lock
 import urllib.request
 from progress import merge_ranges, saved_ranges, progress
+from settings import resolve
 
 SUFFIX = ' (partially available)'
 
@@ -94,7 +95,8 @@ def new_recovery_body(root, event, reason):
     write_json(archive / 'failed.json', [event])
 
 
-def retry_ranges(root, event, item, retries):
+def retry_ranges(root, event, item, retries, tuning=None):
+    tuning = resolve(tuning)
     from download import OPENER, write_json, files
     if item['size'] != event['size'] or item['sha256'] != event['sha256']:
         raise ValueError('Source file changed; refuse to combine ranges')
@@ -112,7 +114,7 @@ def retry_ranges(root, event, item, retries):
     write_json(journal, dict(size=event['size'], sha256=event['sha256'], ranges=additional, salvage_cursor=cursor))
     total = event['size']
     missing_bytes = total - sum(end - start for start, end in ranges)
-    if shutil.disk_usage(root).free < missing_bytes + 1024 ** 3:
+    if shutil.disk_usage(root).free < missing_bytes + tuning['free_space_mib'] * 1024 ** 2:
         raise RuntimeError('Insufficient disk space for range recovery')
     rate_lock = Lock()
     stopping = Event()
@@ -122,12 +124,12 @@ def retry_ranges(root, event, item, retries):
         start, end = bounds
         with rate_lock:
             time.sleep(max(0, next_request - time.monotonic()))
-            next_request = time.monotonic() + 1 / 12
+            next_request = time.monotonic() + 1 / tuning['range_rps']
         if stopping.is_set():
             return bounds, None, 'Interrupted'
         request = urllib.request.Request(item['file'], headers={'Range': f'bytes={start}-{end - 1}', 'Accept-Encoding': 'identity'})
         try:
-            with OPENER.open(request, timeout=30) as response:
+            with OPENER.open(request, timeout=tuning['range_timeout']) as response:
                 served = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', response.headers.get('Content-Range', ''))
                 if (response.status != 206 or not served or int(served[1]) != start
                         or not start <= int(served[2]) < end or int(served[3]) != total
@@ -153,17 +155,18 @@ def retry_ranges(root, event, item, retries):
         except (OSError, http.client.HTTPException) as error:
             return bounds, None, 'HTTP ' + str(error.code) if hasattr(error, 'code') else type(error).__name__
     attempts = []
-    max_passes = min(4, 2 * retries) + 2
+    max_passes = tuning['range_max_passes'] or min(4, 2 * retries) + 2
     failed_count = 0
     remaining_span = total
     for attempt in range(1, max_passes + 1):
         # Backend block geometry is unpublished; refine failed intervals by observed responses.
-        block = max(1024 ** 2, 16 * 1024 ** 2 // (2 ** (attempt - 1)))
+        minimum = tuning['range_min_block_size_kib'] * 1024
+        block = max(minimum, tuning['range_block_size_kib'] * 1024 // (2 ** (attempt - 1)))
         if attempt > 1:
-            block = min(block, max(1024 ** 2, (remaining_span + 1) // 2))
-        fine = attempt > 1 and (block <= 1024 ** 2 or failed_count > 32 or attempt == max_passes)
+            block = min(block, max(minimum, (remaining_span + 1) // 2))
+        fine = attempt > 1 and (block <= minimum or failed_count > tuning['range_failure_limit'] or attempt == max_passes)
         if fine:
-            block = 64 * 1024
+            block = tuning['range_linear_block_size_kib'] * 1024
         missing = []
         position = 0
         for start, end in ranges + [[total, total]]:
@@ -178,10 +181,10 @@ def retry_ranges(root, event, item, retries):
         if fine:
             # Bound the cost of an unavailable multi-GiB file; later runs continue this scan.
             missing = [bounds for bounds in missing if bounds[0] >= cursor] + [bounds for bounds in missing if bounds[0] < cursor]
-            unprobed = max(0, len(missing) - 256)
-            missing = missing[:256]
+            unprobed = max(0, len(missing) - tuning['range_linear_probes'])
+            missing = missing[:tuning['range_linear_probes']]
         if attempt > 1:
-            time.sleep(10)
+            time.sleep(tuning['range_retry_delay'])
         source = json.loads((root / '.download/source.json').read_text())['source']
         fresh = next((row for row in files(source, '/' + event['course']) if row['path'] == event['path']), None)
         if not fresh or (fresh['size'], fresh['sha256']) != (event['size'], event['sha256']):
@@ -200,7 +203,7 @@ def retry_ranges(root, event, item, retries):
                 ranges = merge_ranges(ranges + [saved])
             outcomes.append(dict(start=bounds[0], end=bounds[1], saved_bytes=len(data) if data else 0, error=error))
         # Consume completed requests immediately so Ctrl+C cannot lose later successful chunks.
-        workers = 4
+        workers = tuning['range_workers']
         pool = ThreadPoolExecutor(max_workers=workers)
         futures = set()
         try:
@@ -285,14 +288,14 @@ def reconcile_course(root, course):
             write_json(path, status)
 
 
-def finish_recovery(root, event, item=None, retries=2, _redownload=True):
+def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None):
     from download import write_json
     ledger_path = root / '.download/recovery-state.json'
     ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
     ledger[event['path']] = dict(state='running', event=dict(event))
     write_json(ledger_path, ledger)
     try:
-        result = _finish_recovery(root, event, item, retries, _redownload)
+        result = _finish_recovery(root, event, item, retries, _redownload, tuning)
     except ValueError:
         ledger[event['path']] = dict(state='finished', event=dict(event))
         write_json(ledger_path, ledger)
@@ -302,12 +305,12 @@ def finish_recovery(root, event, item=None, retries=2, _redownload=True):
     return result
 
 
-def _finish_recovery(root, event, item=None, retries=2, _redownload=True):
+def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None):
     from download import record, target, write_json
     path = body_path(root, event)
     if item:
         try:
-            retry_ranges(root, event, item, retries)
+            retry_ranges(root, event, item, retries, tuning)
         except OSError as error:
             event['recovery_error'] = str(error)
             print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)
@@ -341,7 +344,7 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True):
             # Retry in a separate body: no block hashes exist to locate the damaged bytes.
             event.setdefault('sha256_rejected_paths', []).append(event['corrupted_path'])
             new_recovery_body(root, event, 'SHA-256 mismatch; retry in a separate body')
-            return finish_recovery(root, event, item, retries, _redownload=False)
+            return finish_recovery(root, event, item, retries, _redownload=False, tuning=tuning)
         if digest == event['sha256'] and item:
             destination = target(root, item, event['course'])
             copy_saved(path, destination)
@@ -353,7 +356,7 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True):
     return promote_partial(root, event)
 
 
-def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, mark=None, git_push=False, courses=None, force=False):
+def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, mark=None, git_push=False, courses=None, force=False, tuning=None):
     from download import files, write_json, read_events
     root = root.resolve()
     candidates = {}
@@ -429,7 +432,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                     ledger[event['path']] = dict(state='finished', event=dict(event))
                     write_json(ledger_path, ledger)
                     raise ValueError('File no longer listed in source')
-            finish_recovery(root, event, item, retries)
+            finish_recovery(root, event, item, retries, tuning=tuning)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
             event['recovery_error'] = str(error)
             print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)

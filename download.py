@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from settings import OPTIONS, add_arguments, resolve
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ENV = {k: v for k, v in os.environ.items()
@@ -166,7 +167,7 @@ def record(state, item, course, attempt, status, detail, local=None):
     return event
 
 
-def list_course(source, course, retries=2):
+def list_course(source, course, retries=2, retry_delay=60):
     for attempt in range(retries + 1):
         try:
             return sorted(files(source, '/' + course), key=lambda item: item['size'])
@@ -174,11 +175,12 @@ def list_course(source, course, retries=2):
             if (isinstance(error, urllib.error.HTTPError)
                     and 400 <= error.code < 500 and error.code not in (408, 429)) or attempt == retries:
                 raise
-            print(f'Listing error: {error}; retry in 60 seconds', flush=True)
-            time.sleep(60)
+            print(f'Listing error: {error}; retry in {retry_delay} seconds', flush=True)
+            time.sleep(retry_delay)
 
 
-def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False):
+def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None):
+    tuning = resolve(tuning)
     if not all(shutil.which(name) for name in ('aria2c', 'cp')):
         raise RuntimeError('Install aria2c and coreutils first')
     root.mkdir(parents=True, exist_ok=True)
@@ -194,12 +196,13 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
     if identity.exists() and json.loads(identity.read_text(encoding='utf-8'))['source'] != source:
         raise ValueError('Use a separate destination for a different public folder/year')
     write_json(identity, dict(source=source, title=data['title']))
+    write_json(state / 'settings.json', dict(retries=retries, deep=deep, retry_check=retry_check, tuning=tuning))
     read_events(state / 'events.jsonl', repair=True)
     recovered = {}
     if retry_check:
         from recovery import recover_corrupted
         recovered = {event['path']: event for event in recover_corrupted(
-            root, source, retries, True, report_repo, mark, git_push, courses=courses, force=True)}
+            root, source, retries, True, report_repo, mark, git_push, courses=courses, force=True, tuning=tuning)}
     history_path = state / 'course-history.json'
     history = json.loads(history_path.read_text()) if history_path.exists() else {}
     for path in state.glob('*-status.json'):
@@ -216,7 +219,7 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
     if recovery_courses:
         from recovery import recover_corrupted
         recovered = {event['path']: event for event in recover_corrupted(
-            root, source, retries, True, courses=recovery_courses)}
+            root, source, retries, True, courses=recovery_courses, tuning=tuning)}
     events = {event['path']: event for event in read_events(state / 'events.jsonl')}
     registry = state / 'local-copies.json'
     local_copies = json.loads(registry.read_text()) if registry.exists() else []
@@ -261,7 +264,7 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
             history[course] = running
             write_json(history_path, history)
             write_json(status_path, running)
-        entries = list_course(source, course, retries)
+        entries = list_course(source, course, retries, tuning['listing_retry_delay'])
         for item in entries:
             target(root, item, course)
         write_json(state / f'{index:02d}-manifest.json', [
@@ -318,14 +321,14 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                 pending.append(item)
         needed = sum(max(0, item['size'] - (target(root, item, course).stat().st_size
                      if target(root, item, course).exists() else 0)) for item in pending)
-        if shutil.disk_usage(root).free < needed + 1024 ** 3:
+        if shutil.disk_usage(root).free < needed + tuning['free_space_mib'] * 1024 ** 2:
             raise RuntimeError('Insufficient free space for the course')
         for attempt in range(1, retries + 2):
             if not pending:
                 break
             if attempt > 1:
-                time.sleep(10)
-                fresh = {item['path']: item for item in list_course(source, course, retries)}
+                time.sleep(tuning['retry_delay'])
+                fresh = {item['path']: item for item in list_course(source, course, retries, tuning['listing_retry_delay'])}
                 pending = [dict(item, file=fresh.get(item['path'], item)['file']) for item in pending]
             queue = []
             for item in pending:
@@ -337,10 +340,14 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                 'aria2c', '--input-file=' + str(state / 'queue.txt'),
                 '--continue=true', '--always-resume=true', '--check-integrity=true',
                 '--auto-file-renaming=false', '--allow-overwrite=true',
-                '--max-concurrent-downloads=2', '--max-connection-per-server=4', '--split=4',
-                '--min-split-size=4M', '--file-allocation=none', '--disk-cache=256M',
-                '--auto-save-interval=30', '--max-tries=1', '--connect-timeout=20',
-                '--timeout=60', '--summary-interval=30', '--enable-color=false',
+                f"--max-concurrent-downloads={tuning['download_concurrency']}",
+                f"--max-connection-per-server={tuning['connections']}", f"--split={tuning['split']}",
+                f"--min-split-size={tuning['min_split_size_mib']}M", '--file-allocation=none',
+                f"--disk-cache={tuning['disk_cache_mib']}M",
+                f"--max-overall-download-limit={tuning['bandwidth_limit']}",
+                f"--auto-save-interval={tuning['auto_save_interval']}", '--max-tries=1',
+                f"--connect-timeout={tuning['connect_timeout']}", f"--timeout={tuning['timeout']}",
+                f"--summary-interval={tuning['summary_interval']}", '--enable-color=false',
                 '--console-log-level=warn', '--log=' + str(state / 'aria2.log'), '--log-level=notice',
             ], env=ENV)
             if code == 9:
@@ -370,7 +377,7 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                             src.rename(out)
                     try:
                         from recovery import finish_recovery
-                        finish_recovery(root, event, item, retries)
+                        finish_recovery(root, event, item, retries, tuning=tuning)
                     except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
                         event['recovery_error'] = str(error)
                         print('RECOVERY ERROR: ' + item['path'] + '; ' + type(error).__name__, flush=True)
@@ -431,6 +438,7 @@ def main():
     fetching.add_argument('--report-repo', type=Path, help='Update course cards after each course')
     fetching.add_argument('--mark', help='Custom copy owner mark for reports')
     fetching.add_argument('--git-push', action='store_true', help='Commit and push reports after each course')
+    add_arguments(fetching)
     salvage = commands.add_parser('recover', help='Retain videos with over 50 percent confirmed bytes next to originals')
     salvage.add_argument('--destination', required=True, type=Path)
     damaged = commands.add_parser('corrupted', help='Save corrupted download progress and list retained files over 30 percent')
@@ -471,6 +479,7 @@ def main():
             raise ValueError('--report-repo requires --mark')
         if args.retries < 0:
             raise ValueError('--retries must be non-negative')
+        tuning = resolve({name: getattr(args, name) for name in OPTIONS})
         data = json.loads(args.catalog.read_text(encoding='utf-8')) if args.catalog else catalog(args.source)
         chosen = select_courses(data, args.include, args.exclude)
         if not chosen:
@@ -479,7 +488,7 @@ def main():
             available = {item['name'] for item in catalog(data['source'])['courses']}
             if {PurePosixPath(name).parts[0] for name in chosen} - available:
                 raise ValueError('Selected courses no longer exist in the source folder')
-        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep, args.retry_check)
+        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep, args.retry_check, tuning)
     except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(2, f'Error: {error}\n')
 

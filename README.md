@@ -279,3 +279,70 @@ python3 download.py corrupted --destination "$YDS_DEST"
 ```
 
 Результаты остаются локально в `corrupted/progress.json` и `corrupted/Прогресс загрузки.txt`. Процент, записанный при неудаче, сохраняется даже при последующем переносе тела; `retained` показывает его наличие сейчас. Отсутствие `.aria2` у существующего повреждённого файла означает неизвестную долю, а не 100%.
+
+
+## Настройка скачивания и Range
+
+Все значения по умолчанию сохраняют прежние настройки. Список флагов и дефолтов:
+
+```sh
+python3 download.py download --help
+```
+
+Пример более осторожного режима записи на диск:
+
+```sh
+./start.sh /absolute/path/YandexDisk --catalog /absolute/path/catalog.json \
+  --download-concurrency 1 --connections 2 --split 2 \
+  --disk-cache-mib 128 --range-workers 2 --range-rps 8
+```
+
+Настройки текущего запуска сохраняются в `.download/settings.json`. Они описывают последний запуск; новый запуск берёт дефолты и переданные флаги, автоматически сохранённые настройки не подхватывает.
+
+| Флаг | По умолчанию | Назначение |
+|---|---:|---|
+| `--download-concurrency` | `2` | Simultaneous files |
+| `--connections` | `4` | Connections per server per file |
+| `--split` | `4` | Download splits per file |
+| `--min-split-size-mib` | `4` | Minimum aria2 split size, MiB |
+| `--disk-cache-mib` | `256` | aria2 disk cache, MiB; 0 disables |
+| `--bandwidth-limit` | `0` | Total aria2 limit, bytes/second; 0 unlimited |
+| `--auto-save-interval` | `30` | Resume metadata save interval, seconds |
+| `--connect-timeout` | `20` | aria2 connection timeout, seconds |
+| `--timeout` | `60` | aria2 timeout, seconds |
+| `--summary-interval` | `30` | aria2 progress interval, seconds |
+| `--retry-delay` | `10` | Delay between download retries, seconds |
+| `--listing-retry-delay` | `60` | Delay between course-listing retries, seconds |
+| `--free-space-mib` | `1024` | Free space to retain in addition to required bytes, MiB |
+| `--range-workers` | `4` | Simultaneous Range requests |
+| `--range-rps` | `12` | Range requests/second per recovery |
+| `--range-timeout` | `30` | Range request timeout, seconds |
+| `--range-retry-delay` | `10` | Delay between Range passes, seconds |
+| `--range-block-size-kib` | `16384` | Initial Range block, KiB |
+| `--range-min-block-size-kib` | `1024` | Switch to linear probing at this block size, KiB |
+| `--range-linear-block-size-kib` | `64` | Linear probe block size, KiB |
+| `--range-failure-limit` | `32` | Switch to linear after more failed ranges than this |
+| `--range-linear-probes` | `256` | Maximum linear requests per recovery |
+| `--range-max-passes` | `0` | Maximum Range passes; 0 = min(4, 2*retries)+2 |
+
+MiB = 1 048 576 байт; KiB = 1024 байта. `--bandwidth-limit` ограничивает суммарную скорость aria2, в байтах/с; на независимые Range-запросы он не распространяется. Их параллельность и частоту задают `--range-workers` и `--range-rps`. `--range-max-passes 0` сохраняет прежнюю формулу по `--retries`; положительное значение задаёт верхний предел. Линейный этап завершается после ограниченного числа запросов; курсор сохраняется для следующего явного `--retry-check`.
+
+Размеры Range должны удовлетворять `linear <= minimum <= initial`. Передаваемые параметры проверяются до запуска скачивания. Проверки SHA-256, сохранение доказанных диапазонов и порог **строго больше 50% байт** для частичных копий сохраняются.
+
+В JSON очереди параметры находятся в `tuning`; ключи соответствуют флагам с подчёркиваниями. Общие значения можно переопределить для конкретного архива:
+
+```json
+{
+  "tuning": {"download_concurrency": 2, "range_workers": 4},
+  "archives": [
+    {
+      "title": "2025 осень",
+      "catalog": "/absolute/path/2025-autumn.json",
+      "destination": "/absolute/path/YandexDisk/ШАД осень 2025",
+      "tuning": {"download_concurrency": 1, "range_workers": 2}
+    }
+  ]
+}
+```
+
+Изменение настроек требует перезапуска процесса. Для одного файла завершённое восстановление по-прежнему не повторяется без `--retry-check`, даже при новых параметрах Range.

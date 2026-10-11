@@ -10,6 +10,7 @@ from unittest.mock import patch
 import download
 import recovery
 import semester_queue
+import settings
 from test_regressions import Response
 
 
@@ -176,6 +177,71 @@ class ResumeChecks(unittest.TestCase):
         with patch.object(download.OPENER, 'open', side_effect=self.serve):
             self.assertEqual(self.run_download(), 0)
         self.assertEqual(self.requests, [(64, 128)])
+
+    def test_tuning_reaches_aria2_and_saved_state(self):
+        self.status('pending')
+        calls = []
+        def transfer(command, **kwargs):
+            calls.append(command)
+            local = self.root / 'Course/video.mp4'
+            local.parent.mkdir(exist_ok=True)
+            local.write_bytes(self.content)
+            return 0
+        tuning = dict(download_concurrency=1, connections=2, split=3, disk_cache_mib=128,
+                      bandwidth_limit=1048576, auto_save_interval=15, timeout=45)
+        with patch.object(download.subprocess, 'call', side_effect=transfer):
+            self.assertEqual(self.run_download(tuning=tuning), 0)
+        for flag in ('--max-concurrent-downloads=1', '--max-connection-per-server=2',
+                     '--split=3', '--disk-cache=128M', '--max-overall-download-limit=1048576',
+                     '--auto-save-interval=15', '--timeout=45'):
+            self.assertIn(flag, calls[0])
+        saved = json.loads((self.state / 'settings.json').read_text())['tuning']
+        for key, value in tuning.items():
+            self.assertEqual(saved[key], value)
+
+    def test_range_tuning_limits_probes_and_blocks(self):
+        self.content = b'A' * 8192
+        self.item.update(size=8192, sha256=hashlib.sha256(self.content).hexdigest())
+        self.event.update(size=8192, sha256=self.item['sha256'])
+        download.write_json(Path(str(self.body) + '.ranges.json'),
+                            dict(size=8192, sha256=self.item['sha256'], ranges=[[0, 64]]))
+        tuning = dict(range_block_size_kib=2, range_min_block_size_kib=1,
+                      range_linear_block_size_kib=1, range_linear_probes=3,
+                      range_failure_limit=0, range_max_passes=2, range_workers=1,
+                      range_timeout=7, range_retry_delay=0)
+        timeouts = []
+        def fail(request, timeout):
+            timeouts.append(timeout)
+            return self.fail_range(request, timeout)
+        with patch.object(download.OPENER, 'open', side_effect=fail):
+            recovery.retry_ranges(self.root, self.event, self.item, 0, tuning)
+        attempts = self.event['range_attempts']
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(attempts[1]['ranges']), 3)
+        self.assertTrue(attempts[1]['fine'])
+        self.assertTrue(all(row['end'] - row['start'] <= 1024 for row in attempts[1]['ranges']))
+        self.assertEqual(set(timeouts), {7})
+
+    def test_invalid_tuning_is_rejected(self):
+        for values in (dict(range_workers=0), dict(connections=17), dict(timeout=-1),
+                       dict(range_rps=float('nan')), dict(range_rps=float('inf')),
+                       dict(download_concurrency=True), dict(split=1.5),
+                       dict(range_linear_block_size_kib=2048), dict(unknown=3)):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                settings.resolve(values)
+
+    def test_queue_tuning_overrides_global_values(self):
+        queue = self.root / 'queue.json'
+        job = dict(title='test', catalog='catalog.json', destination=str(self.root),
+                   tuning=dict(range_workers=1), state='pending')
+        download.write_json(queue, dict(archives=[job], tuning=dict(range_workers=2, disk_cache_mib=128)))
+        calls = []
+        with patch('sys.argv', ['semester_queue.py', str(queue)]), \
+                patch.object(semester_queue.subprocess, 'call', side_effect=lambda cmd: calls.append(cmd) or 0):
+            semester_queue.main()
+        self.assertIn('--range-workers=1', calls[0])
+        self.assertIn('--disk-cache-mib=128', calls[0])
+        self.assertNotIn('--range-workers=2', calls[0])
 
     def test_api_does_not_retry_permanent_404(self):
         error = urllib.error.HTTPError('https://example.invalid', 404, 'Gone', {}, None)
