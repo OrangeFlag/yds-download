@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import time
+from threading import RLock, Lock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +20,28 @@ from settings import OPTIONS, add_arguments, resolve
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 ENV = {k: v for k, v in os.environ.items()
        if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy')}
+STATE_LOCK = RLock()
+HASH_LOCK = Lock()
+
+
+def sha256_file(path, stopping=None):
+    while not HASH_LOCK.acquire(timeout=0.25):
+        if stopping is not None and stopping.is_set():
+            raise InterruptedError('SHA interrupted')
+    try:
+        before = path.stat()
+        digest = hashlib.sha256()
+        with path.open('rb') as stream:
+            while chunk := stream.read(1024 * 1024):
+                if stopping is not None and stopping.is_set():
+                    raise InterruptedError('SHA interrupted')
+                digest.update(chunk)
+        after = path.stat()
+        if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+            raise OSError('File changed during SHA verification')
+        return digest.hexdigest()
+    finally:
+        HASH_LOCK.release()
 
 
 def api(source, path='/', offset=0):
@@ -104,9 +127,10 @@ def target(root, item, course):
 
 
 def write_json(path, data):
-    temporary = path.with_name(path.name + '.tmp')
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-    temporary.replace(path)
+    with STATE_LOCK:
+        temporary = path.with_name(path.name + '.tmp')
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        temporary.replace(path)
 
 
 def read_events(path, repair=False):
@@ -135,7 +159,7 @@ def read_events(path, repair=False):
     return events
 
 
-def inspect(root, item, course, path=None):
+def inspect(root, item, course, path=None, stopping=None):
     path = path if path is not None else target(root, item, course)
     if not path.exists():
         return 'missing', 'No local file'
@@ -143,8 +167,7 @@ def inspect(root, item, course, path=None):
         return 'partial', 'Resume metadata retained'
     if path.stat().st_size != item['size']:
         return 'invalid', 'Size mismatch'
-    with path.open('rb') as stream:
-        actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+    actual = sha256_file(path, stopping)
     if actual != item['sha256']:
         return 'invalid', 'SHA-256 mismatch: ' + actual
     return 'valid', 'SHA-256 verified'
@@ -237,6 +260,13 @@ def list_course(source, course, retries=2, retry_delay=60):
 
 
 def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None):
+    if deep:
+        return download_deep(data, courses, root, retries, report_repo, mark, git_push, deep, retry_check, tuning)
+    from pipeline import run
+    return run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning)
+
+
+def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None):
     tuning = resolve(tuning)
     if not all(shutil.which(name) for name in ('aria2c', 'cp')):
         raise RuntimeError('Install aria2c and coreutils first')

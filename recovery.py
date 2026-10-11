@@ -13,6 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from threading import Event, Lock
 import urllib.request
+import urllib.error
 from progress import merge_ranges, saved_ranges, progress
 from settings import resolve
 
@@ -97,7 +98,7 @@ def new_recovery_body(root, event, reason):
     write_json(archive / 'failed.json', [event])
 
 
-def retry_ranges(root, event, item, retries, tuning=None):
+def retry_ranges(root, event, item, retries, tuning=None, stopping=None, download_active=None):
     tuning = resolve(tuning)
     from download import OPENER, write_json, files
     if item['size'] != event['size'] or item['sha256'] != event['sha256']:
@@ -119,9 +120,20 @@ def retry_ranges(root, event, item, retries, tuning=None):
     if shutil.disk_usage(root).free < missing_bytes + tuning['free_space_mib'] * 1024 ** 2:
         raise RuntimeError('Insufficient disk space for range recovery')
     rate_lock = Lock()
-    stopping = Event()
+    stopping = stopping if stopping is not None else Event()
+    foreground_limit = Lock()
     next_request = 0.0
     def fetch(bounds):
+        if download_active is not None and download_active.is_set():
+            while not foreground_limit.acquire(timeout=0.25):
+                if stopping.is_set():
+                    return bounds, None, 'Interrupted'
+            try:
+                return fetch_range(bounds)
+            finally:
+                foreground_limit.release()
+        return fetch_range(bounds)
+    def fetch_range(bounds):
         nonlocal next_request
         start, end = bounds
         with rate_lock:
@@ -167,6 +179,8 @@ def retry_ranges(root, event, item, retries, tuning=None):
     failed_count = 0
     remaining_span = total
     for attempt in range(1, max_passes + 1):
+        if stopping.is_set():
+            raise InterruptedError('Range interrupted')
         # Backend block geometry is unpublished; refine failed intervals by observed responses.
         minimum = tuning['range_min_block_size_kib'] * 1024
         block = max(minimum, tuning['range_block_size_kib'] * 1024 // (2 ** (attempt - 1)))
@@ -192,7 +206,16 @@ def retry_ranges(root, event, item, retries, tuning=None):
             unprobed = max(0, len(missing) - tuning['range_linear_probes'])
             missing = missing[:tuning['range_linear_probes']]
         if attempt > 1:
-            time.sleep(tuning['range_retry_delay'])
+            if download_active is None:
+                time.sleep(tuning['range_retry_delay'])
+            else:
+                delay = tuning['range_retry_delay']
+                while delay > 0:
+                    if stopping.is_set():
+                        raise InterruptedError('Range interrupted')
+                    pause = min(delay, 0.25)
+                    time.sleep(pause)
+                    delay -= pause
         source = json.loads((root / '.download/source.json').read_text())['source']
         fresh = next((row for row in files(source, '/' + event['course']) if row['path'] == event['path']), None)
         if not fresh or (fresh['size'], fresh['sha256']) != (event['size'], event['sha256']):
@@ -226,7 +249,7 @@ def retry_ranges(root, event, item, retries, tuning=None):
                     save_result(future)
                     futures.remove(future)
                     bounds = next(pending, None)
-                    if bounds is not None:
+                    if bounds is not None and not stopping.is_set():
                         futures.add(pool.submit(fetch, bounds))
         except KeyboardInterrupt:
             stopping.set()
@@ -237,6 +260,8 @@ def retry_ranges(root, event, item, retries, tuning=None):
             raise
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
+        if stopping.is_set():
+            raise InterruptedError('Range interrupted')
         if fine:
             cursor = missing[-1][1] % total
             write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor, control_imported=True))
@@ -297,19 +322,22 @@ def reconcile_course(root, course):
 
 
 def recovery_state(root, event, state):
-    from download import write_json
+    from download import write_json, STATE_LOCK
     path = root / '.download/recovery-state.json'
-    ledger = json.loads(path.read_text()) if path.exists() else {}
-    ledger[event['path']] = dict(state=state, event=dict(event))
-    write_json(path, ledger)
+    with STATE_LOCK:
+        ledger = json.loads(path.read_text()) if path.exists() else {}
+        ledger[event['path']] = dict(state=state, event=dict(event))
+        write_json(path, ledger)
 
 
-def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None):
+def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False):
+    if event.get('sha256_rejected_paths'):
+        _redownload = False
     if item is None:
-        return _finish_recovery(root, event, item, retries, _redownload, tuning)
+        return _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background)
     recovery_state(root, event, 'running')
     try:
-        result = _finish_recovery(root, event, item, retries, _redownload, tuning)
+        result = _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background)
     except ValueError:
         recovery_state(root, event, 'finished')
         raise
@@ -317,52 +345,62 @@ def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=
     return result
 
 
-def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None):
-    from download import record, target, write_json
+def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False):
+    from download import record, target, write_json, sha256_file
     path = body_path(root, event)
     if item:
         try:
-            retry_ranges(root, event, item, retries, tuning)
+            if background:
+                retry_ranges(root, event, item, retries, tuning, stopping, download_active)
+            else:
+                retry_ranges(root, event, item, retries, tuning)
+        except InterruptedError:
+            raise
         except OSError as error:
+            if background and not isinstance(error, urllib.error.URLError):
+                raise
             event['recovery_error'] = str(error)
             print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)
         path = body_path(root, event)
     ranges = saved_ranges(path, event['size'], event['sha256'])
     if ranges == [[0, event['size']]] and path.exists():
-        with path.open('rb') as stream:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        digest = sha256_file(path, stopping)
         if digest != event['sha256']:
             rejected = dict(event, sha256_mismatch=True, recovery_error='SHA-256 mismatch: ' + digest)
-            for manifest in (root / 'corrupted').glob('**/failed.json'):
-                rows = json.loads(manifest.read_text())
-                changed = False
-                for index, row in enumerate(rows):
-                    relative = row.get('corrupted_path') or str(manifest.parent.joinpath(*Path(row['path']).parts[1:]).relative_to(root))
-                    if relative == event['corrupted_path']:
-                        rows[index] = rejected
-                        changed = True
-                if changed:
-                    write_json(manifest, rows)
-            registry = root / '.download/partial-copies.json'
-            if registry.exists():
-                copies = json.loads(registry.read_text())
-                for copy in copies:
-                    if copy['path'] == event['path'] and copy['sha256'] == event['sha256']:
-                        copy['sha256_mismatch'] = True
-                write_json(registry, copies)
+            from download import STATE_LOCK
+            with STATE_LOCK:
+                for manifest in (root / 'corrupted').glob('**/failed.json'):
+                    rows = json.loads(manifest.read_text())
+                    changed = False
+                    for index, row in enumerate(rows):
+                        relative = row.get('corrupted_path') or str(manifest.parent.joinpath(*Path(row['path']).parts[1:]).relative_to(root))
+                        if relative == event['corrupted_path']:
+                            rows[index] = rejected
+                            changed = True
+                    if changed:
+                        write_json(manifest, rows)
+                registry = root / '.download/partial-copies.json'
+                if registry.exists():
+                    copies = json.loads(registry.read_text())
+                    for copy in copies:
+                        if copy['path'] == event['path'] and copy['sha256'] == event['sha256']:
+                            copy['sha256_mismatch'] = True
+                    write_json(registry, copies)
             event.update(rejected)
             if not item or not _redownload:
                 raise ValueError('SHA-256 mismatch; archived body retained and not promoted')
             # Retry in a separate body: no block hashes exist to locate the damaged bytes.
             event.setdefault('sha256_rejected_paths', []).append(event['corrupted_path'])
             new_recovery_body(root, event, 'SHA-256 mismatch; retry in a separate body')
-            return finish_recovery(root, event, item, retries, _redownload=False, tuning=tuning)
+            return finish_recovery(root, event, item, retries, _redownload=False, tuning=tuning,
+                                   stopping=stopping, download_active=download_active, background=background)
         if digest == event['sha256'] and item:
             destination = target(root, item, event['course'])
             copy_saved(path, destination)
             Path(str(destination) + '.aria2').unlink(missing_ok=True)
             record(root / '.download', item, event['course'], 0, 'valid', 'Recovered all ranges and SHA-256 verified')
-            reconcile_course(root, event['course'])
+            if not background:
+                reconcile_course(root, event['course'])
             event['range_recovered_complete'] = True
             return True
     return promote_partial(root, event)
