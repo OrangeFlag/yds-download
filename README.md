@@ -157,7 +157,7 @@ python3 download.py recover --destination "$YDS_DEST"
 python3 download.py report --destination "$YDS_DEST" --repo ~/gitRepos/ysda-video-backup --mark Walterit
 ```
 
-В Markdown меняются только ячейки таблиц: `Walterit (partially available; байты XX.XX%; время YY.YY%)`. Такая отметка не подтверждает полный оригинал и не делает курс полностью скачанным. Существующая отметка полного оригинала и чужие отметки сохраняются. Изменённые вручную частичные копии загрузчик не перезаписывает.
+В Markdown меняются только ячейки таблиц: `Walterit (partially available; время YY.YY%)`. Процент байтов остаётся в локальных отчётах. Такая отметка не подтверждает полный оригинал и не делает курс полностью скачанным. Существующая отметка полного оригинала и чужие отметки сохраняются. Изменённые вручную частичные копии загрузчик не перезаписывает.
 
 В журнале ищите `RANGE PASS`, `PARTIALLY AVAILABLE` и `RECOVERY ERROR`. Текущие данные `corrupted` можно свести командой `python3 download.py corrupted --destination "$YDS_DEST"`: она обновляет `corrupted/progress.json` и `corrupted/Прогресс загрузки.txt`.
 

@@ -123,8 +123,7 @@ def update_report(destination, repo, mark, git_push=False, message=None):
                 copies = ['' if value == mark else value for value in copies]
             partial_prefix = mark + ' (partially available;'
             if key in known_partial:
-                label = (f'{partial_prefix} байты {partial_copy["downloaded_percent"]:.2f}%; '
-                         f'время {partial_copy["available_time_percent"]:.2f}%)') if partial_copy else ''
+                label = f'{partial_prefix} время {partial_copy["available_time_percent"]:.2f}%)' if partial_copy else ''
                 previous = next((i for i, value in enumerate(copies) if value.startswith(partial_prefix)), None)
                 if previous is not None:
                     copies[previous] = label
