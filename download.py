@@ -55,6 +55,9 @@ def catalog(source):
 
 def select_courses(data, include, exclude):
     names = [item['name'] for item in data['courses']]
+    if any(not isinstance(name, str) or not name or name.startswith('/')
+           or '..' in PurePosixPath(name).parts for name in names):
+        raise ValueError('Course names must be nonempty relative paths without ..')
     if len(names) != len(set(names)):
         raise ValueError('Duplicate course names in catalog')
     unknown = (set(include or []) | set(exclude)) - set(names)
@@ -80,7 +83,10 @@ def files(source, path):
 
 def target(root, item, course):
     path = PurePosixPath(item['path'])
-    if not path.is_absolute() or len(path.parts) < 3 or '..' in path.parts or path.parts[1] != course:
+    course_path = PurePosixPath('/' + course)
+    if (not path.is_absolute() or '..' in path.parts or '..' in course_path.parts
+            or len(path.parts) <= len(course_path.parts)
+            or path.parts[:len(course_path.parts)] != course_path.parts):
         raise ValueError('Unexpected source path')
     destination = root.joinpath(*path.parts[1:])
     if not destination.resolve().is_relative_to(root) or any(ord(c) < 32 for c in str(destination)):
@@ -294,7 +300,7 @@ def main():
             raise ValueError('No courses selected')
         if args.catalog:
             available = {item['name'] for item in catalog(data['source'])['courses']}
-            if set(chosen) - available:
+            if {PurePosixPath(name).parts[0] for name in chosen} - available:
                 raise ValueError('Selected courses no longer exist in the source folder')
         return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push)
     except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:

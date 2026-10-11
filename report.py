@@ -129,7 +129,7 @@ def update_report(destination, repo, mark, git_push=False, message=None):
         updated = ''.join(rows)
         own_complete = bool(results) and valid == len(results)
         other_complete = bool(results) and all(
-            any(cell.strip() and cell.strip() != mark for cell in
+            any(cell.strip() and cell.strip() != mark and 'полнота не проверена' not in cell for cell in
                 re.split(r'(?<!\\)\|', line.strip())[3:-1])
             for line in updated.splitlines() if line.startswith('| `'))
         status = 'копия есть' if own_complete or other_complete else 'не все видео есть, какие-то не удается скачать'
