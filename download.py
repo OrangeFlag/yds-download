@@ -134,7 +134,7 @@ def list_course(source, course):
             time.sleep(60)
 
 
-def download(data, courses, root, retries=2, report_repo=None, mark=None):
+def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False):
     if not shutil.which('aria2c'):
         raise RuntimeError('Install aria2c first')
     root.mkdir(parents=True, exist_ok=True)
@@ -234,8 +234,9 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None):
         if report_repo:
             try:
                 from report import update_report
-                update_report(root, report_repo, mark)
-            except (OSError, ValueError, KeyError) as error:
+                update_report(root, report_repo, mark, git_push,
+                              f"Update {mark} copies: {data['title']} / {course}")
+            except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
                 print(f'REPORT ERROR: {error}', flush=True)
         print(('COURSE VERIFIED COMPLETE: ' if complete else 'COURSE FINISHED WITH ERRORS: ') + course, flush=True)
         write_json(state / 'summary.json', dict(verified=verified, failed=len(failed),
@@ -263,10 +264,12 @@ def main():
     fetching.add_argument('--retries', type=int, default=2, help='Retries after the first attempt (default: 2)')
     fetching.add_argument('--report-repo', type=Path, help='Update course cards after each course')
     fetching.add_argument('--mark', help='Custom copy owner mark for reports')
+    fetching.add_argument('--git-push', action='store_true', help='Commit and push reports after each course')
     reporting = commands.add_parser('report', help='Update backup course cards from download results')
     reporting.add_argument('--destination', required=True, type=Path)
     reporting.add_argument('--repo', required=True, type=Path)
     reporting.add_argument('--mark', required=True)
+    reporting.add_argument('--git-push', action='store_true', help='Commit and push the report')
     args = parser.parse_args()
     os.umask(0o077)
     try:
@@ -277,8 +280,10 @@ def main():
             return 0
         if args.command == 'report':
             from report import update_report
-            update_report(args.destination.resolve(), args.repo.resolve(), args.mark)
+            update_report(args.destination.resolve(), args.repo.resolve(), args.mark, args.git_push)
             return 0
+        if args.git_push and not args.report_repo:
+            raise ValueError('--git-push requires --report-repo')
         if args.report_repo and not args.mark:
             raise ValueError('--report-repo requires --mark')
         if args.retries < 0:
@@ -291,8 +296,8 @@ def main():
             available = {item['name'] for item in catalog(data['source'])['courses']}
             if set(chosen) - available:
                 raise ValueError('Selected courses no longer exist in the source folder')
-        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark)
-    except (ValueError, KeyError, OSError, RuntimeError) as error:
+        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push)
+    except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(2, f'Error: {error}\n')
 
 

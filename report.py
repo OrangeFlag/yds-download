@@ -1,5 +1,7 @@
 """Update existing backup course cards from verified downloader events."""
 import json
+import os
+import subprocess
 from pathlib import Path
 import re
 import unicodedata
@@ -13,9 +15,17 @@ def normalized(value):
     return unicodedata.normalize('NFC', value)
 
 
-def update_report(destination, repo, mark):
+def update_report(destination, repo, mark, git_push=False, message=None):
     if not mark or any(c in mark for c in '|\n\r'):
         raise ValueError('Mark must be nonempty and contain no pipes or line breaks')
+    repo = repo.resolve()
+    dirty = set()
+    if git_push:
+        staged = subprocess.run(['git', '-C', str(repo), 'diff', '--cached', '--quiet'])
+        if staged.returncode != 0:
+            raise RuntimeError('Report publish requires an empty Git index')
+        subprocess.run(['git', '-C', str(repo), 'symbolic-ref', '--quiet', 'HEAD'], check=True, stdout=subprocess.DEVNULL)
+        dirty = set(subprocess.check_output(['git', '-C', str(repo), 'diff', '--name-only', '-z']).decode().split('\0'))
     state = destination / '.download'
     source = json.loads((state / 'source.json').read_text(encoding='utf-8'))['source'].rstrip('/')
     text = (state / 'events.jsonl').read_text(encoding='utf-8')
@@ -119,10 +129,6 @@ def update_report(destination, repo, mark):
                 counts = totals[year_match[1]]
                 counts[0 if old_status[1] == 'копия есть' else 1] -= 1
                 counts[0 if status == 'копия есть' else 1] += 1
-    for card, updated in changes:
-        temporary = card.with_name(card.name + '.tmp')
-        temporary.write_text(updated, encoding='utf-8')
-        temporary.replace(card)
     readme = repo / 'README.md'
     if changes and readme.exists():
         original = readme.read_text(encoding='utf-8')
@@ -143,8 +149,24 @@ def update_report(destination, repo, mark):
                 return '|'.join(cells)
             updated = re.sub(pattern, year_row, updated, flags=re.M)
         if updated != original:
-            temporary = readme.with_name(readme.name + '.tmp')
-            temporary.write_text(updated, encoding='utf-8')
-            temporary.replace(readme)
-    print(f'REPORT: {len(changes)} course cards updated; mark={mark}', flush=True)
+            changes.append((readme, updated))
+    paths = [str(path.relative_to(repo)) for path, _ in changes]
+    if git_push and dirty.intersection(paths):
+        raise RuntimeError('Report would include existing edits: ' + ', '.join(sorted(dirty.intersection(paths))))
+    for path, updated in changes:
+        temporary = path.with_name(path.name + '.tmp')
+        temporary.write_text(updated, encoding='utf-8')
+        temporary.replace(path)
+    print(f'REPORT: {len(changes)} files updated; mark={mark}', flush=True)
+    if git_push:
+        git_env = os.environ.copy()
+        git_env.setdefault('GIT_SSH_COMMAND', 'ssh -o BatchMode=yes -o ConnectTimeout=15')
+        def git(*args):
+            subprocess.run(['git', '-C', str(repo), *args], check=True, timeout=120, env=git_env)
+        if paths:
+            git('add', '--', *paths)
+            git('commit', '-m', message or f'Update {mark} verified download report')
+        # Also retry pushing an earlier local commit when this report is unchanged.
+        git('push', 'origin', 'HEAD')
+        print('REPORT PUSHED', flush=True)
     return len(changes)
