@@ -1,0 +1,191 @@
+{
+  "source": "https://disk.yandex.ru/d/2cjhoac1AX0PMw",
+  "title": "ШАД весна 2026",
+  "courses": [
+    {
+      "name": "Компьютерные сети",
+      "enabled": true,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%9A%D0%BE%D0%BC%D0%BF%D1%8C%D1%8E%D1%82%D0%B5%D1%80%D0%BD%D1%8B%D0%B5%20%D1%81%D0%B5%D1%82%D0%B8"
+    },
+    {
+      "name": "Базы данных, часть 2",
+      "enabled": true,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%91%D0%B0%D0%B7%D1%8B%20%D0%B4%D0%B0%D0%BD%D0%BD%D1%8B%D1%85%2C%20%D1%87%D0%B0%D1%81%D1%82%D1%8C%202"
+    },
+    {
+      "name": "Информационная безопасность облачных платформ",
+      "enabled": true,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%98%D0%BD%D1%84%D0%BE%D1%80%D0%BC%D0%B0%D1%86%D0%B8%D0%BE%D0%BD%D0%BD%D0%B0%D1%8F%20%D0%B1%D0%B5%D0%B7%D0%BE%D0%BF%D0%B0%D1%81%D0%BD%D0%BE%D1%81%D1%82%D1%8C%20%D0%BE%D0%B1%D0%BB%D0%B0%D1%87%D0%BD%D1%8B%D1%85%20%D0%BF%D0%BB%D0%B0%D1%82%D1%84%D0%BE%D1%80%D0%BC"
+    },
+    {
+      "name": "Дополнительные главы АКОС",
+      "enabled": true,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%94%D0%BE%D0%BF%D0%BE%D0%BB%D0%BD%D0%B8%D1%82%D0%B5%D0%BB%D1%8C%D0%BD%D1%8B%D0%B5%20%D0%B3%D0%BB%D0%B0%D0%B2%D1%8B%20%D0%90%D0%9A%D0%9E%D0%A1"
+    },
+    {
+      "name": "Разработка на C++ с учётом особенностей современной архитектуры",
+      "enabled": true,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%A0%D0%B0%D0%B7%D1%80%D0%B0%D0%B1%D0%BE%D1%82%D0%BA%D0%B0%20%D0%BD%D0%B0%20C%2B%2B%20%D1%81%20%D1%83%D1%87%D1%91%D1%82%D0%BE%D0%BC%20%D0%BE%D1%81%D0%BE%D0%B1%D0%B5%D0%BD%D0%BD%D0%BE%D1%81%D1%82%D0%B5%D0%B9%20%D1%81%D0%BE%D0%B2%D1%80%D0%B5%D0%BC%D0%B5%D0%BD%D0%BD%D0%BE%D0%B9%20%D0%B0%D1%80%D1%85%D0%B8%D1%82%D0%B5%D0%BA%D1%82%D1%83%D1%80%D1%8B"
+    },
+    {
+      "name": "Обучение языку C++, часть 2",
+      "enabled": true,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%9E%D0%B1%D1%83%D1%87%D0%B5%D0%BD%D0%B8%D0%B5%20%D1%8F%D0%B7%D1%8B%D0%BA%D1%83%20C%2B%2B%2C%20%D1%87%D0%B0%D1%81%D1%82%D1%8C%202"
+    },
+    {
+      "name": "Вычисления на графических процессорах при помощи C++",
+      "enabled": true,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%92%D1%8B%D1%87%D0%B8%D1%81%D0%BB%D0%B5%D0%BD%D0%B8%D1%8F%20%D0%BD%D0%B0%20%D0%B3%D1%80%D0%B0%D1%84%D0%B8%D1%87%D0%B5%D1%81%D0%BA%D0%B8%D1%85%20%D0%BF%D1%80%D0%BE%D1%86%D0%B5%D1%81%D1%81%D0%BE%D1%80%D0%B0%D1%85%20%D0%BF%D1%80%D0%B8%20%D0%BF%D0%BE%D0%BC%D0%BE%D1%89%D0%B8%20C%2B%2B"
+    },
+    {
+      "name": "Язык Go",
+      "enabled": true,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%AF%D0%B7%D1%8B%D0%BA%20Go"
+    },
+    {
+      "name": "Функциональное программирование на языке Haskell",
+      "enabled": true,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%A4%D1%83%D0%BD%D0%BA%D1%86%D0%B8%D0%BE%D0%BD%D0%B0%D0%BB%D1%8C%D0%BD%D0%BE%D0%B5%20%D0%BF%D1%80%D0%BE%D0%B3%D1%80%D0%B0%D0%BC%D0%BC%D0%B8%D1%80%D0%BE%D0%B2%D0%B0%D0%BD%D0%B8%D0%B5%20%D0%BD%D0%B0%20%D1%8F%D0%B7%D1%8B%D0%BA%D0%B5%20Haskell"
+    },
+    {
+      "name": "Алгоритмы и структуры данных, часть 2",
+      "enabled": true,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%90%D0%BB%D0%B3%D0%BE%D1%80%D0%B8%D1%82%D0%BC%D1%8B%20%D0%B8%20%D1%81%D1%82%D1%80%D1%83%D0%BA%D1%82%D1%83%D1%80%D1%8B%20%D0%B4%D0%B0%D0%BD%D0%BD%D1%8B%D1%85%2C%20%D1%87%D0%B0%D1%81%D1%82%D1%8C%202"
+    },
+    {
+      "name": "Введение в современную прикладную криптографию, часть 2",
+      "enabled": true,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%92%D0%B2%D0%B5%D0%B4%D0%B5%D0%BD%D0%B8%D0%B5%20%D0%B2%20%D1%81%D0%BE%D0%B2%D1%80%D0%B5%D0%BC%D0%B5%D0%BD%D0%BD%D1%83%D1%8E%20%D0%BF%D1%80%D0%B8%D0%BA%D0%BB%D0%B0%D0%B4%D0%BD%D1%83%D1%8E%20%D0%BA%D1%80%D0%B8%D0%BF%D1%82%D0%BE%D0%B3%D1%80%D0%B0%D1%84%D0%B8%D1%8E%2C%20%D1%87%D0%B0%D1%81%D1%82%D1%8C%202"
+    },
+    {
+      "name": "Верификация программ на Lean",
+      "enabled": true,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%92%D0%B5%D1%80%D0%B8%D1%84%D0%B8%D0%BA%D0%B0%D1%86%D0%B8%D1%8F%20%D0%BF%D1%80%D0%BE%D0%B3%D1%80%D0%B0%D0%BC%D0%BC%20%D0%BD%D0%B0%20Lean"
+    },
+    {
+      "name": "3D компьютерное зрение",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/3D%20%D0%BA%D0%BE%D0%BC%D0%BF%D1%8C%D1%8E%D1%82%D0%B5%D1%80%D0%BD%D0%BE%D0%B5%20%D0%B7%D1%80%D0%B5%D0%BD%D0%B8%D0%B5"
+    },
+    {
+      "name": "AI for Robotics",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/AI%20for%20Robotics"
+    },
+    {
+      "name": "Deep Learning Theory",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/Deep%20Learning%20Theory"
+    },
+    {
+      "name": "Self-Driving Cars",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/Self-Driving%20Cars"
+    },
+    {
+      "name": "АБ-тестирование",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%90%D0%91-%D1%82%D0%B5%D1%81%D1%82%D0%B8%D1%80%D0%BE%D0%B2%D0%B0%D0%BD%D0%B8%D0%B5"
+    },
+    {
+      "name": "Анализ данных на Python",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%90%D0%BD%D0%B0%D0%BB%D0%B8%D0%B7%20%D0%B4%D0%B0%D0%BD%D0%BD%D1%8B%D1%85%20%D0%BD%D0%B0%20Python"
+    },
+    {
+      "name": "Генеративные модели в компьютерном зрении",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%93%D0%B5%D0%BD%D0%B5%D1%80%D0%B0%D1%82%D0%B8%D0%B2%D0%BD%D1%8B%D0%B5%20%D0%BC%D0%BE%D0%B4%D0%B5%D0%BB%D0%B8%20%D0%B2%20%D0%BA%D0%BE%D0%BC%D0%BF%D1%8C%D1%8E%D1%82%D0%B5%D1%80%D0%BD%D0%BE%D0%BC%20%D0%B7%D1%80%D0%B5%D0%BD%D0%B8%D0%B8"
+    },
+    {
+      "name": "Глубинное зрение и графика",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%93%D0%BB%D1%83%D0%B1%D0%B8%D0%BD%D0%BD%D0%BE%D0%B5%20%D0%B7%D1%80%D0%B5%D0%BD%D0%B8%D0%B5%20%D0%B8%20%D0%B3%D1%80%D0%B0%D1%84%D0%B8%D0%BA%D0%B0"
+    },
+    {
+      "name": "Дополнительные главы теории игр и дизайн механизмов",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%94%D0%BE%D0%BF%D0%BE%D0%BB%D0%BD%D0%B8%D1%82%D0%B5%D0%BB%D1%8C%D0%BD%D1%8B%D0%B5%20%D0%B3%D0%BB%D0%B0%D0%B2%D1%8B%20%D1%82%D0%B5%D0%BE%D1%80%D0%B8%D0%B8%20%D0%B8%D0%B3%D1%80%20%D0%B8%20%D0%B4%D0%B8%D0%B7%D0%B0%D0%B8%CC%86%D0%BD%20%D0%BC%D0%B5%D1%85%D0%B0%D0%BD%D0%B8%D0%B7%D0%BC%D0%BE%D0%B2"
+    },
+    {
+      "name": "ИИ-ассистенты для исследователя",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%98%D0%98-%D0%B0%D1%81%D1%81%D0%B8%D1%81%D1%82%D0%B5%D0%BD%D1%82%D1%8B%20%D0%B4%D0%BB%D1%8F%20%D0%B8%D1%81%D1%81%D0%BB%D0%B5%D0%B4%D0%BE%D0%B2%D0%B0%D1%82%D0%B5%D0%BB%D1%8F"
+    },
+    {
+      "name": "Комбинаторная оптимизация",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%9A%D0%BE%D0%BC%D0%B1%D0%B8%D0%BD%D0%B0%D1%82%D0%BE%D1%80%D0%BD%D0%B0%D1%8F%20%D0%BE%D0%BF%D1%82%D0%B8%D0%BC%D0%B8%D0%B7%D0%B0%D1%86%D0%B8%D1%8F"
+    },
+    {
+      "name": "Конкретная математика",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%9A%D0%BE%D0%BD%D0%BA%D1%80%D0%B5%D1%82%D0%BD%D0%B0%D1%8F%20%D0%BC%D0%B0%D1%82%D0%B5%D0%BC%D0%B0%D1%82%D0%B8%D0%BA%D0%B0"
+    },
+    {
+      "name": "МСПС",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%9C%D0%A1%D0%9F%D0%A1"
+    },
+    {
+      "name": "Машинное обучение, часть 2",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%9C%D0%B0%D1%88%D0%B8%D0%BD%D0%BD%D0%BE%D0%B5%20%D0%BE%D0%B1%D1%83%D1%87%D0%B5%D0%BD%D0%B8%D0%B5%2C%20%D1%87%D0%B0%D1%81%D1%82%D1%8C%202"
+    },
+    {
+      "name": "Мультимодальные LLM",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%9C%D1%83%D0%BB%D1%8C%D1%82%D0%B8%D0%BC%D0%BE%D0%B4%D0%B0%D0%BB%D1%8C%D0%BD%D1%8B%D0%B5%20LLM"
+    },
+    {
+      "name": "Обучение с подкреплением",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%9E%D0%B1%D1%83%D1%87%D0%B5%D0%BD%D0%B8%D0%B5%20%D1%81%20%D0%BF%D0%BE%D0%B4%D0%BA%D1%80%D0%B5%D0%BF%D0%BB%D0%B5%D0%BD%D0%B8%D0%B5%D0%BC"
+    },
+    {
+      "name": "Основы статистики в машинном обучении",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%9E%D1%81%D0%BD%D0%BE%D0%B2%D1%8B%20%D1%81%D1%82%D0%B0%D1%82%D0%B8%D1%81%D1%82%D0%B8%D0%BA%D0%B8%20%D0%B2%20%D0%BC%D0%B0%D1%88%D0%B8%D0%BD%D0%BD%D0%BE%D0%BC%20%D0%BE%D0%B1%D1%83%D1%87%D0%B5%D0%BD%D0%B8%D0%B8"
+    },
+    {
+      "name": "Продуктовый ML",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%9F%D1%80%D0%BE%D0%B4%D1%83%D0%BA%D1%82%D0%BE%D0%B2%D1%8B%D0%B9%20ML"
+    },
+    {
+      "name": "Рекомендательные системы",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%A0%D0%B5%D0%BA%D0%BE%D0%BC%D0%B5%D0%BD%D0%B4%D0%B0%D1%82%D0%B5%D0%BB%D1%8C%D0%BD%D1%8B%D0%B5%20%D1%81%D0%B8%D1%81%D1%82%D0%B5%D0%BC%D1%8B"
+    },
+    {
+      "name": "Речевые технологии",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%A0%D0%B5%D1%87%D0%B5%D0%B2%D1%8B%D0%B5%20%D1%82%D0%B5%D1%85%D0%BD%D0%BE%D0%BB%D0%BE%D0%B3%D0%B8%D0%B8"
+    },
+    {
+      "name": "Теория вероятностей и прикладная статистика",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%A2%D0%B5%D0%BE%D1%80%D0%B8%D1%8F%20%D0%B2%D0%B5%D1%80%D0%BE%D1%8F%D1%82%D0%BD%D0%BE%D1%81%D1%82%D0%B5%D0%B9%20%D0%B8%20%D0%BF%D1%80%D0%B8%D0%BA%D0%BB%D0%B0%D0%B4%D0%BD%D0%B0%D1%8F%20%D1%81%D1%82%D0%B0%D1%82%D0%B8%D1%81%D1%82%D0%B8%D0%BA%D0%B0"
+    },
+    {
+      "name": "Умные устройства",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%A3%D0%BC%D0%BD%D1%8B%D0%B5%20%D1%83%D1%81%D1%82%D1%80%D0%BE%D0%B9%D1%81%D1%82%D0%B2%D0%B0"
+    },
+    {
+      "name": "Фундаментальные основы генеративного ИИ",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%A4%D1%83%D0%BD%D0%B4%D0%B0%D0%BC%D0%B5%D0%BD%D1%82%D0%B0%D0%BB%D1%8C%D0%BD%D1%8B%D0%B5%20%D0%BE%D1%81%D0%BD%D0%BE%D0%B2%D1%8B%20%D0%B3%D0%B5%D0%BD%D0%B5%D1%80%D0%B0%D1%82%D0%B8%D0%B2%D0%BD%D0%BE%D0%B3%D0%BE%20%D0%98%D0%98"
+    },
+    {
+      "name": "Эффективные модели ML и архитектуры нейросетей",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%AD%D1%84%D1%84%D0%B5%D0%BA%D1%82%D0%B8%D0%B2%D0%BD%D1%8B%D0%B5%20%D0%BC%D0%BE%D0%B4%D0%B5%D0%BB%D0%B8%20ML%20%D0%B8%20%D0%B0%D1%80%D1%85%D0%B8%D1%82%D0%B5%D0%BA%D1%82%D1%83%D1%80%D1%8B%20%D0%BD%D0%B5%D0%B8%CC%86%D1%80%D0%BE%D1%81%D0%B5%D1%82%D0%B5%D0%B8%CC%86"
+    },
+    {
+      "name": "Эффективные системы глубинного обучения",
+      "enabled": false,
+      "url": "https://disk.yandex.ru/d/2cjhoac1AX0PMw/%D0%AD%D1%84%D1%84%D0%B5%D0%BA%D1%82%D0%B8%D0%B2%D0%BD%D1%8B%D0%B5%20%D1%81%D0%B8%D1%81%D1%82%D0%B5%D0%BC%D1%8B%20%D0%B3%D0%BB%D1%83%D0%B1%D0%B8%D0%BD%D0%BD%D0%BE%D0%B3%D0%BE%20%D0%BE%D0%B1%D1%83%D1%87%D0%B5%D0%BD%D0%B8%D1%8F"
+    }
+  ]
+}

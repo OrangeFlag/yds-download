@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.download/
+corrupted/
+*.aria2
+*.log
+catalog.json
