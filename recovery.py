@@ -195,7 +195,7 @@ def retry_ranges(root, event, item, retries):
                 ranges = merge_ranges(ranges + [saved])
             outcomes.append(dict(start=bounds[0], end=bounds[1], saved_bytes=len(data) if data else 0, error=error))
         # Consume completed requests immediately so Ctrl+C cannot lose later successful chunks.
-        workers = 16
+        workers = 4
         pool = ThreadPoolExecutor(max_workers=workers)
         futures = set()
         try:

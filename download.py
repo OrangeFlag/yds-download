@@ -306,9 +306,9 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
                 'aria2c', '--input-file=' + str(state / 'queue.txt'),
                 '--continue=true', '--always-resume=true', '--check-integrity=true',
                 '--auto-file-renaming=false', '--allow-overwrite=true',
-                '--max-concurrent-downloads=8', '--max-connection-per-server=4', '--split=4',
-                '--min-split-size=4M', '--file-allocation=none', '--disk-cache=64M',
-                '--auto-save-interval=5', '--max-tries=1', '--connect-timeout=20',
+                '--max-concurrent-downloads=2', '--max-connection-per-server=4', '--split=4',
+                '--min-split-size=4M', '--file-allocation=none', '--disk-cache=256M',
+                '--auto-save-interval=30', '--max-tries=1', '--connect-timeout=20',
                 '--timeout=60', '--summary-interval=30', '--enable-color=false',
                 '--console-log-level=warn', '--log=' + str(state / 'aria2.log'), '--log-level=notice',
             ], env=ENV)
