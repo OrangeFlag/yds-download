@@ -365,6 +365,36 @@ class ReviewRegression(unittest.TestCase):
         copy = json.loads((self.state / 'partial-copies.json').read_text())[0]
         self.assertEqual(copy['downloaded_percent'], 75)
 
+    def test_many_failed_ranges_switch_directly_to_bounded_linear_scan(self):
+        self.item['size'] = 33 * 16 * 1024 ** 2
+        self.event['size'] = self.item['size']
+        error = urllib.error.HTTPError('https://example.invalid', 500, 'Unavailable', {}, None)
+        with patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=error):
+            recovery.retry_ranges(self.root, self.event, self.item, 2)
+        attempts = self.event['range_attempts']
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(attempts[1]['fine'])
+        self.assertEqual(len(attempts[1]['ranges']), 256)
+        self.assertGreater(attempts[1]['unprobed'], 0)
+        for r in attempts[1]['ranges']:
+            self.assertLessEqual(r['end'] - r['start'], 65536)
+
+    def test_single_failed_range_is_halved_without_skipping_other_half(self):
+        self.content = b'A' * (16 * 1024 ** 2)
+        self.item.update(size=len(self.content), sha256=hashlib.sha256(self.content).hexdigest())
+        self.event.update(size=self.item['size'], sha256=self.item['sha256'])
+        def serve(request, timeout):
+            start = int(request.get_header('Range')[6:].split('-')[0])
+            if start == 0:
+                raise urllib.error.HTTPError(request.full_url, 500, 'Unavailable', {}, None)
+            return self.serve(request, timeout)
+        with patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=serve):
+            ranges = recovery.retry_ranges(self.root, self.event, self.item, 2)
+        second = self.event['range_attempts'][1]
+        self.assertEqual(sorted((r['start'], r['end']) for r in second['ranges']),
+                         [(0, 8 * 1024 ** 2), (8 * 1024 ** 2, 16 * 1024 ** 2)])
+        self.assertGreater(sum(end - start for start, end in ranges), 15 * 1024 ** 2)
+
 
 if __name__ == '__main__':
     unittest.main()

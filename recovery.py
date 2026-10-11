@@ -153,10 +153,15 @@ def retry_ranges(root, event, item, retries):
         except (OSError, http.client.HTTPException) as error:
             return bounds, None, 'HTTP ' + str(error.code) if hasattr(error, 'code') else type(error).__name__
     attempts = []
-    for attempt in range(1, retries + 3):
+    max_passes = min(4, 2 * retries) + 2
+    failed_count = 0
+    remaining_span = total
+    for attempt in range(1, max_passes + 1):
         # Backend block geometry is unpublished; refine failed intervals by observed responses.
-        block = max(64 * 1024, 16 * 1024 ** 2 // (4 ** min(attempt - 1, 4)))
-        fine = attempt == retries + 2
+        block = max(1024 ** 2, 16 * 1024 ** 2 // (2 ** (attempt - 1)))
+        if attempt > 1:
+            block = min(block, max(1024 ** 2, (remaining_span + 1) // 2))
+        fine = attempt > 1 and (block <= 1024 ** 2 or failed_count > 32 or attempt == max_passes)
         if fine:
             block = 64 * 1024
         missing = []
@@ -225,9 +230,13 @@ def retry_ranges(root, event, item, retries):
             cursor = missing[-1][1] % total
             write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor))
         attempts.append(dict(attempt=attempt, ranges=outcomes, unprobed=unprobed, fine=fine))
+        failed_count = sum(row['saved_bytes'] < row['end'] - row['start'] for row in outcomes)
+        remaining_span = max((row['end'] - row['start'] - row['saved_bytes'] for row in outcomes), default=0)
         event['range_attempts'] = attempts
         event.update(progress(path, total, sha256=event['sha256']))
-        print(f'RANGE PASS {attempt}/{retries + 2}: {event["path"]}; chunk={block}; saved={sum(row["saved_bytes"] > 0 for row in outcomes)}/{len(outcomes)}; bytes={event["downloaded_percent"]}; unprobed={unprobed}', flush=True)
+        print(f'RANGE PASS {attempt}/{max_passes}: {event["path"]}; chunk={block}; mode={"linear" if fine else "halving"}; saved={sum(row["saved_bytes"] > 0 for row in outcomes)}/{len(outcomes)}; bytes={event["downloaded_percent"]}; unprobed={unprobed}', flush=True)
+        if fine:
+            break
     return ranges
 
 
