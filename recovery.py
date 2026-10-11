@@ -106,8 +106,10 @@ def retry_ranges(root, event, item, retries):
         path = body_path(root, event)
         path.parent.mkdir(parents=True, exist_ok=True)
     journal = Path(str(path) + '.ranges.json')
-    additional = json.loads(journal.read_text())['ranges'] if journal.exists() else []
     cursor = json.loads(journal.read_text()).get('salvage_cursor', 0) if journal.exists() else 0
+    additional = [list(bounds) for bounds in ranges]
+    # Drop proofs past the retained body before a new write can extend it again.
+    write_json(journal, dict(size=event['size'], sha256=event['sha256'], ranges=additional, salvage_cursor=cursor))
     total = event['size']
     missing_bytes = total - sum(end - start for start, end in ranges)
     if shutil.disk_usage(root).free < missing_bytes + 1024 ** 3:
@@ -277,7 +279,11 @@ def finish_recovery(root, event, item=None, retries=2, _redownload=True):
     from download import record, target, write_json
     path = body_path(root, event)
     if item:
-        retry_ranges(root, event, item, retries)
+        try:
+            retry_ranges(root, event, item, retries)
+        except OSError as error:
+            event['recovery_error'] = str(error)
+            print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)
         path = body_path(root, event)
     ranges = saved_ranges(path, event['size'], event['sha256'])
     if ranges == [[0, event['size']]] and path.exists():
@@ -380,6 +386,11 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
             event['recovery_error'] = str(error)
             print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)
+            if isinstance(error, OSError):
+                try:
+                    finish_recovery(root, event)
+                except (OSError, ValueError, KeyError, subprocess.SubprocessError) as local_error:
+                    event['local_recovery_error'] = str(local_error)
         if retry and not event.get('range_recovered_complete'):
             event.update(time=datetime.now().astimezone().isoformat(),
                          status='partial' if (event.get('downloaded_bytes') or 0) > 0 else 'missing',

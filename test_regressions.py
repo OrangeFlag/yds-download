@@ -329,6 +329,42 @@ class ReviewRegression(unittest.TestCase):
         self.body.unlink()
         self.assertEqual(progress.saved_ranges(self.body, self.item['size'], self.item['sha256']), [])
 
+    def test_old_journal_ranges_do_not_reappear_after_body_grows(self):
+        block = 65536
+        self.content = b'A' * (20 * block)
+        self.item.update(size=len(self.content), sha256=hashlib.sha256(self.content).hexdigest())
+        self.event.update(size=self.item['size'], sha256=self.item['sha256'])
+        self.body.write_bytes(self.content[:6 * block])
+        self.journal(self.body, [[0, 12 * block]])
+        def serve(request, timeout):
+            start = int(request.get_header('Range')[6:].split('-')[0])
+            if start < 16 * block:
+                raise urllib.error.HTTPError(request.full_url, 500, 'Unavailable', {}, None)
+            return self.serve(request, timeout)
+        with patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=serve):
+            self.assertFalse(recovery.finish_recovery(self.root, self.event, self.item, retries=0))
+        self.assertEqual(self.event['downloaded_bytes'], 10 * block)
+        self.assertFalse((self.state / 'partial-copies.json').exists())
+
+    def test_metadata_failure_still_promotes_existing_confirmed_bytes(self):
+        self.body.write_bytes(self.content)
+        self.journal(self.body, [[0, 3 * self.item['size'] // 4]])
+        error = urllib.error.HTTPError('https://example.invalid', 500, 'Unavailable', {}, None)
+        with patch.object(download, 'files', side_effect=error):
+            recovery.recover_corrupted(self.root, self.source, retry=True)
+        copy = json.loads((self.state / 'partial-copies.json').read_text())[0]
+        self.assertEqual(copy['downloaded_percent'], 75)
+        self.assertIn('recovery_error', copy)
+
+    def test_first_archive_metadata_failure_still_promotes(self):
+        self.body.write_bytes(self.content)
+        self.journal(self.body, [[0, 3 * self.item['size'] // 4]])
+        error = urllib.error.HTTPError('https://example.invalid', 500, 'Unavailable', {}, None)
+        with patch.object(download, 'files', side_effect=error):
+            self.assertTrue(recovery.finish_recovery(self.root, self.event, self.item, retries=0))
+        copy = json.loads((self.state / 'partial-copies.json').read_text())[0]
+        self.assertEqual(copy['downloaded_percent'], 75)
+
 
 if __name__ == '__main__':
     unittest.main()
