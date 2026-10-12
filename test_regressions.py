@@ -109,7 +109,7 @@ class ReviewRegression(unittest.TestCase):
             return 1
         data = dict(source=self.source, title='test')
         with patch.object(download, 'list_course', return_value=[self.item]), \
-                patch.object(download.subprocess, 'call', side_effect=aria), \
+                patch('pipeline.transfer_process', side_effect=aria), \
                 patch.object(download, 'inspect', return_value=('invalid', 'test')), \
                 patch.object(recovery, 'finish_recovery', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
@@ -468,7 +468,7 @@ class ReviewRegression(unittest.TestCase):
             return 1
         error = urllib.error.HTTPError('https://example.invalid', 500, 'Unavailable', {}, None)
         with patch.object(download, 'files', return_value=[self.item]), \
-                patch.object(download.subprocess, 'call', side_effect=aria), \
+                patch('pipeline.transfer_process', side_effect=aria), \
                 patch.object(download.OPENER, 'open', side_effect=error):
             self.assertEqual(download.download(dict(source=self.source, title='test'),
                                              ['Course'], self.root, retries=0), 1)
@@ -514,7 +514,7 @@ class ReviewRegression(unittest.TestCase):
         error = urllib.error.HTTPError('https://example.invalid', 500, 'Unavailable', {}, None)
         with patch.object(download, 'files', return_value=[self.item]), \
                 patch.object(download.OPENER, 'open', side_effect=error), \
-                patch.object(download.subprocess, 'call', side_effect=AssertionError('Ready file requeued')):
+                patch('pipeline.transfer_process', side_effect=AssertionError('Ready file requeued')):
             self.assertEqual(download.download(dict(source=self.source, title='test'),
                                              ['Course'], self.root, retries=0, deep=True, retry_check=True), 0)
         latest = download.read_events(self.state / 'events.jsonl')[-1]

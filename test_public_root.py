@@ -32,7 +32,7 @@ class PublicRootChecks(unittest.TestCase):
                 (root / 'photo.jpg').write_bytes(content)
                 return 0
             with patch.object(download, 'api', return_value=item), \
-                    patch.object(download.subprocess, 'call', side_effect=transfer):
+                    patch('pipeline.transfer_process', side_effect=transfer):
                 data = download.catalog('https://disk.yandex.ru/d/test', True)
                 self.assertEqual(download.download(data, ['.'], root, retries=0), 0)
             status = json.loads((root / '.download/course-history.json').read_text())['.']

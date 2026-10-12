@@ -4,9 +4,11 @@ from collections import namedtuple
 import json
 from pathlib import Path
 import tempfile
+import sys
+import subprocess
 from threading import Event
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import download
 import recovery
@@ -41,7 +43,7 @@ class PipelineChecks(unittest.TestCase):
 
     def run_download(self, **kwargs):
         with patch.object(download, 'list_course', side_effect=lambda source, course, *args: [self.items[course]]), \
-                patch.object(download.subprocess, 'call', side_effect=self.transfer):
+                patch('pipeline.transfer_process', side_effect=self.transfer):
             return download.download(self.data, ['First', 'Second'], self.root, retries=0, **kwargs)
 
     def test_sha_does_not_block_next_course(self):
@@ -53,6 +55,48 @@ class PipelineChecks(unittest.TestCase):
         with patch.object(download, 'inspect', side_effect=inspect):
             self.assertEqual(self.run_download(), 0)
         self.assertTrue(json.loads((self.root / '.download/01-status.json').read_text())['complete'])
+
+    def test_completed_course_is_published_during_next_transfer(self):
+        original_popen = subprocess.Popen
+        original_inspect = download.inspect
+        observed = self.root / 'observed'
+        first = self.root / 'First/video.mp4'
+        first.parent.mkdir()
+        first.write_bytes(self.content)
+        def inspect(root, item, course, *args, **kwargs):
+            if course == 'First':
+                self.assertTrue(self.second_started.wait(2))
+            return original_inspect(root, item, course, *args, **kwargs)
+        def popen(command, **kwargs):
+            self.second_started.set()
+            script = ("import pathlib,time; root=pathlib.Path(" + repr(str(self.root)) + "); "
+                      "deadline=time.monotonic()+8\n"
+                      "while time.monotonic()<deadline:\n"
+                      " q=root/'.download/02-status.json'\n"
+                      " if q.exists() and '\"state\": \"finished\"' in q.read_text():\n"
+                      "  (root/'premature').touch()\n"
+                      " p=root/'.download/01-status.json'\n"
+                      " if p.exists() and '\"state\": \"finished\"' in p.read_text():\n"
+                      "  (root/'observed').touch(); break\n"
+                      " time.sleep(.05)\n"
+                      "p=root/'Second/video.mp4'; p.parent.mkdir(exist_ok=True); p.write_bytes(b'lecture')\n")
+            return original_popen([sys.executable, '-c', script], **kwargs)
+        with patch.object(download, 'list_course', side_effect=lambda source, course, *args: [self.items[course]]), \
+                patch.object(download, 'inspect', side_effect=inspect), \
+                patch.object(subprocess, 'Popen', side_effect=popen):
+            self.assertEqual(download.download(self.data, ['First', 'Second'], self.root, retries=0), 0)
+        self.assertTrue(observed.exists(), 'Finished course waited for the entire next transfer')
+        self.assertFalse((self.root / 'premature').exists(), 'Active download was finalized early')
+
+    def test_callback_failure_stops_and_reaps_transfer(self):
+        process = Mock()
+        process.wait.side_effect = [subprocess.TimeoutExpired('aria2c', 5), 130]
+        process.poll.return_value = None
+        with patch.object(subprocess, 'Popen', return_value=process):
+            with self.assertRaisesRegex(RuntimeError, 'background failed'):
+                pipeline.transfer_process(['aria2c'], env={}, on_tick=Mock(side_effect=RuntimeError('background failed')))
+        process.send_signal.assert_called_once_with(pipeline.signal.SIGINT)
+        self.assertEqual(process.wait.call_count, 2)
 
     def test_range_does_not_block_next_course(self):
         self.items['First']['size'] = 20
@@ -100,7 +144,7 @@ class PipelineChecks(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 self.run_download()
         with patch.object(download, 'list_course', side_effect=lambda source, course, *args: [self.items[course]]), \
-                patch.object(download.subprocess, 'call', side_effect=AssertionError('Completed file transferred again')):
+                patch('pipeline.transfer_process', side_effect=AssertionError('Completed file transferred again')):
             self.assertEqual(download.download(self.data, ['First'], self.root, retries=0), 0)
 
     def test_external_original_survives_a_newer_missing_root_event(self):
@@ -123,7 +167,7 @@ class PipelineChecks(unittest.TestCase):
                 (self.root / 'First/video.mp4').write_bytes(b'garbage')
             return code
         with patch.object(download, 'list_course', side_effect=lambda source, course, *args: [self.items[course]]), \
-                patch.object(download.subprocess, 'call', side_effect=transfer), \
+                patch('pipeline.transfer_process', side_effect=transfer), \
                 patch.object(recovery, 'retry_ranges', return_value=None), \
                 patch.object(download.time, 'sleep'):
             self.assertEqual(download.download(self.data, ['First', 'Second'], self.root, retries=1), 1)
@@ -155,7 +199,7 @@ class PipelineChecks(unittest.TestCase):
             return original_rename(path, destination)
         interruption = patch.object(Path, 'rename', rename) if split_move else patch.object(pipeline, 'failure_manifests', side_effect=manifest)
         with patch.object(download, 'list_course', side_effect=lambda source, course, *args: [self.items[course]]), \
-                patch.object(download.subprocess, 'call', side_effect=transfer), interruption:
+                patch('pipeline.transfer_process', side_effect=transfer), interruption:
             with self.assertRaises(KeyboardInterrupt):
                 download.download(self.data, ['First'], self.root, retries=0)
         def ranges(root, event, item, *args, **kwargs):

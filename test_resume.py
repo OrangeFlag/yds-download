@@ -40,7 +40,7 @@ class ResumeChecks(unittest.TestCase):
         for target, kwargs in (
                 ('download.files', dict(return_value=[self.item])),
                 ('download.time.sleep', {}),
-                ('download.subprocess.call', dict(side_effect=AssertionError('aria2 restarted an archived file')))):
+                ('pipeline.transfer_process', dict(side_effect=AssertionError('aria2 restarted an archived file')))):
             context = patch(target, **kwargs)
             context.start()
             self.addCleanup(context.stop)
@@ -225,7 +225,7 @@ class ResumeChecks(unittest.TestCase):
         tuning = dict(download_concurrency=1, connections=2, split=3, disk_cache_mib=128,
                       bandwidth_limit=1048576, auto_save_interval=15, timeout=45,
                       auto_concurrency=True, auto_concurrency_a=1.0, auto_concurrency_b=2.0)
-        with patch.object(download.subprocess, 'call', side_effect=transfer):
+        with patch('pipeline.transfer_process', side_effect=transfer):
             self.assertEqual(self.run_download(tuning=tuning), 0)
         for flag in ('--max-concurrent-downloads=1', '--max-connection-per-server=2',
                      '--split=3', '--disk-cache=128M', '--max-overall-download-limit=1048576',

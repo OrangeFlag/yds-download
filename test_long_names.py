@@ -60,7 +60,7 @@ class LongNameChecks(unittest.TestCase):
             (folder / name).write_bytes(self.content)
             return 0
         with patch.object(download, 'list_course', return_value=[self.item]), \
-                patch.object(download.subprocess, 'call', side_effect=transfer):
+                patch('pipeline.transfer_process', side_effect=transfer):
             self.assertEqual(download.download(data, ['Course'], self.root, retries=0), 0)
         state = self.root / '.download'
         event = download.read_events(state / 'events.jsonl')[-1]

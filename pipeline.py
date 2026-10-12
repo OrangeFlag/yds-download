@@ -7,6 +7,7 @@ import json
 from local_paths import local_path
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 from threading import Event
 import time
@@ -18,6 +19,24 @@ from settings import resolve
 
 def now():
     return datetime.now().astimezone().isoformat()
+
+
+def transfer_process(command, *, env, on_tick):
+    process = subprocess.Popen(command, env=env)
+    try:
+        while True:
+            try:
+                return process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                on_tick()
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 def failure_manifests(root, event):
@@ -44,6 +63,8 @@ class Background:
         self.download_active = Event()
         self.wake = Event()
         self.retry = []
+        self.transferring = None
+        self.on_tick = self.poll
         self.ledger_path = self.state / 'transfer-state.json'
         self.ledger = json.loads(self.ledger_path.read_text()) if self.ledger_path.exists() else {}
 
@@ -220,10 +241,12 @@ class Background:
                    f"--summary-interval={t['summary_interval']}", '--enable-color=false', '--console-log-level=warn',
                    '--log=' + str(self.state / 'aria2.log'), '--log-level=notice']
         self.download_active.set()
+        self.transferring = course
         try:
-            code = d.subprocess.call(command, env=d.ENV)
+            code = transfer_process(command, env=d.ENV, on_tick=self.on_tick)
         finally:
             self.download_active.clear()
+            self.transferring = None
         if code == 9:
             raise RuntimeError('aria2 reports insufficient disk space')
         if code in (130, -2) or self.stopping.is_set():
@@ -303,7 +326,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             proofs = {row['path']: row for row in d.read_events(state / 'events.jsonl')}
             for course, (index, entries) in list(active.items()):
                 jobs = [json.loads(path.read_text()) for path in background.futures if json.loads(path.read_text())['course'] == course]
-                waiting = bool(jobs or any(name == course for _, name, _ in background.retry))
+                waiting = bool(background.transferring == course or jobs or any(name == course for _, name, _ in background.retry))
                 valid = 0
                 for item in entries:
                     for proof in (proofs.get(item['path'], {}), events.get(item['path'], {})):
@@ -337,6 +360,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             if not summary_path.exists() or json.loads(summary_path.read_text()) != summary:
                 d.write_json(summary_path, summary)
 
+        background.on_tick = finalize
         try:
             for index, course in enumerate(courses, 1):
                 background.retry_ready()
