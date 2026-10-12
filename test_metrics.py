@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 import tempfile
-from threading import Event
+from threading import Event, Thread
 import unittest
 from unittest.mock import patch
 
@@ -10,6 +10,73 @@ from metrics import Metrics, AriaMetrics
 
 
 class MetricsChecks(unittest.TestCase):
+    def test_slow_latest_metrics_write_does_not_block_download_state_writes(self):
+        from download import write_json
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            m = Metrics(root/'metrics.jsonl', 'test', start=False)
+            entered, release, saved = Event(), Event(), Event()
+            original = Path.write_text
+            def write(path, *args, **kwargs):
+                if path.name == 'metrics-latest.json.tmp':
+                    entered.set()
+                    release.wait(2)
+                return original(path, *args, **kwargs)
+            def checkpoint():
+                write_json(root/'task.json', {'state': 'done'})
+                saved.set()
+            with patch.object(Path, 'write_text', write):
+                snapshot = Thread(target=m.snapshot)
+                snapshot.start()
+                self.assertTrue(entered.wait(2))
+                worker = Thread(target=checkpoint)
+                worker.start()
+                try:
+                    self.assertTrue(saved.wait(.2), 'Metrics I/O blocked download state writes')
+                finally:
+                    release.set()
+                    snapshot.join(2)
+                    worker.join(2)
+            self.assertEqual(json.loads((root/'task.json').read_text()), {'state': 'done'})
+            m.close()
+
+    def test_slow_snapshot_write_does_not_block_counters_or_share_mutable_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            m = Metrics(Path(directory)/'metrics.jsonl', 'test', start=False)
+            entered, release, added = Event(), Event(), Event()
+            rows = []
+            original = Path.write_text
+            def write(path, data, *args, **kwargs):
+                if path.name == 'metrics-latest.json.tmp':
+                    entered.set()
+                    release.wait(2)
+                    rows.append(json.loads(data))
+                return original(path, data, *args, **kwargs)
+            def update():
+                m.add(range_requests=1)
+                m.gauge('archives', {'finished': 1})
+                m.range_request(dict(saved_bytes=0, error='HTTP 500', seconds=1,
+                                     request_seconds=1, save_seconds=0, first_byte_seconds=None))
+                added.set()
+            with patch.object(Path, 'write_text', write):
+                snapshot = Thread(target=m.snapshot)
+                snapshot.start()
+                self.assertTrue(entered.wait(2))
+                worker = Thread(target=update)
+                worker.start()
+                try:
+                    self.assertTrue(added.wait(.2), 'Metrics filesystem I/O blocked task updates')
+                finally:
+                    release.set()
+                    snapshot.join(2)
+                    worker.join(2)
+            self.assertNotIn('archives', rows[0]['gauges'])
+            self.assertNotIn('range', rows[0]['errors'])
+            m.snapshot()
+            latest = json.loads(m.path.with_name('metrics-latest.json').read_text())
+            self.assertEqual(latest['interval_counters']['range_requests'], 2)
+            m.close()
+
     def test_range_pass_counts_bytes_errors_and_wait_separately(self):
         with tempfile.TemporaryDirectory() as directory:
             m = Metrics(Path(directory)/'metrics.jsonl', 'test', interval=60, start=False)

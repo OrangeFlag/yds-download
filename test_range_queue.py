@@ -193,6 +193,7 @@ class SharedRangeChecks(unittest.TestCase):
                 local.write_bytes(b'lecture')
                 d.record(state, item, 'Course', 3, 'valid', 'SHA-256 verified')
                 event['range_recovered_complete'] = True
+                event['recovered_stat'] = q.Background.stat(local)
             finish = q.finish_courses
             def finalize(*args):
                 try:
@@ -289,6 +290,7 @@ class SharedRangeChecks(unittest.TestCase):
                 local.write_bytes(content)
                 d.record(state, item, 'Course', 3, 'valid', 'SHA-256 verified')
                 event['range_recovered_complete'] = True
+                event['recovered_stat'] = q.Background.stat(local)
             finish = q.finish_courses
             def finalize(*args):
                 finish(*args)

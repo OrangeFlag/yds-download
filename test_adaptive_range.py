@@ -1,7 +1,8 @@
 """Adaptive salvage must find distant islands without claiming unprobed holes."""
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from threading import Event
 import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -40,7 +41,9 @@ class AdaptiveRangeTest(unittest.TestCase):
     def test_request_measurements_distinguish_wait_network_and_save(self):
         def serve(request, timeout):
             start, end = map(int, request.get_header('Range')[6:].split('-'))
-            return Response(start, end + 1, len(self.content), self.content[start:end + 1])
+            response = Response(start, end + 1, len(self.content), self.content[start:end + 1])
+            response.headers['Content-Length'] = f' {end - start + 1} '
+            return response
         self.run_ranges(serve)
         attempt = self.event['range_attempts'][0]
         self.assertGreaterEqual(attempt['seconds'], 0)
@@ -49,6 +52,19 @@ class AdaptiveRangeTest(unittest.TestCase):
             self.assertGreaterEqual(row['seconds'], row['request_seconds'])
             self.assertGreaterEqual(row['request_seconds'], row['first_byte_seconds'])
             self.assertGreaterEqual(row['first_byte_seconds'], 0)
+
+    def test_malformed_content_length_does_not_confirm_range_bytes(self):
+        for content_length in ('16385', '16383', 'invalid', '-1'):
+            with self.subTest(content_length=content_length):
+                def serve(request, timeout):
+                    start, last = map(int, request.get_header('Range')[6:].split('-'))
+                    response = Response(start, last + 1, len(self.content), self.content[start:last + 1])
+                    response.headers['Content-Length'] = content_length
+                    return response
+                with redirect_stdout(io.StringIO()):
+                    ranges = self.run_ranges(serve)
+                self.assertEqual(ranges, [])
+                self.assertFalse(self.body.exists())
 
     def test_shared_budget_stop_retains_other_completed_response(self):
         stopping = Event()

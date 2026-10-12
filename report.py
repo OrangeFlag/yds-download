@@ -51,10 +51,14 @@ def _update_report(destination, repo, mark, git_push=False, message=None):
         identity = expected.get(normalized(row['path']))
         return identity is None or (identity['size'], identity['sha256']) == (row['size'], row['sha256'])
     external = {}
+    known_external = {}
     registry = state / 'local-copies.json'
     if registry.exists():
         for copy in json.loads(registry.read_text(encoding='utf-8')):
-            if copy['source'].rstrip('/') != source or copy['status'] != 'valid' or not same_identity(copy):
+            if copy['source'].rstrip('/') != source:
+                continue
+            known_external[normalized(copy['path'])] = dict(copy, status='missing')
+            if copy['status'] != 'valid' or not same_identity(copy):
                 continue
             local = Path(copy['local'])
             if local.exists():
@@ -62,14 +66,14 @@ def _update_report(destination, repo, mark, git_push=False, message=None):
                 if stat.st_size == copy['size'] and stat.st_mtime_ns == copy['mtime_ns'] and not Path(str(local) + '.aria2').exists():
                     external[normalized(copy['path'])] = copy
     partial = {}
-    known_partial = set()
+    known_partial = {}
     registry = state / 'partial-copies.json'
     if registry.exists():
         for copy in json.loads(registry.read_text()):
             if copy['source'].rstrip('/') != source:
                 continue
             key = normalized(copy['path'])
-            known_partial.add(key)
+            known_partial[key] = copy
             local = (destination / copy['recovered_path']).resolve()
             if not local.is_relative_to(destination.resolve()):
                 raise ValueError('Unsafe partial copy path')
@@ -100,7 +104,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None):
         if not source_match or not path_match or source_match[1].rstrip('/') != source:
             continue
         prefix = '/' + path_match[1].strip('/') + '/'
-        if not any(key.startswith(normalized(prefix)) for key in events.keys() | external.keys() | known_partial):
+        if not any(key.startswith(normalized(prefix)) for key in events.keys() | known_external.keys() | known_partial.keys()):
             continue
         rows = original.splitlines(keepends=True)
         results = []
@@ -114,7 +118,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None):
             key = normalized(prefix + name)
             local_copy = external.get(key)
             partial_copy = partial.get(key)
-            event = local_copy or events.get(key) or partial_copy
+            event = local_copy or events.get(key) or partial_copy or known_external.get(key) or known_partial.get(key)
             status = 'unknown'
             if event:
                 status = event['status']

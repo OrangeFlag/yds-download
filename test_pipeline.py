@@ -48,6 +48,48 @@ class PipelineChecks(unittest.TestCase):
                 patch('pipeline.transfer_process', side_effect=self.transfer):
             return download.download(self.data, ['First', 'Second'], self.root, retries=0, **kwargs)
 
+    def test_transfer_batches_ledger_before_transfer_and_sha(self):
+        state = self.root / '.download'
+        state.mkdir()
+        background = pipeline.Background(self.root, self.data['source'], 0, pipeline.resolve())
+        self.addCleanup(background.close)
+        items = [dict(self.items['First'], path=f'/First/file{i}.mp4') for i in range(20)]
+        original = download.write_json
+        writes = []
+        def write(path, data):
+            if path == background.ledger_path:
+                writes.append(dict(data))
+            original(path, data)
+        def expect_phase(phase):
+            saved = json.loads(background.ledger_path.read_text())
+            self.assertEqual(set(saved), {item['path'] for item in items})
+            self.assertEqual({row['phase'] for row in saved.values()}, {phase})
+        def transfer(*args, **kwargs):
+            expect_phase('downloading')
+            return 0
+        def submit(*args, **kwargs):
+            expect_phase('verifying')
+        with patch.object(download, 'write_json', side_effect=write), \
+                patch.object(pipeline, 'transfer_process', side_effect=transfer), \
+                patch.object(background, 'submit', side_effect=submit):
+            background.transfer(items, 'First')
+        self.assertEqual(len(writes), 2)
+        background.checkpoint(items[0], 'First', 1, 'finished')
+        self.assertEqual(json.loads(background.ledger_path.read_text())[items[0]['path']]['phase'], 'finished')
+
+    def test_deep_preserves_deferred_range_handoff(self):
+        self.items['First']['size'] = 20
+        with patch.object(recovery, 'retry_ranges', side_effect=AssertionError('Unexpected Range')):
+            self.assertEqual(self.run_download(defer_range=True), 1)
+        state = self.root / '.download'
+        before = json.loads((state / 'summary.json').read_text())
+        with patch.object(download, 'list_course', side_effect=lambda source, course, *args: [self.items[course]]):
+            self.assertEqual(download.download(self.data, ['First', 'Second'], self.root, retries=0, deep=True), 1)
+        after = json.loads((state / 'summary.json').read_text())
+        self.assertTrue(after['downloads_complete'])
+        self.assertEqual(after['pending_courses'], before['pending_courses'])
+        self.assertFalse(after['complete'])
+
     def test_sha_does_not_block_next_course(self):
         original = download.inspect
         def inspect(root, item, course, *args, **kwargs):
@@ -304,6 +346,91 @@ class PipelineChecks(unittest.TestCase):
 
     def test_range_enospc_remains_pending_for_restart(self):
         self.local_range_failure(OSError(28, 'Insufficient disk space'))
+
+    def completed_range(self):
+        from settings import resolve
+        state = self.root / '.download'
+        state.mkdir()
+        download.write_json(state / 'source.json', {'source': self.data['source']})
+        item = self.items['First']
+        event = dict(item, course='First', attempt=1, time='2026-01-01',
+                     corrupted_path='corrupted/old/First/video.mp4')
+        body = self.root / event['corrupted_path']
+        body.parent.mkdir(parents=True)
+        body.write_bytes(self.content)
+        download.write_json(Path(str(body) + '.ranges.json'),
+                            dict(size=item['size'], sha256=item['sha256'], ranges=[[0, item['size']]]))
+        background = pipeline.Background(self.root, self.data['source'], 0, resolve())
+        self.addCleanup(background.close)
+        background.submit('range', item, 'First', 1, event)
+        path, future = next(iter(background.futures.items()))
+        future.result(timeout=3)
+        return background, path, event
+
+    def test_range_done_and_finished_ledger_restore_removed_copy_without_http(self):
+        background, path, event = self.completed_range()
+        local = self.root / 'First/video.mp4'
+        background.close()
+        for state in ('done', 'applied'):
+            with self.subTest(state=state):
+                local.unlink(missing_ok=True)
+                job = json.loads(path.read_text())
+                job['state'] = state
+                download.write_json(path, job)
+                from settings import resolve
+                restarted = pipeline.Background(self.root, self.data['source'], 0, resolve())
+                try:
+                    with patch.object(download.OPENER, 'open', side_effect=AssertionError('Confirmed bytes were requested again')):
+                        restarted.submit('range', self.items['First'], 'First', 1, event)
+                        next(iter(restarted.futures.values())).result(timeout=3)
+                        restarted.poll()
+                    self.assertTrue(local.exists())
+                    self.assertEqual(local.read_bytes(), self.content)
+                finally:
+                    restarted.close()
+
+    def test_range_full_result_changed_before_poll_is_revalidated(self):
+        background, path, event = self.completed_range()
+        local = self.root / 'First/video.mp4'
+        local.write_bytes(b'changed')
+        background.poll()
+        if background.futures:
+            next(iter(background.futures.values())).result(timeout=3)
+            background.poll()
+        result = json.loads(path.read_text())['result']['event']
+        self.assertFalse(result.get('range_recovered_complete'))
+        self.assertEqual(local.read_bytes(), b'changed')
+        self.assertTrue(json.loads((self.root / 'corrupted/failed.json').read_text()))
+
+    def test_range_submit_prefers_better_archive_to_done_task_and_finished_ledger(self):
+        from settings import resolve
+        background, path, event = self.completed_range()
+        background.close()
+        (self.root / 'First/video.mp4').unlink()
+        old = self.root / event['corrupted_path']
+        old.write_bytes(self.content[:2])
+        download.write_json(Path(str(old) + '.ranges.json'),
+                            dict(size=7, sha256=event['sha256'], ranges=[[0, 2]]))
+        better = dict(event, corrupted_path='corrupted/new/First/video.mp4')
+        body = self.root / better['corrupted_path']
+        body.parent.mkdir(parents=True)
+        body.write_bytes(self.content[:5])
+        download.write_json(Path(str(body) + '.ranges.json'),
+                            dict(size=7, sha256=event['sha256'], ranges=[[0, 5]]))
+        old_job = json.loads(path.read_text())
+        for state in ('done', 'applied'):
+            with self.subTest(state=state):
+                old_job['state'] = state
+                download.write_json(path, old_job)
+                restarted = pipeline.Background(self.root, self.data['source'], 0, resolve())
+                try:
+                    with patch.object(recovery, 'finish_recovery') as recover:
+                        restarted.submit('range', self.items['First'], 'First', 1, dict(better))
+                        next(iter(restarted.futures.values())).result(timeout=3)
+                        restarted.poll()
+                    self.assertEqual(recover.call_args.args[1]['corrupted_path'], better['corrupted_path'])
+                finally:
+                    restarted.close()
 
     def local_range_failure(self, error):
         self.items['First']['size'] = 20

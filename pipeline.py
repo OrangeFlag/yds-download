@@ -81,13 +81,14 @@ class Background:
         self.aria_metrics = AriaMetrics(self.state/'aria2.log',self.metrics)
         self.metrics.sample = self.aria_metrics.sample
 
-    def checkpoint(self, item, course, attempt, phase, event=None):
+    def checkpoint(self, item, course, attempt, phase, event=None, persist=True):
         row = dict(source=self.source, size=item['size'], sha256=item['sha256'],
                    course=course, attempt=attempt, phase=phase, time=now())
         if event is not None:
             row['event'] = event
         self.ledger[item['path']] = row
-        d.write_json(self.ledger_path, self.ledger)
+        if persist:
+            d.write_json(self.ledger_path, self.ledger)
 
     def continuation(self, item):
         row = self.ledger.get(item['path'], {})
@@ -109,16 +110,18 @@ class Background:
                 # Reapply a result saved just before interruption, but never trust changed bytes.
                 local = d.target(self.root, item, course)
                 result = old.get('result', {})
-                if kind == 'range' or (local.exists() and result.get('stat') == self.stat(local)
-                                       and not Path(str(local) + '.aria2').exists()):
+                if (kind == 'range' and r.prefer_saved_event(self.root, event, result.get('event', {}))
+                        and self.range_result_current(item, result.get('event', {}))
+                        or kind != 'range' and local.exists() and result.get('stat') == self.stat(local)
+                        and not Path(str(local) + '.aria2').exists()):
                     job = old
             elif kind == 'range':
                 ledger = self.state / 'recovery-state.json'
                 saved = json.loads(ledger.read_text()).get(item['path'], {}) if ledger.exists() else {}
                 proof = saved.get('event', {})
-                if (proof.get('size'), proof.get('sha256')) == (item['size'], item['sha256']):
+                if r.prefer_saved_event(self.root, event, proof):
                     job['event'] = proof
-                    if saved.get('state') == 'finished':
+                    if saved.get('state') == 'finished' and self.range_result_current(item, proof):
                         job.update(state='done', result=dict(event=proof))
         d.write_json(path, job)
         self.jobs[path] = job
@@ -133,6 +136,13 @@ class Background:
     def stat(local):
         stat = local.stat()
         return [stat.st_ino, stat.st_size, stat.st_mtime_ns]
+
+    def range_result_current(self, item, event):
+        if not event.get('range_recovered_complete'):
+            return True
+        local = d.target(self.root, item, event['course'])
+        return (local.exists() and event.get('recovered_stat') == self.stat(local)
+                and not Path(str(local) + '.aria2').exists())
 
     def work(self, path, job):
         if job['state'] == 'done':
@@ -153,6 +163,7 @@ class Background:
             result = dict(status=status, detail=detail, stat=before)
         else:
             event = job['event']
+            event.pop('range_recovered_complete', None)
             try:
                 r.finish_recovery(self.root, event, job['item'], self.retries, tuning=self.tuning,
                                   stopping=self.stopping, download_active=self.download_active if self.budget is None else None,
@@ -240,6 +251,11 @@ class Background:
                     self.checkpoint(item, course, attempt, 'finished', event)
             else:
                 event = result['event']
+                if not self.range_result_current(item, event):
+                    del self.futures[path]
+                    self.jobs.pop(path, None)
+                    self.submit('range', item, course, attempt, event, force=True)
+                    continue
                 if not event.get('range_recovered_complete'):
                     with (self.state / 'events.jsonl').open('a') as log:
                         log.write(json.dumps(event, ensure_ascii=False) + '\n')
@@ -270,7 +286,8 @@ class Background:
             local = d.target(self.root, item, course)
             local.parent.mkdir(parents=True, exist_ok=True)
             lines.append(f"{item['file']}\n dir={local.parent}\n out={local.name}\n")
-            self.checkpoint(item, course, previous_attempt + 1, 'downloading')
+            self.checkpoint(item, course, previous_attempt + 1, 'downloading', persist=False)
+        d.write_json(self.ledger_path, self.ledger)
         (self.state / 'queue.txt').write_text(''.join(lines))
         t = self.tuning
         command = ['aria2c', '--input-file=' + str(self.state / 'queue.txt'), '--continue=true',
@@ -296,7 +313,9 @@ class Background:
             raise InterruptedError('Download interrupted')
         attempt = previous_attempt + 1
         for item in pending:
-            self.checkpoint(item, course, attempt, 'verifying')
+            self.checkpoint(item, course, attempt, 'verifying', persist=False)
+        d.write_json(self.ledger_path, self.ledger)
+        for item in pending:
             self.submit('sha', item, course, attempt, force=True)
         self.poll()
 
@@ -479,6 +498,9 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                         background.submit('sha', item, course, continuation['attempt'])
                     elif continuation.get('phase') == 'range':
                         event = continuation['event']
+                        if (archived and (archived['size'], archived['sha256']) == (item['size'], item['sha256'])
+                                and not r.prefer_saved_event(root, archived, event)):
+                            event = archived
                         if not event.get('corrupted_path'):
                             event = background.archive(item, course, continuation['attempt'], event)
                         else:
@@ -489,7 +511,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                         ledger_path = state / 'recovery-state.json'
                         ledger = json.loads(ledger_path.read_text()).get(item['path'], {}) if ledger_path.exists() else {}
                         old = ledger.get('event', {})
-                        same = (old.get('size'), old.get('sha256')) == (item['size'], item['sha256'])
+                        same = r.prefer_saved_event(root, archived, old)
                         if same:
                             archived = old
                         if not retry_check and (same and ledger.get('state') == 'finished' or not ledger and archived.get('range_attempts')):

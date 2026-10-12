@@ -1,5 +1,6 @@
 """Minute telemetry from task results and resume metadata, without reading bodies."""
 from collections import Counter, deque
+from copy import deepcopy
 from datetime import datetime
 import json
 import os
@@ -24,7 +25,7 @@ class Metrics:
         self.path, self.role, self.interval = Path(path), role, interval
         self.settings = settings or {}
         self.run_id = uuid.uuid4().hex
-        self.lock, self.stop = RLock(), Event()
+        self.lock, self.snapshot_lock, self.stop = RLock(), RLock(), Event()
         self.counters, self.previous = Counter(), Counter()
         self.errors, self.gauges, self.tasks = {}, {}, {}
         self.first_bytes = deque(maxlen=1024)
@@ -124,35 +125,38 @@ class Metrics:
 
     def snapshot(self, reason='periodic'):
         try:
-            with self.lock:
+            with self.snapshot_lock:
                 self.sample()
                 now = time.monotonic(); elapsed = max(.001,now-self.previous_time)
                 host = self.host()
                 rates = {key:(value-self.host_previous[key])/elapsed for key,value in host.items()
                          if key in self.host_previous and value >= self.host_previous[key]}
-                queue = Counter(); oldest = {}
-                for kind, state, queued in self.tasks.values():
-                    queue[kind+':'+state] += 1
-                    if state == 'pending':
-                        try:
-                            age = max(0,time.time()-datetime.fromisoformat(queued).timestamp())
-                            oldest[kind] = max(oldest.get(kind,0),age)
-                        except (ValueError, TypeError):
-                            pass
-                first = sorted(self.first_bytes)
-                row = dict(time=datetime.now().astimezone().isoformat(), role=self.role, reason=reason, pid=os.getpid(),
-                           run_id=self.run_id, revision=REVISION, settings=self.settings,
-                           seconds=elapsed, counters=dict(self.counters),
-                           interval_counters={k:v-self.previous.get(k,0) for k,v in self.counters.items()},
-                           errors=self.errors, gauges=self.gauges, tasks=queue, oldest_pending_seconds=oldest,
-                           first_byte_p95_last_1024=first[min(len(first)-1,int(len(first)*.95))] if first else None,
-                           host_rates=rates)
+                with self.lock:
+                    queue = Counter(); oldest = {}
+                    for kind, state, queued in self.tasks.values():
+                        queue[kind+':'+state] += 1
+                        if state == 'pending':
+                            try:
+                                age = max(0,time.time()-datetime.fromisoformat(queued).timestamp())
+                                oldest[kind] = max(oldest.get(kind,0),age)
+                            except (ValueError, TypeError):
+                                pass
+                    first = sorted(self.first_bytes)
+                    row = dict(time=datetime.now().astimezone().isoformat(), role=self.role, reason=reason, pid=os.getpid(),
+                               run_id=self.run_id, revision=REVISION, settings=self.settings,
+                               seconds=elapsed, counters=dict(self.counters),
+                               interval_counters={k:v-self.previous.get(k,0) for k,v in self.counters.items()},
+                               errors=deepcopy(self.errors), gauges=deepcopy(self.gauges), tasks=queue, oldest_pending_seconds=oldest,
+                               first_byte_p95_last_1024=first[min(len(first)-1,int(len(first)*.95))] if first else None,
+                               host_rates=rates)
                 self.path.parent.mkdir(parents=True,exist_ok=True)
                 with self.path.open('a',encoding='utf-8') as stream:
                     stream.write(json.dumps(row,ensure_ascii=False)+'\n')
-                from download import write_json
-                write_json(self.path.with_name(self.path.stem+'-latest.json'),row)
-                self.previous = self.counters.copy(); self.previous_time = now; self.host_previous = host
+                latest = self.path.with_name(self.path.stem+'-latest.json')
+                temporary = latest.with_name(latest.name+'.tmp')
+                temporary.write_text(json.dumps(row,ensure_ascii=False,indent=2),encoding='utf-8')
+                temporary.replace(latest)
+                self.previous = row['counters']; self.previous_time = now; self.host_previous = host
         except (OSError, ValueError, KeyError, TypeError) as error:
             if not self.warned:
                 print('METRICS WARNING: '+type(error).__name__,flush=True)
@@ -182,9 +186,10 @@ class AriaMetrics:
             self.offset, self.inode = 0, None
         self.buffer = b''
         self.files = {}
+        self.lock = RLock()
 
     def begin(self, files):
-        with self.metrics.lock:
+        with self.lock:
             self.sample()
             self.files = {path:dict(size=size, seen=received, complete=False) for path,(size,received) in files.items()}
 
@@ -197,6 +202,10 @@ class AriaMetrics:
             entry['seen'] = amount
 
     def sample(self):
+        with self.lock:
+            self._sample()
+
+    def _sample(self):
         from progress import received_bytes
         try:
             stat = self.path.stat()
@@ -218,7 +227,8 @@ class AriaMetrics:
                     self.metrics.add(aria_aborted_files=1)
                 codes = re.findall(r'errorCode=(\d+)',line)
                 if codes:
-                    self.metrics.errors.setdefault('aria_error_messages',Counter()).update(codes)
+                    with self.metrics.lock:
+                        self.metrics.errors.setdefault('aria_error_messages',Counter()).update(codes)
             self.metrics.gauge('aria_log_backlog_bytes',max(0,stat.st_size-self.offset))
         except OSError:
             pass

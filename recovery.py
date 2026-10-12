@@ -227,6 +227,12 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                         or response.headers.get('Content-Encoding', 'identity') != 'identity'):
                     return bounds, None, 'Range not honoured'
                 length = int(served[2]) - start + 1
+                content_length = response.headers.get('Content-Length')
+                if content_length is not None:
+                    content_length = content_length.strip()
+                if content_length is not None and (not re.fullmatch(r'[0-9]+', content_length)
+                                                   or int(content_length) != length):
+                    return bounds, None, 'Invalid Range Content-Length'
                 data = bytearray()
                 error = None
                 try:
@@ -455,6 +461,19 @@ def recovery_state(root, event, state):
         write_json(path, ledger)
 
 
+def prefer_saved_event(root, event, proof):
+    if (proof.get('size'), proof.get('sha256')) != (event.get('size'), event.get('sha256')):
+        return False
+    if proof.get('corrupted_path') == event.get('corrupted_path'):
+        return True
+    if proof.get('sha256_mismatch'):
+        return False
+    if event.get('sha256_mismatch'):
+        return True
+    retained = lambda row: progress(body_path(root, row), row['size'], sha256=row['sha256']).get('downloaded_bytes') or 0
+    return retained(proof) >= retained(event)
+
+
 def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None, metrics=None):
     if event.get('sha256_rejected_paths'):
         _redownload = False
@@ -528,6 +547,8 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
                     raise FileExistsError('Refusing to replace an unverified original: ' + str(destination))
             else:
                 copy_saved(path, destination)
+            stat = destination.stat()
+            event['recovered_stat'] = [stat.st_ino, stat.st_size, stat.st_mtime_ns]
             record(root / '.download', item, event['course'], 0, 'valid', 'Recovered all ranges and SHA-256 verified')
             if not background:
                 reconcile_course(root, event['course'])
@@ -586,6 +607,8 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
             continue
         ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
         saved = ledger.get(event['path'])
+        if saved and not prefer_saved_event(root, event, saved['event']):
+            saved = None
         if saved and (saved['event']['size'], saved['event']['sha256']) == (event['size'], event['sha256']):
             event = dict(saved['event'])
             if retry and not force and saved['state'] == 'finished':

@@ -297,6 +297,9 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
             raise ValueError('Use a separate destination for a different public folder/year')
         write_json(identity, dict(source=source, title=data['title']))
         write_json(state / 'settings.json', dict(retries=retries, deep=deep, retry_check=retry_check, tuning=tuning))
+        summary_path = state / 'summary.json'
+        handoff = json.loads(summary_path.read_text()) if deep and not retry_check and summary_path.exists() else {}
+        handoff = {key: handoff[key] for key in ('downloads_complete', 'pending_courses') if key in handoff}
         read_events(state / 'events.jsonl', repair=True)
         recovered = {}
         if retry_check:
@@ -502,12 +505,13 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                 except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
                     print(f'REPORT ERROR: {error}', flush=True)
             print(('COURSE VERIFIED COMPLETE: ' if complete else 'COURSE FINISHED WITH ERRORS: ') + course, flush=True)
-            write_json(state / 'summary.json', dict(verified=verified, failed=len(failed),
+            write_json(state / 'summary.json', dict(handoff, verified=verified, failed=len(failed),
                        last_finished_course=course, complete=False))
         (root / 'corrupted').mkdir(exist_ok=True)
         write_json(root / 'corrupted' / 'failed.json', failed)
         failed_count = sum(history[course]['failed'] for course in courses)
-        write_json(state / 'summary.json', dict(verified=verified, failed=failed_count, complete=not failed_count))
+        write_json(state / 'summary.json', dict(handoff, verified=verified, failed=failed_count,
+                   complete=not failed_count and not handoff.get('pending_courses')))
         print(f'ALL SELECTED COURSES PROCESSED: verified={verified}, failed={failed_count}', flush=True)
         return 1 if failed_count else 0
 

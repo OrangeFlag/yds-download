@@ -83,6 +83,20 @@ class ReviewRegression(unittest.TestCase):
         (self.root / 'corrupted/old/failed.json').unlink()
         self.assertEqual(recovery.recover_corrupted(self.root, self.source, retry=True), [])
 
+    def test_recovery_ledger_does_not_replace_better_distinct_archive(self):
+        self.body.write_bytes(self.content[:1200000])
+        self.journal(self.body, [[0, 1200000]])
+        recovery.recovery_state(self.root, self.event, 'finished')
+        better = dict(self.event, corrupted_path='corrupted/new/Course/video.mp4', time='2026-02-01')
+        body = self.root / better['corrupted_path']
+        body.parent.mkdir(parents=True)
+        body.write_bytes(self.content[:1600000])
+        self.journal(body, [[0, 1600000]])
+        download.write_json(self.root / 'corrupted/new/failed.json', [better])
+        result = recovery.recover_corrupted(self.root, self.source)[0]
+        self.assertEqual(result['corrupted_path'], better['corrupted_path'])
+        self.assertEqual(result['downloaded_bytes'], 1600000)
+
     def test_torn_event_is_repaired_before_append(self):
         path = self.state / 'events.jsonl'
         valid = json.dumps(self.event) + '\n'
