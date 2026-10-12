@@ -1,5 +1,6 @@
 """Update existing backup course cards from verified downloader events."""
 import json
+from local_paths import local_path
 import os
 import subprocess
 from pathlib import Path
@@ -106,7 +107,7 @@ def update_report(destination, repo, mark, git_push=False, message=None):
             status = 'unknown'
             if event:
                 status = event['status']
-                local = Path(local_copy['local']) if local_copy else destination.joinpath(*Path(event['path']).parts[1:])
+                local = Path(local_copy['local']) if local_copy else local_path(destination, event['path'])
                 if status == 'valid' and (not same_identity(event) or not local.exists() or local.stat().st_size != event['size']
                                          or ('mtime_ns' in event and local.stat().st_mtime_ns != event['mtime_ns'])
                                          or Path(str(local) + '.aria2').exists()):

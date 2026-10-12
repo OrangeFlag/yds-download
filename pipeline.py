@@ -4,6 +4,7 @@ from datetime import datetime
 import fcntl
 import hashlib
 import json
+from local_paths import local_path
 from pathlib import Path
 import shutil
 import subprocess
@@ -283,7 +284,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             for row in json.loads(manifest.read_text()):
                 if row['course'] not in courses:
                     continue
-                row = dict(row, corrupted_path=row.get('corrupted_path') or str(manifest.parent.joinpath(*Path(row['path']).parts[1:]).relative_to(root)))
+                row = dict(row, corrupted_path=row.get('corrupted_path') or str(local_path(manifest.parent, row['path']).relative_to(root)))
                 amount = r.progress(r.body_path(root, row), row['size'], sha256=row['sha256']).get('downloaded_bytes') or 0
                 rank = (not row.get('sha256_mismatch', False), amount, row['time'])
                 if row['path'] not in candidates or rank > candidates[row['path']][0]:

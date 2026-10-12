@@ -3,6 +3,7 @@ from datetime import datetime
 import hashlib
 import http.client
 import json
+from local_paths import local_path
 import os
 from pathlib import Path
 import re
@@ -55,7 +56,7 @@ def promote_partial(root, event):
     if (not original_path.is_absolute() or len(original_path.parts) < 2
             or '..' in original_path.parts or original_path.parts[1] in ('.download', 'corrupted')):
         raise ValueError('Unsafe recovered destination')
-    original = root.joinpath(*original_path.parts[1:])
+    original = local_path(root, event['path'])
     if not original.resolve().is_relative_to(root) or not original.parent.resolve().is_relative_to(root):
         raise ValueError('Unsafe recovered destination')
     destination = original.with_name(original.stem + SUFFIX + original.suffix)
@@ -89,7 +90,7 @@ def new_recovery_body(root, event, reason):
     archive = root / 'corrupted' / (datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '-recovery')
     archive.mkdir(parents=True)
     event.setdefault('preserved_archive_paths', []).append(event['corrupted_path'])
-    event['corrupted_path'] = str(archive.joinpath(*Path(event['path']).parts[1:]).relative_to(root))
+    event['corrupted_path'] = str(local_path(archive, event['path']).relative_to(root))
     for key in ('sha256_mismatch', 'recovery_error', 'available_seconds', 'available_time_percent', 'available_intervals', 'time_method', 'range_attempts'):
         event.pop(key, None)
     event['restart_reason'] = reason
@@ -305,7 +306,7 @@ def reconcile_course(root, course):
     verified = 0
     for row in expected:
         proof = proofs.get(row['path'], {})
-        local = Path(proof['local']) if proof.get('local') else root.joinpath(*Path(row['path']).parts[1:])
+        local = Path(proof['local']) if proof.get('local') else local_path(root, row['path'])
         if (proof.get('status') == 'valid' and proof.get('sha256') == row['sha256']
                 and proof.get('size') == row['size'] and local.exists()
                 and local.stat().st_size == row['size']
@@ -373,7 +374,7 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
                     rows = json.loads(manifest.read_text())
                     changed = False
                     for index, row in enumerate(rows):
-                        relative = row.get('corrupted_path') or str(manifest.parent.joinpath(*Path(row['path']).parts[1:]).relative_to(root))
+                        relative = row.get('corrupted_path') or str(local_path(manifest.parent, row['path']).relative_to(root))
                         if relative == event['corrupted_path']:
                             rows[index] = rejected
                             changed = True
@@ -415,7 +416,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
             if courses is not None and row['course'] not in courses:
                 continue
             if 'corrupted_path' not in row:
-                row = dict(row, corrupted_path=str(manifest.parent.joinpath(*Path(row['path']).parts[1:]).relative_to(root)))
+                row = dict(row, corrupted_path=str(local_path(manifest.parent, row['path']).relative_to(root)))
             path = body_path(root, row)
             amount = progress(path, row['size'], sha256=row['sha256']).get('downloaded_bytes') or 0
             previous = candidates.get(row['path'])
@@ -445,7 +446,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                 results.append(checked)
                 reconcile_course(root, event['course'])
                 continue
-        local = Path(known['local']) if known.get('local') else root.joinpath(*Path(event['path']).parts[1:])
+        local = Path(known['local']) if known.get('local') else local_path(root, event['path'])
         complete = (known.get('status') == 'valid' and known.get('sha256') == event['sha256']
                     and known.get('size') == event['size'] and local.exists()
                     and local.stat().st_size == known['size']
@@ -469,7 +470,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
             results.append(event)
             continue
         archived = body_path(root, event)
-        original = root.joinpath(*Path(event['path']).parts[1:])
+        original = local_path(root, event['path'])
         # Finish an archive move interrupted between manifest, body and control writes.
         control = Path(str(original) + '.aria2')
         if retry and (control.exists() or (original.exists() and not archived.exists())):
@@ -514,7 +515,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
         rows = json.loads(manifest.read_text())
         changed = False
         for index, row in enumerate(rows):
-            relative = row.get('corrupted_path') or str(manifest.parent.joinpath(*Path(row['path']).parts[1:]).relative_to(root))
+            relative = row.get('corrupted_path') or str(local_path(manifest.parent, row['path']).relative_to(root))
             replacement = by_path.get(relative)
             if replacement:
                 rows[index] = replacement

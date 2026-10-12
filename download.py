@@ -5,6 +5,7 @@ from datetime import datetime
 import fcntl
 import hashlib
 import json
+from local_paths import local_path
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -122,7 +123,7 @@ def target(root, item, course):
             or len(path.parts) <= len(course_path.parts)
             or path.parts[:len(course_path.parts)] != course_path.parts):
         raise ValueError('Unexpected source path')
-    destination = root.joinpath(*path.parts[1:])
+    destination = local_path(root, item['path'])
     if not destination.resolve().is_relative_to(root) or any(ord(c) < 32 for c in str(destination)):
         raise ValueError('Unsafe local path')
     if destination.relative_to(root).parts[0] in ('.download', 'corrupted'):
@@ -187,7 +188,7 @@ def record(state, item, course, attempt, status, detail, local=None):
                  size=item['size'], sha256=item['sha256'])
     if local is not None:
         event['local'] = str(local)
-    local = local if local is not None else state.parent.joinpath(*PurePosixPath(item['path']).parts[1:])
+    local = local if local is not None else local_path(state.parent, item['path'])
     from progress import progress
     event.update(progress(local, item['size'], valid=status == 'valid', sha256=item['sha256']))
     if status == 'valid':
@@ -204,7 +205,7 @@ def inspect_copies(root, item, course, cached, source):
     copies = json.loads(registry.read_text()) if registry.exists() else []
     matching = [copy for copy in copies if copy['path'] == item['path']
                 and copy['source'].rstrip('/') == source.rstrip('/')]
-    locations = [root.joinpath(*PurePosixPath(item['path']).parts[1:])]
+    locations = [local_path(root, item['path'])]
     if cached.get('local'):
         locations.append(Path(cached['local']))
     locations.extend(Path(copy['local']) for copy in matching)
@@ -230,8 +231,11 @@ def bind_resume(root, entries, previous, events, deep_only):
     state = root / '.download'
     path = state / 'resume-identities.json'
     identities = json.loads(path.read_text()) if path.exists() else {}
+    destinations = [local_path(root, item['path']) for item in entries]
+    if len(destinations) != len(set(destinations)):
+        raise ValueError('Source names collide after local shortening')
     for item in entries:
-        local = root.joinpath(*PurePosixPath(item['path']).parts[1:])
+        local = local_path(root, item['path'])
         control = Path(str(local) + '.aria2')
         old = identities.get(item['path'], previous.get(item['path'], events.get(item['path'], {})))
         changed = old and (old.get('size'), old.get('sha256')) != (item['size'], item['sha256'])
@@ -244,7 +248,7 @@ def bind_resume(root, entries, previous, events, deep_only):
             archive.mkdir(parents=True)
             write_json(archive / 'source-change.json', dict(path=item['path'], previous=old,
                        current={key: item[key] for key in ('size', 'sha256')}))
-            retained = archive.joinpath(*PurePosixPath(item['path']).parts[1:])
+            retained = local_path(archive, item['path'])
             retained.parent.mkdir(parents=True, exist_ok=True)
             for suffix in ('', '.aria2', '.ranges.json'):
                 existing = Path(str(local) + suffix)

@@ -1,5 +1,6 @@
 """Read saved HTTP aria2 progress and inventory retained corrupted files."""
 import json
+from local_paths import local_path
 from pathlib import Path
 import struct
 
@@ -125,7 +126,7 @@ def corrupted_report(root):
         changed = False
         for event in events:
             relative = event.get('corrupted_path')
-            path = root / relative if relative else manifest.parent.joinpath(*Path(event['path']).parts[1:])
+            path = root / relative if relative else local_path(manifest.parent, event['path'])
             if not path.resolve().is_relative_to(folder):
                 raise ValueError('Unsafe corrupted path')
             if path.exists() or 'downloaded_bytes' not in event:
