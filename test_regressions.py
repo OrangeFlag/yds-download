@@ -127,6 +127,32 @@ class ReviewRegression(unittest.TestCase):
         self.assertEqual((self.root / 'Course/video.mp4').read_bytes(), self.content)
         self.assertNotEqual(self.event['corrupted_path'], str(old_body.relative_to(self.root)))
 
+    def test_full_recovery_preserves_unverified_existing_original(self):
+        self.body.write_bytes(self.content)
+        self.journal(self.body, [[0, self.item['size']]])
+        original = self.root / 'Course/video.mp4'
+        original.parent.mkdir()
+        original.write_bytes(b'important local data')
+        with patch.object(recovery, 'retry_ranges', return_value=None):
+            with self.assertRaisesRegex(FileExistsError, 'unverified original'):
+                recovery.finish_recovery(self.root, self.event, self.item, retries=0)
+        self.assertEqual(original.read_bytes(), b'important local data')
+        self.assertEqual(self.body.read_bytes(), self.content)
+
+    def test_full_recovery_reuses_verified_existing_original(self):
+        self.body.write_bytes(self.content)
+        self.journal(self.body, [[0, self.item['size']]])
+        original = self.root / 'Course/video.mp4'
+        original.parent.mkdir()
+        original.write_bytes(self.content)
+        before = original.stat().st_mtime_ns
+        with patch.object(recovery, 'retry_ranges', return_value=None), \
+                patch.object(recovery, 'copy_saved', side_effect=AssertionError('Unnecessary overwrite')):
+            self.assertTrue(recovery.finish_recovery(self.root, self.event, self.item, retries=0))
+        self.assertEqual(original.stat().st_mtime_ns, before)
+        self.assertEqual(original.read_bytes(), self.content)
+        self.assertEqual(download.read_events(self.state / 'events.jsonl')[-1]['status'], 'valid')
+
     def test_source_links_refreshed(self):
         fresh = dict(self.item, file='https://example.invalid/fresh')
         urls = []
