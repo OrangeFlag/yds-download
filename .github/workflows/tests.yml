@@ -12,5 +12,11 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install aria2
         run: sudo apt-get update && sudo apt-get install -y aria2
+      - name: Validate executable entrypoints
+        run: |
+          test -x download.py
+          test -x start.sh
+          bash -n start.sh
+          python3 download.py --help > /dev/null
       - name: Run tests
         run: python3 -m unittest discover -v

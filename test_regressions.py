@@ -74,6 +74,10 @@ class ReviewRegression(unittest.TestCase):
         download.write_json(Path(str(body) + '.ranges.json'),
                             dict(size=self.item['size'], sha256=self.item['sha256'], ranges=ranges))
 
+    def test_merge_ranges_uses_exact_byte_boundaries(self):
+        self.assertEqual(progress.merge_ranges([(0, 3), (3, 4), (6, 9), (8, 10)]),
+                         [[0, 4], [6, 10]])
+
     def test_new_archive_without_events(self):
         (self.state / 'events.jsonl').unlink()
         (self.root / 'corrupted/old/failed.json').unlink()

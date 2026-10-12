@@ -54,7 +54,7 @@ def merge_ranges(ranges):
     for start, end in sorted(ranges):
         if end <= start:
             continue
-        if merged and start <= merged[-1][1] + 1.001e-6:
+        if merged and start <= merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], end)
         else:
             merged.append([start, end])
