@@ -182,10 +182,16 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     foreground_limit = Lock()
     next_request = 0.0
     def fetch(bounds):
+        started = time.monotonic()
+        timing = dict(request_seconds=0.0, first_byte_seconds=None)
+        result = fetch_limited(bounds, timing)
+        timing['seconds'] = time.monotonic() - started
+        return (*result, timing)
+    def fetch_limited(bounds, timing):
         if request_budget is not None:
             try:
                 with request_budget.request(stopping):
-                    return fetch_range(bounds)
+                    return fetch_range(bounds, timing)
             except InterruptedError:
                 return bounds, None, 'Interrupted'
         if download_active is not None and download_active.is_set():
@@ -193,11 +199,11 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                 if stopping.is_set():
                     return bounds, None, 'Interrupted'
             try:
-                return fetch_range(bounds)
+                return fetch_range(bounds, timing)
             finally:
                 foreground_limit.release()
-        return fetch_range(bounds)
-    def fetch_range(bounds):
+        return fetch_range(bounds, timing)
+    def fetch_range(bounds, timing):
         nonlocal next_request
         start, end = bounds
         with rate_lock:
@@ -212,6 +218,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
         if stopping.is_set():
             return bounds, None, 'Interrupted'
         request = urllib.request.Request(item['file'], headers={'Range': f'bytes={start}-{end - 1}', 'Accept-Encoding': 'identity'})
+        request_started = time.monotonic()
         try:
             with OPENER.open(request, timeout=tuning['range_timeout']) as response:
                 served = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', response.headers.get('Content-Range', ''))
@@ -227,8 +234,12 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                         chunk = response.read1(min(64 * 1024, length - len(data)))
                         if not chunk:
                             break
+                        if timing['first_byte_seconds'] is None:
+                            timing['first_byte_seconds'] = time.monotonic() - request_started
                         data.extend(chunk)
                 except http.client.IncompleteRead as failure:
+                    if failure.partial and timing['first_byte_seconds'] is None:
+                        timing['first_byte_seconds'] = time.monotonic() - request_started
                     data.extend(failure.partial)
                     error = 'Incomplete response'
                 except (OSError, http.client.HTTPException) as failure:
@@ -238,6 +249,8 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                 return bounds, data or None, error or (None if len(data) == length else 'Incomplete response')
         except (OSError, http.client.HTTPException) as error:
             return bounds, None, 'HTTP ' + str(error.code) if hasattr(error, 'code') else type(error).__name__
+        finally:
+            timing['request_seconds'] = time.monotonic() - request_started
     attempts = []
     max_passes = tuning['range_max_passes'] or min(4, 2 * retries) + 2
     source = json.loads((root / '.download/source.json').read_text())['source']
@@ -262,6 +275,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     failed_count = 0
     remaining_span = total
     for attempt in range(1, max_passes + 1):
+        pass_started = time.monotonic()
         if stopping.is_set():
             raise InterruptedError('Range interrupted')
         # Backend block geometry is unpublished; refine failed intervals by observed responses.
@@ -292,7 +306,8 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
         outcomes = []
         def save_result(future):
             nonlocal additional, ranges
-            bounds, data, error = future.result()
+            bounds, data, error, timing = future.result()
+            save_started = time.monotonic()
             if data is not None:
                 saved = [bounds[0], bounds[0] + len(data)]
                 with path.open('r+b' if path.exists() else 'w+b') as stream:
@@ -300,7 +315,8 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                 additional = merge_ranges(additional + [saved])
                 write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor, control_imported=True))
                 ranges = merge_ranges(ranges + [saved])
-            outcomes.append(dict(start=bounds[0], end=bounds[1], saved_bytes=len(data) if data else 0, error=error))
+            outcomes.append(dict(start=bounds[0], end=bounds[1], saved_bytes=len(data) if data else 0, error=error,
+                                 save_seconds=time.monotonic() - save_started, **timing))
         def execute(batch, mode):
             # Persist each completed request before waiting for the rest of the batch.
             workers = tuning['range_workers']
@@ -367,12 +383,15 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
             write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor, control_imported=True))
         else:
             unprobed = execute(missing, 'halving')
-        attempts.append(dict(attempt=attempt, ranges=outcomes, unprobed=unprobed, fine=fine))
+        attempts.append(dict(attempt=attempt, ranges=outcomes, unprobed=unprobed, fine=fine,
+                             seconds=time.monotonic() - pass_started))
         failed_count = sum(row['saved_bytes'] < row['end'] - row['start'] for row in outcomes)
         remaining_span = max((row['end'] - row['start'] - row['saved_bytes'] for row in outcomes), default=0)
         event['range_attempts'] = attempts
         event.update(progress(path, total, sha256=event['sha256']))
-        print(f'RANGE PASS {attempt}/{max_passes}: {event["path"]}; chunk={block}; mode={"adaptive" if fine else "halving"}; saved={sum(row["saved_bytes"] > 0 for row in outcomes)}/{len(outcomes)}; bytes={event["downloaded_percent"]}; unprobed={unprobed}', flush=True)
+        first_bytes = sorted(row['first_byte_seconds'] for row in outcomes if row['first_byte_seconds'] is not None)
+        first_byte_p95 = first_bytes[min(len(first_bytes) - 1, int(len(first_bytes) * .95))] if first_bytes else None
+        print(f'RANGE PASS {attempt}/{max_passes}: {event["path"]}; chunk={block}; mode={"adaptive" if fine else "halving"}; saved={sum(row["saved_bytes"] > 0 for row in outcomes)}/{len(outcomes)}; bytes={event["downloaded_percent"]}; unprobed={unprobed}; seconds={attempts[-1]["seconds"]:.3f}; request_seconds={sum(row["request_seconds"] for row in outcomes):.3f}; io_seconds={sum(row["save_seconds"] for row in outcomes):.3f}; new_bytes={sum(row["saved_bytes"] for row in outcomes)}; first_byte_p95={first_byte_p95}', flush=True)
         if fine:
             break
     return ranges

@@ -37,6 +37,19 @@ class AdaptiveRangeTest(unittest.TestCase):
                 patch.object(download.OPENER, 'open', side_effect=serve):
             return recovery.retry_ranges(self.root, self.event, self.item, 2, self.tuning)
 
+    def test_request_measurements_distinguish_wait_network_and_save(self):
+        def serve(request, timeout):
+            start, end = map(int, request.get_header('Range')[6:].split('-'))
+            return Response(start, end + 1, len(self.content), self.content[start:end + 1])
+        self.run_ranges(serve)
+        attempt = self.event['range_attempts'][0]
+        self.assertGreaterEqual(attempt['seconds'], 0)
+        for row in attempt['ranges']:
+            self.assertGreaterEqual(row['save_seconds'], 0)
+            self.assertGreaterEqual(row['seconds'], row['request_seconds'])
+            self.assertGreaterEqual(row['request_seconds'], row['first_byte_seconds'])
+            self.assertGreaterEqual(row['first_byte_seconds'], 0)
+
     def test_shared_budget_stop_retains_other_completed_response(self):
         stopping = Event()
         reading = Event()
