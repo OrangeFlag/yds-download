@@ -38,6 +38,23 @@ class MetricsChecks(unittest.TestCase):
             self.assertEqual(row['counters']['aria_aborted_files'],1)
             self.assertNotIn('HIDDEN',m.path.read_text());m.close()
 
+    def test_btrfs_virtual_device_uses_mountinfo_backing_disk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            mountinfo=f'1 0 0:114 / {root} rw - btrfs /dev/sda1 rw\n'
+            diskstats='8 0 sda 0 0 2 0 0 0 4 0 0 10 0 0 0 0\n'
+            def resolve(path,*args,**kwargs):
+                return Path('/mock/sda/sda1') if str(path)=='/sys/class/block/sda1' else path
+            def read(path,*args,**kwargs):
+                return mountinfo if str(path)=='/proc/self/mountinfo' else diskstats
+            with patch.object(Path,'resolve',resolve),patch.object(Path,'exists',lambda p:str(p)=='/mock/sda/sda1/partition'), \
+                 patch.object(Path,'read_text',read):
+                m=Metrics(root/'metrics.jsonl','test',start=False)
+                self.assertEqual(m.disk_name,'sda')
+                self.assertEqual(m.host_previous['disk_read_bytes'],1024)
+                self.assertEqual(m.host_previous['disk_busy_ms'],10)
+            m.close()
+
     def test_existing_body_without_resume_proof_does_not_invent_new_traffic(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);log=root/'aria2.log';log.touch()

@@ -30,6 +30,8 @@ class Metrics:
         self.first_bytes = deque(maxlen=1024)
         self.sample = lambda: None
         self.previous_time = time.monotonic()
+        self.disk_name = self.disk_device()
+        self.gauges['disk_device'] = self.disk_name
         self.host_previous = self.host()
         self.warned = self.closed = False
         self.thread = None
@@ -76,6 +78,28 @@ class Metrics:
                 for row in outcomes:
                     self.range_request(row)
 
+    def disk_device(self):
+        try:
+            dev = self.path.parent.stat().st_dev
+            device = (Path('/sys/dev/block')/f'{os.major(dev)}:{os.minor(dev)}').resolve()
+            if not device.exists():
+                # Btrfs st_dev is virtual; mountinfo names its actual backing device.
+                destination = str(self.path.parent.resolve())
+                closest = (0,None)
+                for row in Path('/proc/self/mountinfo').read_text().splitlines():
+                    fields, filesystem = row.split(' - ',1)
+                    mount = re.sub(r'\\([0-7]{3})',lambda m:chr(int(m[1],8)),fields.split()[4])
+                    if destination == mount or destination.startswith(mount.rstrip('/')+'/'):
+                        if len(mount) > closest[0]:
+                            closest = len(mount),filesystem.split()[1]
+                source = closest[1]
+                if not source or not source.startswith('/dev/'):
+                    return None
+                device = (Path('/sys/class/block')/Path(source).resolve().name).resolve()
+            return device.parent.name if (device/'partition').exists() else device.name
+        except (OSError, ValueError, IndexError):
+            return None
+
     def host(self):
         result = {}
         for interface in Path('/sys/class/net').glob('*'):
@@ -86,12 +110,9 @@ class Metrics:
                 except OSError:
                     pass
         try:
-            dev = self.path.parent.stat().st_dev
-            device = (Path('/sys/dev/block')/f'{os.major(dev)}:{os.minor(dev)}').resolve()
-            name = device.parent.name if (device/'partition').exists() else device.name
             for row in Path('/proc/diskstats').read_text().splitlines():
                 fields = row.split()
-                if fields[2] == name:
+                if fields[2] == self.disk_name:
                     result.update(disk_read_bytes=int(fields[5])*512, disk_write_bytes=int(fields[9])*512,
                                   disk_busy_ms=int(fields[12]))
                     break
