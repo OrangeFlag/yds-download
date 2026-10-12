@@ -159,6 +159,15 @@ class ResumeChecks(unittest.TestCase):
                 patch.object(download.OPENER, 'open', side_effect=AssertionError('Ready file downloaded')):
             self.assertEqual(self.run_download(retry_check=True), 0)
 
+    def test_interrupted_child_keeps_archive_resumable(self):
+        queue = self.root / 'queue.json'
+        download.write_json(queue, dict(archives=[dict(title='test', catalog='catalog.json', destination=str(self.root), state='pending')]))
+        with patch('sys.argv', ['semester_queue.py', str(queue)]), patch.object(semester_queue, 'transfer_process', return_value=130):
+            with self.assertRaises(KeyboardInterrupt):
+                semester_queue.main()
+        self.assertEqual(json.loads(queue.read_text())['archives'][0]['state'], 'running')
+        self.assertNotIn('exit_code', json.loads(queue.read_text())['archives'][0])
+
     def test_queue_lock_is_closed_after_success(self):
         queue = self.root / 'queue.json'
         download.write_json(queue, dict(archives=[dict(
@@ -174,7 +183,7 @@ class ResumeChecks(unittest.TestCase):
 
         with patch.object(Path, 'open', track), \
                 patch('sys.argv', ['semester_queue.py', str(queue)]), \
-                patch.object(semester_queue.subprocess, 'call', return_value=0):
+                patch.object(semester_queue, 'transfer_process', return_value=0):
             semester_queue.main()
         self.assertTrue(opened)
         self.assertTrue(all(stream.closed for stream in opened))
@@ -201,7 +210,7 @@ class ResumeChecks(unittest.TestCase):
             download.write_json(queue, dict(archives=[job], deep=deep, retry_check=retry))
             calls = []
             with patch('sys.argv', ['semester_queue.py', str(queue)]), \
-                    patch.object(semester_queue.subprocess, 'call', side_effect=lambda cmd: calls.append(cmd) or 1):
+                    patch.object(semester_queue, 'transfer_process', side_effect=lambda cmd, **kwargs: calls.append(cmd) or 1):
                 semester_queue.main()
             self.assertEqual('--deep' in calls[0], deep)
             self.assertEqual('--retry-check' in calls[0], retry)
@@ -276,7 +285,7 @@ class ResumeChecks(unittest.TestCase):
         download.write_json(queue, dict(archives=[job], tuning=dict(range_workers=2, disk_cache_mib=128, auto_concurrency=True)))
         calls = []
         with patch('sys.argv', ['semester_queue.py', str(queue)]), \
-                patch.object(semester_queue.subprocess, 'call', side_effect=lambda cmd: calls.append(cmd) or 0):
+                patch.object(semester_queue, 'transfer_process', side_effect=lambda cmd, **kwargs: calls.append(cmd) or 0):
             semester_queue.main()
         self.assertIn('--range-workers=1', calls[0])
         self.assertIn('--disk-cache-mib=128', calls[0])

@@ -56,7 +56,7 @@ class SharedRangeChecks(unittest.TestCase):
             jobs = [dict(title=str(i), catalog='catalog.json', destination=str(root / str(i))) for i in range(2)]
             d.write_json(queue, dict(archives=jobs))
             calls = []
-            def transfer(command):
+            def transfer(command, **kwargs):
                 self.assertIn('--defer-range', command)
                 destination = Path(command[command.index('--destination') + 1])
                 state = destination / '.download'
@@ -68,11 +68,11 @@ class SharedRangeChecks(unittest.TestCase):
                     for job in jobs:
                         d.write_json(Path(job['destination']) / '.download/summary.json', dict(downloads_complete=True, pending_courses=[]))
                 return 1
-            with patch('sys.argv', ['semester_queue.py', str(queue), '--defer-range']), patch.object(semester_queue.subprocess, 'call', side_effect=transfer), patch.object(semester_queue.time, 'sleep'):
+            with patch('sys.argv', ['semester_queue.py', str(queue), '--defer-range']), patch.object(semester_queue, 'transfer_process', side_effect=transfer), patch.object(semester_queue.time, 'sleep'):
                 semester_queue.main()
             self.assertEqual(calls, ['0', '1'])
             self.assertTrue(all(job['state'] == 'finished' for job in json.loads(queue.read_text())['archives']))
-            with patch('sys.argv', ['semester_queue.py', str(queue), '--defer-range']), patch.object(semester_queue.subprocess, 'call', side_effect=AssertionError('Completed archive downloaded again')):
+            with patch('sys.argv', ['semester_queue.py', str(queue), '--defer-range']), patch.object(semester_queue, 'transfer_process', side_effect=AssertionError('Completed archive downloaded again')):
                 semester_queue.main()
 
     def test_worker_recovers_four_files_without_ordinary_downloads(self):

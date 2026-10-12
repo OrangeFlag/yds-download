@@ -14,7 +14,7 @@ shift
 [[ -d "$destination" ]]
 mkdir -p -- "$destination/.download"
 exec systemd-run --user --unit=yds-download --collect \
-  --property="WorkingDirectory=$PWD" --property=KillSignal=SIGINT \
+  --property="WorkingDirectory=$PWD" --property=KillSignal=SIGINT --property=SuccessExitStatus=130 \
   --property=TimeoutStopSec=90 \
   --property="StandardOutput=append:$destination/.download/download.log" \
   --property="StandardError=append:$destination/.download/download.log" \

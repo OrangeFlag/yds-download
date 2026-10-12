@@ -88,6 +88,21 @@ class PipelineChecks(unittest.TestCase):
         self.assertTrue(observed.exists(), 'Finished course waited for the entire next transfer')
         self.assertFalse((self.root / 'premature').exists(), 'Active download was finalized early')
 
+    def test_cli_interrupt_is_quiet_and_preserves_exit_code(self):
+        with patch('builtins.print') as message:
+            self.assertEqual(download.cli(Mock(side_effect=KeyboardInterrupt)), 130)
+        message.assert_called_once_with('STOPPED: interrupted; resume state retained', flush=True)
+
+    def test_queue_interrupt_stops_and_reaps_download_process(self):
+        process = Mock()
+        process.wait.side_effect = [KeyboardInterrupt, 130]
+        process.poll.return_value = None
+        with patch.object(subprocess, 'Popen', return_value=process):
+            with self.assertRaises(KeyboardInterrupt):
+                pipeline.transfer_process(['download.py'], env={}, on_tick=lambda: None, stop_timeout=80)
+        process.send_signal.assert_called_once_with(pipeline.signal.SIGINT)
+        self.assertEqual(process.wait.call_args.kwargs, {'timeout': 80})
+
     def test_callback_failure_stops_and_reaps_transfer(self):
         process = Mock()
         process.wait.side_effect = [subprocess.TimeoutExpired('aria2c', 5), 130]

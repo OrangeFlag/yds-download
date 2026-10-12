@@ -592,5 +592,13 @@ def main():
         parser.exit(2, f'Error: {error}\n')
 
 
+def cli(entrypoint):
+    try:
+        return entrypoint()
+    except KeyboardInterrupt:
+        print('STOPPED: interrupted; resume state retained', flush=True)
+        return 130
+
+
 if __name__ == '__main__':
-    raise SystemExit(main())
+    raise SystemExit(cli(main))

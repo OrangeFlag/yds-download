@@ -256,7 +256,7 @@ python3 semester_queue.py /absolute/path/queue.json
 Для фонового запуска используйте отдельный юнит:
 
 ```bash
-systemd-run --user --unit=yds-download-queue --collect   --property=KillSignal=SIGINT --property=TimeoutStopSec=90   --property=StandardOutput=append:/absolute/path/queue.log   --property=StandardError=append:/absolute/path/queue.log   python3 "$PWD/semester_queue.py" /absolute/path/queue.json
+systemd-run --user --unit=yds-download-queue --collect   --property=KillSignal=SIGINT --property=SuccessExitStatus=130 --property=TimeoutStopSec=90   --property=StandardOutput=append:/absolute/path/queue.log   --property=StandardError=append:/absolute/path/queue.log   python3 "$PWD/semester_queue.py" /absolute/path/queue.json
 ```
 
 Наблюдение: `tail -f /absolute/path/queue.log`, `cat /absolute/path/queue.json`. `finished` означает завершение обработки, включая файлы, исчерпавшие попытки; полноту копии смотрите в `.download/summary.json` и статусах курсов. Код загрузчика `1` сохраняется как `exit_code`, очередь продолжает следующий архив; ошибка настройки или нехватка места останавливает очередь с `blocked`. При повторном запуске обработанные архивы пропускаются. Перед редактированием работающей очереди остановите её: `systemctl --user stop yds-download-queue.service`; частичные загрузки сохранятся.

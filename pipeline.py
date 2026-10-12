@@ -21,7 +21,7 @@ def now():
     return datetime.now().astimezone().isoformat()
 
 
-def transfer_process(command, *, env, on_tick):
+def transfer_process(command, *, env, on_tick, stop_timeout=30):
     process = subprocess.Popen(command, env=env)
     try:
         while True:
@@ -33,7 +33,7 @@ def transfer_process(command, *, env, on_tick):
         if process.poll() is None:
             process.send_signal(signal.SIGINT)
             try:
-                process.wait(timeout=30)
+                process.wait(timeout=stop_timeout)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()

@@ -8,7 +8,8 @@ from pathlib import Path
 import subprocess
 import time
 from datetime import datetime
-from download import write_json
+from download import cli, write_json
+from pipeline import transfer_process
 from settings import arguments, resolve
 
 def main():
@@ -65,7 +66,9 @@ def main():
                 command += ['--report-repo', data['report_repo'], '--mark', data['mark']]
             if data.get('git_push'):
                 command += ['--git-push']
-            code = subprocess.call(command)
+            code = transfer_process(command, env=os.environ.copy(), on_tick=lambda: None, stop_timeout=80)
+            if code in (130, -2):
+                raise KeyboardInterrupt
             job.update(exit_code=code, time=datetime.now().astimezone().isoformat())
             if code not in (0, 1):
                 job['state'] = 'blocked'
@@ -95,4 +98,4 @@ def main():
         print('ALL ARCHIVES PROCESSED', flush=True)
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(cli(main))
