@@ -157,6 +157,41 @@ class ResumeChecks(unittest.TestCase):
                 patch.object(download.OPENER, 'open', side_effect=AssertionError('Ready file downloaded')):
             self.assertEqual(self.run_download(retry_check=True), 0)
 
+    def test_queue_lock_is_closed_after_success(self):
+        queue = self.root / 'queue.json'
+        download.write_json(queue, dict(archives=[dict(
+            title='test', catalog='catalog.json', destination=str(self.root), state='pending')]))
+        opened = []
+        original_open = Path.open
+
+        def track(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            if path.name == 'queue.lock':
+                opened.append(stream)
+            return stream
+
+        with patch.object(Path, 'open', track), \
+                patch('sys.argv', ['semester_queue.py', str(queue)]), \
+                patch.object(semester_queue.subprocess, 'call', return_value=0):
+            semester_queue.main()
+        self.assertTrue(opened)
+        self.assertTrue(all(stream.closed for stream in opened))
+
+    def test_deep_download_lock_is_closed_after_success(self):
+        opened = []
+        original_open = Path.open
+
+        def track(path, *args, **kwargs):
+            stream = original_open(path, *args, **kwargs)
+            if path.name == 'download.lock':
+                opened.append(stream)
+            return stream
+
+        with patch.object(Path, 'open', track):
+            self.assertEqual(self.run_download(deep=True), 1)
+        self.assertTrue(opened)
+        self.assertTrue(all(stream.closed for stream in opened))
+
     def test_queue_flags_are_independent_and_deep_preserves_state(self):
         queue = self.root / 'queue.json'
         for deep, retry in ((True, False), (False, True), (True, True)):
