@@ -154,7 +154,7 @@ def expand_probes(ranges, total, outcomes, block, limit, minimum, discoveries=No
     return planned
 
 
-def retry_ranges(root, event, item, retries, tuning=None, stopping=None, download_active=None, request_budget=None):
+def retry_ranges(root, event, item, retries, tuning=None, stopping=None, download_active=None, request_budget=None, metrics=None):
     tuning = resolve(tuning)
     from download import OPENER, write_json, api
     if item['size'] != event['size'] or item['sha256'] != event['sha256']:
@@ -317,6 +317,8 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                 ranges = merge_ranges(ranges + [saved])
             outcomes.append(dict(start=bounds[0], end=bounds[1], saved_bytes=len(data) if data else 0, error=error,
                                  save_seconds=time.monotonic() - save_started, **timing))
+            if metrics is not None:
+                metrics.range_request(outcomes[-1])
         def execute(batch, mode):
             # Persist each completed request before waiting for the rest of the batch.
             workers = tuning['range_workers']
@@ -391,6 +393,8 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
         event.update(progress(path, total, sha256=event['sha256']))
         first_bytes = sorted(row['first_byte_seconds'] for row in outcomes if row['first_byte_seconds'] is not None)
         first_byte_p95 = first_bytes[min(len(first_bytes) - 1, int(len(first_bytes) * .95))] if first_bytes else None
+        if metrics is not None:
+            metrics.range_pass(outcomes,attempts[-1]['seconds'],count_requests=False)
         print(f'RANGE PASS {attempt}/{max_passes}: {event["path"]}; chunk={block}; mode={"adaptive" if fine else "halving"}; saved={sum(row["saved_bytes"] > 0 for row in outcomes)}/{len(outcomes)}; bytes={event["downloaded_percent"]}; unprobed={unprobed}; seconds={attempts[-1]["seconds"]:.3f}; request_seconds={sum(row["request_seconds"] for row in outcomes):.3f}; io_seconds={sum(row["save_seconds"] for row in outcomes):.3f}; new_bytes={sum(row["saved_bytes"] for row in outcomes)}; first_byte_p95={first_byte_p95}', flush=True)
         if fine:
             break
@@ -451,14 +455,14 @@ def recovery_state(root, event, state):
         write_json(path, ledger)
 
 
-def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None):
+def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None, metrics=None):
     if event.get('sha256_rejected_paths'):
         _redownload = False
     if item is None:
-        return _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background, request_budget)
+        return _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background, request_budget, metrics)
     recovery_state(root, event, 'running')
     try:
-        result = _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background, request_budget)
+        result = _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background, request_budget, metrics)
     except ValueError:
         recovery_state(root, event, 'finished')
         raise
@@ -466,13 +470,13 @@ def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=
     return result
 
 
-def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None):
+def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None, metrics=None):
     from download import record, target, write_json, sha256_file, inspect
     path = body_path(root, event)
     if item:
         try:
             if background:
-                retry_ranges(root, event, item, retries, tuning, stopping, download_active, request_budget)
+                retry_ranges(root, event, item, retries, tuning, stopping, download_active, request_budget, metrics=metrics)
             else:
                 retry_ranges(root, event, item, retries, tuning)
         except InterruptedError:
@@ -514,7 +518,7 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
             event.setdefault('sha256_rejected_paths', []).append(event['corrupted_path'])
             new_recovery_body(root, event, 'SHA-256 mismatch; retry in a separate body')
             return finish_recovery(root, event, item, retries, _redownload=False, tuning=tuning,
-                                   stopping=stopping, download_active=download_active, background=background, request_budget=request_budget)
+                                   stopping=stopping, download_active=download_active, background=background, request_budget=request_budget, metrics=metrics)
         if digest == event['sha256'] and item:
             destination = target(root, item, event['course'])
             control = Path(str(destination) + '.aria2')

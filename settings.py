@@ -16,6 +16,7 @@ OPTIONS = {
     'auto_save_interval': (30, 1, None, 'Resume metadata save interval, seconds'),
     'connect_timeout': (20, 1, None, 'aria2 connection timeout, seconds'),
     'timeout': (60, 1, None, 'aria2 timeout, seconds'),
+    'metrics_interval': (60, 1, None, 'Service metrics interval, seconds'),
     'summary_interval': (30, 1, None, 'aria2 progress interval, seconds'),
     'retry_delay': (10, 0, None, 'Delay between download retries, seconds'),
     'listing_retry_delay': (60, 0, None, 'Delay between course-listing retries, seconds'),

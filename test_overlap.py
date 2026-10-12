@@ -20,7 +20,7 @@ class OverlapChecks(unittest.TestCase):
     def test_overlap_runs_ranges_during_next_course_and_hands_off_without_waiting(self):
         self.items['First']['size'] = 20
         started = Event()
-        def ranges(root, event, item, retries, tuning=None, stopping=None, download_active=None, request_budget=None):
+        def ranges(root, event, item, retries, tuning=None, stopping=None, download_active=None, request_budget=None, metrics=None):
             self.assertEqual(tuning['range_workers'], 2)
             self.assertIsNotNone(request_budget)
             started.set()

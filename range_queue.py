@@ -17,6 +17,7 @@ import download as d
 from pipeline import Background, failure_manifests, now
 import recovery as r
 from settings import resolve
+from metrics import Metrics
 
 
 class RangeBudget:
@@ -154,7 +155,7 @@ def finish_courses(background, config, changed_courses=()):
                  failed=failed, pending_courses=pending, downloads_complete=True, complete=not failed and not pending))
 
 
-def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None, secondary_slots=1, budget_directory=None):
+def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60):
     if files < 1 or per_file < 1:
         raise ValueError('Range file limits must be positive')
     if not 1 <= secondary_slots <= max(1, files - 1):
@@ -168,7 +169,9 @@ def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None, secondar
     cache = JsonCache()
     roots = {}
     priorities = {}
-    with ThreadPoolExecutor(max_workers=files, thread_name_prefix='range-file') as pool:
+    with Metrics(queues[0].with_suffix('.range.metrics.jsonl'),'range-queue',interval=metrics_interval,
+                 settings=dict(files=files,per_file=per_file,requests=requests,rps=rps,secondary_slots=secondary_slots)) as metrics, \
+            ThreadPoolExecutor(max_workers=files, thread_name_prefix='range-file') as pool:
         try:
             while not stopping.is_set():
                 # Poll applies every result under the archive's exclusive download lock.
@@ -207,7 +210,7 @@ def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None, secondar
                                 settings = cache.read(state / 'settings.json')
                                 tuning = resolve({**settings['tuning'], 'range_workers': per_file, 'range_rps': rps})
                                 background = Background(root, identity['source'], settings['retries'], tuning,
-                                                        range_pool=pool, budget=budget)
+                                                        range_pool=pool, budget=budget, range_files=files)
                             except BaseException:
                                 lock.close()
                                 raise
@@ -262,6 +265,9 @@ def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None, secondar
                         background.close()
                         lock.close()
                         del roots[root]
+                metrics.gauge('range_active_files',sum(len(bg.futures) for bg,_,_ in roots.values()))
+                metrics.gauge('range_eligible_files',len(eligible))
+                metrics.gauge('archives_owned',len(roots))
                 stopping.wait(2)
         finally:
             for background, _, _ in roots.values():
@@ -269,7 +275,8 @@ def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None, secondar
             for background, lock, _ in roots.values():
                 background.close()
             pool.shutdown(wait=True, cancel_futures=True)
-            for _, lock, _ in roots.values():
+            for background, lock, _ in roots.values():
+                background.metrics.close()
                 lock.close()
 
 
@@ -282,6 +289,7 @@ def main():
     parser.add_argument('--requests-per-file', type=int, default=2)
     parser.add_argument('--requests', type=int, default=8)
     parser.add_argument('--rps', type=float, default=12)
+    parser.add_argument('--metrics-interval',type=int,default=60,help='Service metrics interval, seconds')
     parser.add_argument('--budget', type=Path, help='Share the HTTP budget with overlapping ordinary downloaders')
     args = parser.parse_args()
     stopping = Event()
@@ -290,7 +298,7 @@ def main():
     # Prevent two workers from multiplying the global limits.
     with args.queue[0].with_suffix('.range.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget)
+        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget, args.metrics_interval)
 
 
 if __name__ == '__main__':

@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 from local_paths import local_path
+from metrics import Metrics, AriaMetrics
 from pathlib import Path
 import shutil
 import signal
@@ -75,6 +76,10 @@ class Background:
         self.on_tick = self.poll
         self.ledger_path = self.state / 'transfer-state.json'
         self.ledger = json.loads(self.ledger_path.read_text()) if self.ledger_path.exists() else {}
+        self.metrics = Metrics(self.state/'metrics.jsonl', 'range-worker' if range_pool else 'downloader',
+                               interval=tuning['metrics_interval'], settings=dict(tuning=tuning, retries=retries, range_files=range_files))
+        self.aria_metrics = AriaMetrics(self.state/'aria2.log',self.metrics)
+        self.metrics.sample = self.aria_metrics.sample
 
     def checkpoint(self, item, course, attempt, phase, event=None):
         row = dict(source=self.source, size=item['size'], sha256=item['sha256'],
@@ -94,11 +99,12 @@ class Background:
         if path in self.futures:
             return
         job = dict(source=self.source, kind=kind, item=item, course=course, attempt=attempt,
-                   state='pending', time=now())
+                   state='pending', time=now(), queued_at=now())
         if event is not None:
             job['event'] = event
         if path.exists() and not force:
             old = json.loads(path.read_text())
+            job['queued_at'] = old.get('queued_at') or old.get('time',job['time'])
             if old['state'] == 'done':
                 # Reapply a result saved just before interruption, but never trust changed bytes.
                 local = d.target(self.root, item, course)
@@ -116,6 +122,7 @@ class Background:
                         job.update(state='done', result=dict(event=proof))
         d.write_json(path, job)
         self.jobs[path] = job
+        self.metrics.task(path,kind,job['state'],job.get('queued_at') or job.get('time',now()))
         if kind == 'range' and self.defer_range:
             self.deferred[path] = job
             return
@@ -133,6 +140,8 @@ class Background:
         if self.stopping.is_set():
             raise InterruptedError('Background task interrupted')
         job['state'] = 'running'
+        self.metrics.task(path,job['kind'],'running',job.get('queued_at') or job.get('time',now()))
+        started = time.monotonic()
         d.write_json(path, job)
         if job['kind'] == 'sha':
             local = d.target(self.root, job['item'], job['course'])
@@ -147,7 +156,7 @@ class Background:
             try:
                 r.finish_recovery(self.root, event, job['item'], self.retries, tuning=self.tuning,
                                   stopping=self.stopping, download_active=self.download_active if self.budget is None else None,
-                                  background=True, request_budget=self.budget)
+                                  background=True, request_budget=self.budget, metrics=self.metrics)
             except InterruptedError:
                 raise
             except (ValueError, FileExistsError) as error:
@@ -155,6 +164,13 @@ class Background:
                 print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)
                 r.recovery_state(self.root, event, 'finished')
             result = dict(event=event)
+        seconds = time.monotonic()-started
+        if job['kind'] == 'sha':
+            self.metrics.add(sha_checks=1, sha_seconds=seconds, sha_verified_bytes=job['item']['size'] if result['status']=='valid' else 0)
+            self.metrics.add(**{'sha_'+result['status']+'_files':1})
+        else:
+            self.metrics.add(range_finished_files=1, range_full_files=int(event.get('range_recovered_complete',False)))
+        self.metrics.task(path,job['kind'],'done',job.get('queued_at') or job.get('time',now()))
         job.update(state='done', result=result, time=now())
         d.write_json(path, job)
         return job
@@ -207,6 +223,7 @@ class Background:
                 job.update(state='pending', time=now())
                 d.write_json(path, job)
                 self.deferred[path] = job
+                self.metrics.task(path,'range','pending',job.get('queued_at') or job.get('time',now()))
                 del self.futures[path]
                 continue
             item, course, attempt = job['item'], job['course'], job['attempt']
@@ -229,6 +246,7 @@ class Background:
                 failure_manifests(self.root, event)
                 self.checkpoint(item, course, attempt, 'finished', event)
             job['state'] = 'applied'
+            self.metrics.task(path,job['kind'],'applied',job.get('queued_at') or job.get('time',now()))
             d.write_json(path, job)
             del self.futures[path]
             self.jobs.pop(path, None)
@@ -242,8 +260,9 @@ class Background:
                 if current is None or (current['size'], current['sha256']) != (item['size'], item['sha256']):
                     raise ValueError('Source changed during download retry: ' + item['path'])
                 item['file'] = current['file']
-        needed = sum(max(0, item['size'] - (r.progress(d.target(self.root, item, course), item['size'],
-                     sha256=item['sha256']).get('downloaded_bytes') or 0)) for item in pending)
+        progress = {item['path']: r.progress(d.target(self.root,item,course),item['size'],sha256=item['sha256']).get('downloaded_bytes') for item in pending}
+        needed = sum(max(0,item['size']-(progress[item['path']] or 0)) for item in pending)
+        self.aria_metrics.begin({str(d.target(self.root,item,course)):(item['size'],progress[item['path']]) for item in pending})
         if shutil.disk_usage(self.root).free < needed + self.tuning['free_space_mib'] * 1024 ** 2:
             raise RuntimeError('Insufficient free space for the course')
         lines = []
@@ -295,6 +314,8 @@ class Background:
             if pool is self.shared_pool:
                 continue
             pool.shutdown(wait=True, cancel_futures=True)
+        if self.shared_pool is None or not self.futures:
+            self.metrics.close()
 
 
 def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range=False, range_budget=None, range_files=16):
@@ -495,6 +516,8 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             if budget is not None:
                 background.close()
             finalize()
+            if budget is not None:
+                background.metrics.snapshot('handoff')
         finally:
             background.close()
         failed = sum(history[course]['failed'] for course in courses)

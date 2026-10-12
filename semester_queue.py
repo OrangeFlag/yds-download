@@ -10,6 +10,8 @@ import time
 from datetime import datetime
 from download import cli, write_json
 from pipeline import transfer_process
+from metrics import Metrics
+from collections import Counter
 from settings import arguments, resolve
 
 def main():
@@ -23,7 +25,8 @@ def main():
     if args.range_budget is not None and (not args.defer_range or args.range_files < 1):
         parser.error('--range-budget requires --defer-range and positive --range-files')
     path = args.queue.resolve()
-    with path.with_suffix('.lock').open('a') as lock:
+    with path.with_suffix('.lock').open('a') as lock, Metrics(path.with_suffix('.metrics.jsonl'),'semester-queue',
+            interval=resolve(json.loads(path.read_text()).get('tuning',{}))['metrics_interval']) as metrics:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         data = json.loads(path.read_text())
         resolve(data.get('tuning', {}))
@@ -42,6 +45,8 @@ def main():
                     raise RuntimeError('Current archive did not finish; queue remains paused')
         data = json.loads(path.read_text())
         for job in data['archives']:
+            metrics.gauge('archives',dict(Counter(a.get('state','pending') for a in data['archives'])))
+            metrics.gauge('current_archive',job['title'])
             if not job.get('enabled', True) or ((job.get('state') == 'finished' or (args.defer_range and job.get('downloads_complete'))) and not (data.get('deep', False) or data.get('retry_check', False))):
                 continue
             if args.defer_range and not (data.get('deep') or data.get('retry_check')):
@@ -72,7 +77,7 @@ def main():
                 command += ['--report-repo', data['report_repo'], '--mark', data['mark']]
             if data.get('git_push'):
                 command += ['--git-push']
-            code = transfer_process(command, env=os.environ.copy(), on_tick=lambda: None, stop_timeout=80)
+            code = transfer_process(command, env=os.environ.copy(), on_tick=lambda: metrics.gauge('archives',dict(Counter(a.get('state','pending') for a in data['archives']))), stop_timeout=80)
             if code in (130, -2):
                 raise KeyboardInterrupt
             job.update(exit_code=code, time=datetime.now().astimezone().isoformat())
@@ -90,6 +95,7 @@ def main():
             print('ARCHIVE FINISHED: ' + job['title'] + '; exit=' + str(code), flush=True)
         if args.defer_range:
             while any(job.get('state') == 'recovering' for job in data['archives']):
+                metrics.gauge('archives',dict(Counter(a.get('state','pending') for a in data['archives'])))
                 changed = False
                 for job in data['archives']:
                     if job.get('state') != 'recovering':
