@@ -99,6 +99,55 @@ def new_recovery_body(root, event, reason):
     write_json(archive / 'failed.json', [event])
 
 
+def missing_chunks(ranges, total, block):
+    """Split only unconfirmed holes, keeping the remote byte alignment."""
+    missing = []
+    position = 0
+    for start, end in ranges + [[total, total]]:
+        while position < start:
+            stop = min(start, (position // block + 1) * block)
+            missing.append((position, stop))
+            position = stop
+        position = end
+    return missing
+
+
+def spread_probes(missing, limit):
+    count = min(len(missing), limit)
+    if count < 2:
+        return missing[:count]
+    return [missing[i * (len(missing) - 1) // (count - 1)] for i in range(count)]
+
+
+def expand_probes(ranges, total, outcomes, block, limit, minimum, discoveries=None):
+    """Try larger neighbours of discoveries without overlapping saved/pending bytes."""
+    planned = []
+    reserved = ranges
+    failures = {(row['start'], row['end']) for row in outcomes if not row['saved_bytes']}
+    for row in outcomes if discoveries is None else discoveries:
+        if not row['saved_bytes']:
+            continue
+        for anchor, backwards in ((row['start'], True), (row['start'] + row['saved_bytes'], False)):
+            for start, end in missing_chunks(reserved, total, total):
+                if backwards and start < anchor <= end:
+                    bounds = (max(start, anchor - block), anchor)
+                elif not backwards and start <= anchor < end:
+                    bounds = (anchor, min(end, anchor + block))
+                else:
+                    continue
+                while bounds in failures and bounds[1] - bounds[0] > minimum:
+                    length = max(minimum, (bounds[1] - bounds[0]) // 2)
+                    bounds = (bounds[1] - length, bounds[1]) if backwards else (bounds[0], bounds[0] + length)
+                if bounds in failures:
+                    break
+                if len(planned) >= limit:
+                    return planned
+                planned.append(bounds)
+                reserved = merge_ranges(reserved + [list(bounds)])
+                break
+    return planned
+
+
 def retry_ranges(root, event, item, retries, tuning=None, stopping=None, download_active=None):
     tuning = resolve(tuning)
     from download import OPENER, write_json, files
@@ -190,22 +239,10 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
         fine = attempt > 1 and (block <= minimum or failed_count > tuning['range_failure_limit'] or attempt == max_passes)
         if fine:
             block = tuning['range_linear_block_size_kib'] * 1024
-        missing = []
-        position = 0
-        for start, end in ranges + [[total, total]]:
-            while position < start:
-                stop = min(start, (position // block + 1) * block)
-                missing.append((position, stop))
-                position = stop
-            position = end
+        missing = missing_chunks(ranges, total, block)
         if not missing:
             break
         unprobed = 0
-        if fine:
-            # Bound the cost of an unavailable multi-GiB file; later runs continue this scan.
-            missing = [bounds for bounds in missing if bounds[0] >= cursor] + [bounds for bounds in missing if bounds[0] < cursor]
-            unprobed = max(0, len(missing) - tuning['range_linear_probes'])
-            missing = missing[:tuning['range_linear_probes']]
         if attempt > 1:
             if download_active is None:
                 time.sleep(tuning['range_retry_delay'])
@@ -234,44 +271,78 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                 write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor, control_imported=True))
                 ranges = merge_ranges(ranges + [saved])
             outcomes.append(dict(start=bounds[0], end=bounds[1], saved_bytes=len(data) if data else 0, error=error))
-        # Consume completed requests immediately so Ctrl+C cannot lose later successful chunks.
-        workers = tuning['range_workers']
-        pool = ThreadPoolExecutor(max_workers=workers)
-        futures = set()
-        try:
-            pending = iter(missing)
-            for bounds in missing[:workers]:
-                futures.add(pool.submit(fetch, bounds))
-            for _ in missing[:workers]:
-                next(pending)
-            while futures:
-                completed, _ = wait(futures, return_when=FIRST_COMPLETED)
-                for future in completed:
-                    save_result(future)
-                    futures.remove(future)
+        def execute(batch, mode):
+            # Persist each completed request before waiting for the rest of the batch.
+            workers = tuning['range_workers']
+            pool = ThreadPoolExecutor(max_workers=workers)
+            futures = set()
+            first_outcome = len(outcomes)
+            submitted = 0
+            try:
+                pending = iter(batch)
+                for _ in range(workers):
                     bounds = next(pending, None)
-                    if bounds is not None and not stopping.is_set():
+                    if bounds is not None:
                         futures.add(pool.submit(fetch, bounds))
-        except KeyboardInterrupt:
-            stopping.set()
-            pool.shutdown(wait=True, cancel_futures=True)
-            for future in futures:
-                if not future.cancelled():
-                    save_result(future)
-            raise
-        finally:
-            pool.shutdown(wait=True, cancel_futures=True)
-        if stopping.is_set():
-            raise InterruptedError('Range interrupted')
+                        submitted += 1
+                while futures:
+                    completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        save_result(future)
+                        futures.remove(future)
+                        rows = outcomes[first_outcome:]
+                        cutoff = (mode == 'halving' and attempt < max_passes
+                                  and len(rows) > tuning['range_failure_limit']
+                                  and not any(row['saved_bytes'] for row in rows))
+                        bounds = None if cutoff else next(pending, None)
+                        if bounds is not None and not stopping.is_set():
+                            futures.add(pool.submit(fetch, bounds))
+                            submitted += 1
+            except KeyboardInterrupt:
+                stopping.set()
+                pool.shutdown(wait=True, cancel_futures=True)
+                for future in futures:
+                    if not future.cancelled():
+                        save_result(future)
+                raise
+            finally:
+                pool.shutdown(wait=True, cancel_futures=True)
+                for row in outcomes[first_outcome:]:
+                    row['mode'] = mode
+            if stopping.is_set():
+                raise InterruptedError('Range interrupted')
+            return len(batch) - submitted
+
         if fine:
-            cursor = missing[-1][1] % total
+            budget = tuning['range_linear_probes']
+            # Reserve at least half the budget for expansion and resumable linear coverage.
+            ordered = [bounds for bounds in missing if bounds[0] >= cursor]
+            ordered += [bounds for bounds in missing if bounds[0] < cursor]
+            scatter = spread_probes(ordered, budget // 2)
+            execute(scatter, 'scatter')
+            previous = [row for earlier in attempts for row in earlier['ranges']]
+            expansions = expand_probes(ranges, total, previous + outcomes,
+                                       tuning['range_block_size_kib'] * 1024, budget // 4, block, outcomes)
+            execute(expansions, 'expand')
+            remaining = missing_chunks(ranges, total, block)
+            tested = set(scatter)
+            linear = [bounds for bounds in remaining if bounds[0] >= cursor and bounds not in tested]
+            linear += [bounds for bounds in remaining if bounds[0] < cursor and bounds not in tested]
+            linear = linear[:budget - len(outcomes)]
+            execute(linear, 'linear')
+            if linear:
+                cursor = linear[-1][1] % total
+            small_tests = tested | set(linear)
+            unprobed = sum(bounds not in small_tests for bounds in missing_chunks(ranges, total, block))
             write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor, control_imported=True))
+        else:
+            unprobed = execute(missing, 'halving')
         attempts.append(dict(attempt=attempt, ranges=outcomes, unprobed=unprobed, fine=fine))
         failed_count = sum(row['saved_bytes'] < row['end'] - row['start'] for row in outcomes)
         remaining_span = max((row['end'] - row['start'] - row['saved_bytes'] for row in outcomes), default=0)
         event['range_attempts'] = attempts
         event.update(progress(path, total, sha256=event['sha256']))
-        print(f'RANGE PASS {attempt}/{max_passes}: {event["path"]}; chunk={block}; mode={"linear" if fine else "halving"}; saved={sum(row["saved_bytes"] > 0 for row in outcomes)}/{len(outcomes)}; bytes={event["downloaded_percent"]}; unprobed={unprobed}', flush=True)
+        print(f'RANGE PASS {attempt}/{max_passes}: {event["path"]}; chunk={block}; mode={"adaptive" if fine else "halving"}; saved={sum(row["saved_bytes"] > 0 for row in outcomes)}/{len(outcomes)}; bytes={event["downloaded_percent"]}; unprobed={unprobed}', flush=True)
         if fine:
             break
     return ranges

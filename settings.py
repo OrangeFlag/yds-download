@@ -28,7 +28,7 @@ OPTIONS = {
     'range_min_block_size_kib': (1024, 1, None, 'Switch to linear probing at this block size, KiB'),
     'range_linear_block_size_kib': (64, 1, None, 'Linear probe block size, KiB'),
     'range_failure_limit': (32, 0, None, 'Switch to linear after more failed ranges than this'),
-    'range_linear_probes': (256, 1, None, 'Maximum linear requests per recovery'),
+    'range_linear_probes': (256, 1, None, 'Maximum scatter/expansion/linear requests per recovery'),
     'range_max_passes': (0, 0, None, 'Maximum Range passes; 0 = min(4, 2*retries)+2'),
 }
 
