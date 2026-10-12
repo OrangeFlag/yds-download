@@ -274,6 +274,32 @@ class ReviewRegression(unittest.TestCase):
         report.update_report(self.root, repo, 'Walterit')
         self.assertNotIn('| Walterit |', card.read_text())
 
+    def test_occupied_copy_slots_do_not_block_other_report_rows(self):
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                local = self.root / 'Course/video.mp4'
+                local.parent.mkdir(exist_ok=True)
+                local.write_bytes(self.content)
+                download.record(self.state, self.item, 'Course', 1, 'valid', 'SHA verified')
+                if partial:
+                    self.body.write_bytes(self.content)
+                    self.journal(self.body, [[0, 3 * self.item['size'] // 4]])
+                    recovery.promote_partial(self.root, self.event)
+                    local.unlink()
+                second = dict(self.item, path='/Course/second.mp4')
+                (self.root / 'Course/second.mp4').write_bytes(self.content)
+                download.record(self.state, second, 'Course', 1, 'valid', 'SHA verified')
+                repo = self.root / 'repo'
+                (repo / 'courses').mkdir(parents=True, exist_ok=True)
+                card = repo / 'courses/course.md'
+                occupied = '| `video.mp4` | 1 | Alice | Bob | Carol |'
+                card.write_text('- Год: 2026\n- Источник: [disk](' + self.source + ')\n- Путь: `Course`\n'
+                                '**Статус:** копия есть\n' + occupied + '\n'
+                                '| `second.mp4` | 1 | Other | | |\n')
+                report.update_report(self.root, repo, 'Walterit')
+                self.assertIn(occupied, card.read_text())
+                self.assertIn('| `second.mp4` | 1 | Other | Walterit |  |', card.read_text())
+
     def test_truncated_control_keeps_independent_journal(self):
         self.body.write_bytes(self.content)
         control = Path(str(self.body) + '.aria2')

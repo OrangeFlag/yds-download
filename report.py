@@ -123,8 +123,9 @@ def update_report(destination, repo, mark, git_push=False, message=None):
                         copies[position] = '' if mark in copies else mark
             if status == 'valid' and mark not in copies:
                 if '' not in copies:
-                    raise ValueError('All copy columns occupied: ' + str(card) + ': ' + name)
-                copies[copies.index('')] = mark
+                    print('REPORT ROW SKIPPED: All copy columns occupied: ' + str(card) + ': ' + name, flush=True)
+                else:
+                    copies[copies.index('')] = mark
             elif event and status != 'valid':
                 copies = ['' if value == mark else value for value in copies]
             if key in known_partial:
@@ -135,8 +136,9 @@ def update_report(destination, repo, mark, git_push=False, message=None):
                     copies[previous] = label
                 elif label:
                     if '' not in copies:
-                        raise ValueError('All copy columns occupied: ' + str(card) + ': ' + name)
-                    copies[copies.index('')] = label
+                        print('REPORT ROW SKIPPED: All copy columns occupied: ' + str(card) + ': ' + name, flush=True)
+                    else:
+                        copies[copies.index('')] = label
             if copies != [cell.strip() for cell in cells[2:]]:
 
                 rows[index] = f'| {cells[0].strip()} | {cells[1].strip()} | ' + ' | '.join(copies) + ' |\n'
