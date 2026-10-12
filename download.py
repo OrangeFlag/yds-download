@@ -285,230 +285,230 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
     root.mkdir(parents=True, exist_ok=True)
     state = root / '.download'
     state.mkdir(mode=0o700, exist_ok=True)
-    lock = (state / 'download.lock').open('a')
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise RuntimeError('Another downloader is using this destination') from None
-    source = data['source']
-    identity = state / 'source.json'
-    if identity.exists() and json.loads(identity.read_text(encoding='utf-8'))['source'] != source:
-        raise ValueError('Use a separate destination for a different public folder/year')
-    write_json(identity, dict(source=source, title=data['title']))
-    write_json(state / 'settings.json', dict(retries=retries, deep=deep, retry_check=retry_check, tuning=tuning))
-    read_events(state / 'events.jsonl', repair=True)
-    recovered = {}
-    if retry_check:
-        from recovery import recover_corrupted
-        recovered = {event['path']: event for event in recover_corrupted(
-            root, source, retries, True, report_repo, mark, git_push, courses=courses, force=True, tuning=tuning, deep=deep)}
-    history_path = state / 'course-history.json'
-    history = json.loads(history_path.read_text()) if history_path.exists() else {}
-    for path in state.glob('*-status.json'):
-        previous = json.loads(path.read_text())
-        if previous.get('source') == source and previous.get('state') in ('finished', 'running'):
-            name = previous['course']
-            if previous['state'] == 'running' and not previous.get('time'):
-                previous['time'] = datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat()
-            if previous.get('time', '') >= history.get(name, {}).get('time', ''):
-                history[name] = previous
-    write_json(history_path, history)
-    recovery_courses = [] if retry_check or deep else [
-        course for course in courses if history.get(course, {}).get('state') == 'running']
-    if recovery_courses:
-        from recovery import recover_corrupted
-        recovered = {event['path']: event for event in recover_corrupted(
-            root, source, retries, True, courses=recovery_courses, tuning=tuning)}
-    events = {event['path']: event for event in read_events(state / 'events.jsonl')}
-    registry = state / 'local-copies.json'
-    local_copies = json.loads(registry.read_text()) if registry.exists() else []
-    for event in local_copies:
-        if event['source'].rstrip('/') == source.rstrip('/') and (deep or event['status'] == 'valid'):
-            local = Path(event['local'])
-            if deep or (local.exists() and local.stat().st_size == event['size']
-                    and local.stat().st_mtime_ns == event['mtime_ns']
-                    and not Path(str(local) + '.aria2').exists()):
-                events[event['path']] = event
-    write_json(state / 'catalog.json', data)
-    write_json(state / 'courses.json', courses)
-    lines = [data['title'] + ' — порядок скачивания', 'Источник: ' + source,
-             f'Курсы последовательно; первая попытка + {retries} повтора; неудачи: corrupted.', '']
-    for index, course in enumerate(courses, 1):
-        lines.extend([f'{index:02d}. {course}', source.rstrip('/') + '/' +
-                      urllib.parse.quote(course, safe=''), ''])
-    (root / 'Порядок скачивания.txt').write_text('\n'.join(lines), encoding='utf-8')
-    broken_root = root / 'corrupted' / datetime.now().strftime('%Y%m%d-%H%M%S-%f')
-    prior_failures = {}
-    for path in (root / 'corrupted').glob('*/failed.json'):
-        for event in json.loads(path.read_text()):
-            if event['course'] in courses and event['time'] > prior_failures.get(event['path'], {}).get('time', ''):
-                prior_failures[event['path']] = event
-    failed = [event for path, event in prior_failures.items()
-              if events.get(path, {}).get('status') != 'valid']
-    verified = 0
-    for index, course in enumerate(courses, 1):
-        print(f'COURSE {index}/{len(courses)}: {course}', flush=True)
-        status_path = state / f'{index:02d}-status.json'
-        previous = history.get(course, {})
-        if (not deep and previous.get('state') == 'finished' and previous.get('source') == source
-                and not (retry_check and previous.get('failed'))):
-            write_json(status_path, previous)
-            verified += previous['verified']
-            print(f'COURSE SKIPPED: {course}; already processed; verified={previous["verified"]}; failed={previous["failed"]}', flush=True)
-            continue
-        failed = [event for event in failed if event['course'] != course]
-        running = dict(previous, course=course, source=source, complete=False, state='running',
-                       time=datetime.now().astimezone().isoformat())
-        if not (deep and not retry_check):
-            history[course] = running
-            write_json(history_path, history)
-            write_json(status_path, running)
-        entries = list_course(source, course, retries, tuning['listing_retry_delay'])
-        for item in entries:
-            target(root, item, course)
-        previous_entries = {}
-        for manifest in sorted(state.glob('*-manifest.json'), key=lambda path: path.stat().st_mtime_ns):
-            previous_entries.update({row['path']: row for row in json.loads(manifest.read_text())})
-        bind_resume(root, entries, previous_entries, events, deep and not retry_check)
-        write_json(state / f'{index:02d}-manifest.json', [
-            {k: item[k] for k in ('path', 'size', 'sha256')} for item in entries])
-        print(f"FILES {len(entries)}; SIZE {sum(x['size'] for x in entries)/1024**3:.2f} GiB", flush=True)
-        pending = []
-        course_failed = []
-        for item in entries:
-            archived = recovered.get(item['path'])
-            if (archived and not archived.get('range_recovered_complete')
-                    and (archived['size'], archived['sha256']) == (item['size'], item['sha256'])):
-                course_failed.append(archived)
-                failed.append(archived)
+    with (state / 'download.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Another downloader is using this destination') from None
+        source = data['source']
+        identity = state / 'source.json'
+        if identity.exists() and json.loads(identity.read_text(encoding='utf-8'))['source'] != source:
+            raise ValueError('Use a separate destination for a different public folder/year')
+        write_json(identity, dict(source=source, title=data['title']))
+        write_json(state / 'settings.json', dict(retries=retries, deep=deep, retry_check=retry_check, tuning=tuning))
+        read_events(state / 'events.jsonl', repair=True)
+        recovered = {}
+        if retry_check:
+            from recovery import recover_corrupted
+            recovered = {event['path']: event for event in recover_corrupted(
+                root, source, retries, True, report_repo, mark, git_push, courses=courses, force=True, tuning=tuning, deep=deep)}
+        history_path = state / 'course-history.json'
+        history = json.loads(history_path.read_text()) if history_path.exists() else {}
+        for path in state.glob('*-status.json'):
+            previous = json.loads(path.read_text())
+            if previous.get('source') == source and previous.get('state') in ('finished', 'running'):
+                name = previous['course']
+                if previous['state'] == 'running' and not previous.get('time'):
+                    previous['time'] = datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat()
+                if previous.get('time', '') >= history.get(name, {}).get('time', ''):
+                    history[name] = previous
+        write_json(history_path, history)
+        recovery_courses = [] if retry_check or deep else [
+            course for course in courses if history.get(course, {}).get('state') == 'running']
+        if recovery_courses:
+            from recovery import recover_corrupted
+            recovered = {event['path']: event for event in recover_corrupted(
+                root, source, retries, True, courses=recovery_courses, tuning=tuning)}
+        events = {event['path']: event for event in read_events(state / 'events.jsonl')}
+        registry = state / 'local-copies.json'
+        local_copies = json.loads(registry.read_text()) if registry.exists() else []
+        for event in local_copies:
+            if event['source'].rstrip('/') == source.rstrip('/') and (deep or event['status'] == 'valid'):
+                local = Path(event['local'])
+                if deep or (local.exists() and local.stat().st_size == event['size']
+                        and local.stat().st_mtime_ns == event['mtime_ns']
+                        and not Path(str(local) + '.aria2').exists()):
+                    events[event['path']] = event
+        write_json(state / 'catalog.json', data)
+        write_json(state / 'courses.json', courses)
+        lines = [data['title'] + ' — порядок скачивания', 'Источник: ' + source,
+                 f'Курсы последовательно; первая попытка + {retries} повтора; неудачи: corrupted.', '']
+        for index, course in enumerate(courses, 1):
+            lines.extend([f'{index:02d}. {course}', source.rstrip('/') + '/' +
+                          urllib.parse.quote(course, safe=''), ''])
+        (root / 'Порядок скачивания.txt').write_text('\n'.join(lines), encoding='utf-8')
+        broken_root = root / 'corrupted' / datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+        prior_failures = {}
+        for path in (root / 'corrupted').glob('*/failed.json'):
+            for event in json.loads(path.read_text()):
+                if event['course'] in courses and event['time'] > prior_failures.get(event['path'], {}).get('time', ''):
+                    prior_failures[event['path']] = event
+        failed = [event for path, event in prior_failures.items()
+                  if events.get(path, {}).get('status') != 'valid']
+        verified = 0
+        for index, course in enumerate(courses, 1):
+            print(f'COURSE {index}/{len(courses)}: {course}', flush=True)
+            status_path = state / f'{index:02d}-status.json'
+            previous = history.get(course, {})
+            if (not deep and previous.get('state') == 'finished' and previous.get('source') == source
+                    and not (retry_check and previous.get('failed'))):
+                write_json(status_path, previous)
+                verified += previous['verified']
+                print(f'COURSE SKIPPED: {course}; already processed; verified={previous["verified"]}; failed={previous["failed"]}', flush=True)
                 continue
-            local = target(root, item, course)
-            cached = events.get(item['path'], {})
-            if cached.get('local') and (deep or cached.get('status') == 'valid'):
-                local = Path(cached['local'])
-            if deep and not retry_check:
-                event = inspect_copies(root, item, course, cached, source)
-                if event['status'] == 'valid':
-                    verified += 1
-                else:
-                    course_failed.append(event)
-                    failed.append(event)
-                continue
-            if ((not deep or archived) and cached.get('status') == 'valid'
-                    and cached.get('sha256') == item['sha256'] and cached.get('size') == item['size']
-                    and local.exists() and local.stat().st_size == item['size']
-                    and ('mtime_ns' not in cached or local.stat().st_mtime_ns == cached['mtime_ns'])
-                    and not Path(str(local) + '.aria2').exists()):
-                verified += 1
-                print('FILE SKIPPED: ' + item['path'] + '; previously SHA-256 verified', flush=True)
-            else:
-                if deep:
+            failed = [event for event in failed if event['course'] != course]
+            running = dict(previous, course=course, source=source, complete=False, state='running',
+                           time=datetime.now().astimezone().isoformat())
+            if not (deep and not retry_check):
+                history[course] = running
+                write_json(history_path, history)
+                write_json(status_path, running)
+            entries = list_course(source, course, retries, tuning['listing_retry_delay'])
+            for item in entries:
+                target(root, item, course)
+            previous_entries = {}
+            for manifest in sorted(state.glob('*-manifest.json'), key=lambda path: path.stat().st_mtime_ns):
+                previous_entries.update({row['path']: row for row in json.loads(manifest.read_text())})
+            bind_resume(root, entries, previous_entries, events, deep and not retry_check)
+            write_json(state / f'{index:02d}-manifest.json', [
+                {k: item[k] for k in ('path', 'size', 'sha256')} for item in entries])
+            print(f"FILES {len(entries)}; SIZE {sum(x['size'] for x in entries)/1024**3:.2f} GiB", flush=True)
+            pending = []
+            course_failed = []
+            for item in entries:
+                archived = recovered.get(item['path'])
+                if (archived and not archived.get('range_recovered_complete')
+                        and (archived['size'], archived['sha256']) == (item['size'], item['sha256'])):
+                    course_failed.append(archived)
+                    failed.append(archived)
+                    continue
+                local = target(root, item, course)
+                cached = events.get(item['path'], {})
+                if cached.get('local') and (deep or cached.get('status') == 'valid'):
+                    local = Path(cached['local'])
+                if deep and not retry_check:
                     event = inspect_copies(root, item, course, cached, source)
                     if event['status'] == 'valid':
                         verified += 1
-                        continue
-                pending.append(item)
-        needed = sum(max(0, item['size'] - (target(root, item, course).stat().st_size
-                     if target(root, item, course).exists() else 0)) for item in pending)
-        if pending and shutil.disk_usage(root).free < needed + tuning['free_space_mib'] * 1024 ** 2:
-            raise RuntimeError('Insufficient free space for the course')
-        for attempt in range(1, retries + 2):
-            if not pending:
-                break
-            if attempt > 1:
-                time.sleep(tuning['retry_delay'])
-                fresh = {item['path']: item for item in list_course(source, course, retries, tuning['listing_retry_delay'])}
-                pending = [dict(item, file=fresh.get(item['path'], item)['file']) for item in pending]
-            queue = []
-            for item in pending:
-                destination = target(root, item, course)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                queue.append(f"{item['file']}\n dir={destination.parent}\n out={destination.name}\n checksum=sha-256={item['sha256']}\n")
-            (state / 'queue.txt').write_text(''.join(queue), encoding='utf-8')
-            code = subprocess.call([
-                'aria2c', '--input-file=' + str(state / 'queue.txt'),
-                '--continue=true', '--always-resume=true', '--check-integrity=true',
-                '--auto-file-renaming=false', '--allow-overwrite=true',
-                f"--max-concurrent-downloads={tuning['download_concurrency']}",
-                '--optimize-concurrent-downloads=' + (
-                    f"{tuning['auto_concurrency_a']:g}:{tuning['auto_concurrency_b']:g}"
-                    if tuning['auto_concurrency'] else 'false'),
-                f"--max-connection-per-server={tuning['connections']}", f"--split={tuning['split']}",
-                f"--min-split-size={tuning['min_split_size_mib']}M", '--file-allocation=none',
-                f"--disk-cache={tuning['disk_cache_mib']}M",
-                f"--max-overall-download-limit={tuning['bandwidth_limit']}",
-                f"--auto-save-interval={tuning['auto_save_interval']}", '--max-tries=1',
-                f"--connect-timeout={tuning['connect_timeout']}", f"--timeout={tuning['timeout']}",
-                f"--summary-interval={tuning['summary_interval']}", '--enable-color=false',
-                '--console-log-level=warn', '--log=' + str(state / 'aria2.log'), '--log-level=notice',
-            ], env=ENV)
-            if code == 9:
-                raise RuntimeError('aria2 reports insufficient disk space')
-            remaining = []
-            for item in pending:
-                status, detail = inspect(root, item, course)
-                event = record(state, item, course, attempt, status, detail)
-                if status == 'valid':
+                    else:
+                        course_failed.append(event)
+                        failed.append(event)
+                    continue
+                if ((not deep or archived) and cached.get('status') == 'valid'
+                        and cached.get('sha256') == item['sha256'] and cached.get('size') == item['size']
+                        and local.exists() and local.stat().st_size == item['size']
+                        and ('mtime_ns' not in cached or local.stat().st_mtime_ns == cached['mtime_ns'])
+                        and not Path(str(local) + '.aria2').exists()):
                     verified += 1
-                elif attempt < retries + 1:
-                    remaining.append(item)
+                    print('FILE SKIPPED: ' + item['path'] + '; previously SHA-256 verified', flush=True)
                 else:
+                    if deep:
+                        event = inspect_copies(root, item, course, cached, source)
+                        if event['status'] == 'valid':
+                            verified += 1
+                            continue
+                    pending.append(item)
+            needed = sum(max(0, item['size'] - (target(root, item, course).stat().st_size
+                         if target(root, item, course).exists() else 0)) for item in pending)
+            if pending and shutil.disk_usage(root).free < needed + tuning['free_space_mib'] * 1024 ** 2:
+                raise RuntimeError('Insufficient free space for the course')
+            for attempt in range(1, retries + 2):
+                if not pending:
+                    break
+                if attempt > 1:
+                    time.sleep(tuning['retry_delay'])
+                    fresh = {item['path']: item for item in list_course(source, course, retries, tuning['listing_retry_delay'])}
+                    pending = [dict(item, file=fresh.get(item['path'], item)['file']) for item in pending]
+                queue = []
+                for item in pending:
                     destination = target(root, item, course)
-                    broken = broken_root / destination.relative_to(root)
-                    broken.parent.mkdir(parents=True, exist_ok=True)
-                    event['corrupted_path'] = str(broken.relative_to(root))
-                    course_failed.append(event)
-                    failed.append(event)
-                    write_json(root / 'corrupted' / 'failed.json', failed)
-                    write_json(broken_root / 'failed.json', failed)
-                    for src, out in [(destination, broken),
-                                     (Path(str(destination) + '.aria2'), Path(str(broken) + '.aria2'))]:
-                        if src.exists():
-                            if out.exists():
-                                raise FileExistsError(out)
-                            src.rename(out)
-                    try:
-                        from recovery import finish_recovery
-                        finish_recovery(root, event, item, retries, tuning=tuning)
-                    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
-                        event['recovery_error'] = str(error)
-                        print('RECOVERY ERROR: ' + item['path'] + '; ' + type(error).__name__, flush=True)
-                    if event.get('range_recovered_complete'):
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    queue.append(f"{item['file']}\n dir={destination.parent}\n out={destination.name}\n checksum=sha-256={item['sha256']}\n")
+                (state / 'queue.txt').write_text(''.join(queue), encoding='utf-8')
+                code = subprocess.call([
+                    'aria2c', '--input-file=' + str(state / 'queue.txt'),
+                    '--continue=true', '--always-resume=true', '--check-integrity=true',
+                    '--auto-file-renaming=false', '--allow-overwrite=true',
+                    f"--max-concurrent-downloads={tuning['download_concurrency']}",
+                    '--optimize-concurrent-downloads=' + (
+                        f"{tuning['auto_concurrency_a']:g}:{tuning['auto_concurrency_b']:g}"
+                        if tuning['auto_concurrency'] else 'false'),
+                    f"--max-connection-per-server={tuning['connections']}", f"--split={tuning['split']}",
+                    f"--min-split-size={tuning['min_split_size_mib']}M", '--file-allocation=none',
+                    f"--disk-cache={tuning['disk_cache_mib']}M",
+                    f"--max-overall-download-limit={tuning['bandwidth_limit']}",
+                    f"--auto-save-interval={tuning['auto_save_interval']}", '--max-tries=1',
+                    f"--connect-timeout={tuning['connect_timeout']}", f"--timeout={tuning['timeout']}",
+                    f"--summary-interval={tuning['summary_interval']}", '--enable-color=false',
+                    '--console-log-level=warn', '--log=' + str(state / 'aria2.log'), '--log-level=notice',
+                ], env=ENV)
+                if code == 9:
+                    raise RuntimeError('aria2 reports insufficient disk space')
+                remaining = []
+                for item in pending:
+                    status, detail = inspect(root, item, course)
+                    event = record(state, item, course, attempt, status, detail)
+                    if status == 'valid':
                         verified += 1
-                        course_failed.remove(event)
-                        failed.remove(event)
+                    elif attempt < retries + 1:
+                        remaining.append(item)
+                    else:
+                        destination = target(root, item, course)
+                        broken = broken_root / destination.relative_to(root)
+                        broken.parent.mkdir(parents=True, exist_ok=True)
+                        event['corrupted_path'] = str(broken.relative_to(root))
+                        course_failed.append(event)
+                        failed.append(event)
                         write_json(root / 'corrupted' / 'failed.json', failed)
                         write_json(broken_root / 'failed.json', failed)
-                        continue
-                    with (state / 'events.jsonl').open('a') as log:
-                        log.write(json.dumps(event, ensure_ascii=False) + '\n')
-                    write_json(root / 'corrupted' / 'failed.json', failed)
-                    write_json(broken_root / 'failed.json', failed)
-            pending = remaining
-        complete = not course_failed
-        course_status = dict(course=course, source=source, complete=complete,
-                             state=previous.get('state', 'pending') if deep and not retry_check else 'finished',
-                             total=len(entries), verified=len(entries) - len(course_failed),
-                             failed=len(course_failed), time=datetime.now().astimezone().isoformat())
-        write_json(status_path, course_status)
-        history[course] = course_status
-        write_json(history_path, history)
-        if report_repo:
-            try:
-                from report import update_report
-                update_report(root, report_repo, mark, git_push,
-                              f"Update {mark} copies: {data['title']} / {course}")
-            except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
-                print(f'REPORT ERROR: {error}', flush=True)
-        print(('COURSE VERIFIED COMPLETE: ' if complete else 'COURSE FINISHED WITH ERRORS: ') + course, flush=True)
-        write_json(state / 'summary.json', dict(verified=verified, failed=len(failed),
-                   last_finished_course=course, complete=False))
-    (root / 'corrupted').mkdir(exist_ok=True)
-    write_json(root / 'corrupted' / 'failed.json', failed)
-    failed_count = sum(history[course]['failed'] for course in courses)
-    write_json(state / 'summary.json', dict(verified=verified, failed=failed_count, complete=not failed_count))
-    print(f'ALL SELECTED COURSES PROCESSED: verified={verified}, failed={failed_count}', flush=True)
-    return 1 if failed_count else 0
+                        for src, out in [(destination, broken),
+                                         (Path(str(destination) + '.aria2'), Path(str(broken) + '.aria2'))]:
+                            if src.exists():
+                                if out.exists():
+                                    raise FileExistsError(out)
+                                src.rename(out)
+                        try:
+                            from recovery import finish_recovery
+                            finish_recovery(root, event, item, retries, tuning=tuning)
+                        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+                            event['recovery_error'] = str(error)
+                            print('RECOVERY ERROR: ' + item['path'] + '; ' + type(error).__name__, flush=True)
+                        if event.get('range_recovered_complete'):
+                            verified += 1
+                            course_failed.remove(event)
+                            failed.remove(event)
+                            write_json(root / 'corrupted' / 'failed.json', failed)
+                            write_json(broken_root / 'failed.json', failed)
+                            continue
+                        with (state / 'events.jsonl').open('a') as log:
+                            log.write(json.dumps(event, ensure_ascii=False) + '\n')
+                        write_json(root / 'corrupted' / 'failed.json', failed)
+                        write_json(broken_root / 'failed.json', failed)
+                pending = remaining
+            complete = not course_failed
+            course_status = dict(course=course, source=source, complete=complete,
+                                 state=previous.get('state', 'pending') if deep and not retry_check else 'finished',
+                                 total=len(entries), verified=len(entries) - len(course_failed),
+                                 failed=len(course_failed), time=datetime.now().astimezone().isoformat())
+            write_json(status_path, course_status)
+            history[course] = course_status
+            write_json(history_path, history)
+            if report_repo:
+                try:
+                    from report import update_report
+                    update_report(root, report_repo, mark, git_push,
+                                  f"Update {mark} copies: {data['title']} / {course}")
+                except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+                    print(f'REPORT ERROR: {error}', flush=True)
+            print(('COURSE VERIFIED COMPLETE: ' if complete else 'COURSE FINISHED WITH ERRORS: ') + course, flush=True)
+            write_json(state / 'summary.json', dict(verified=verified, failed=len(failed),
+                       last_finished_course=course, complete=False))
+        (root / 'corrupted').mkdir(exist_ok=True)
+        write_json(root / 'corrupted' / 'failed.json', failed)
+        failed_count = sum(history[course]['failed'] for course in courses)
+        write_json(state / 'summary.json', dict(verified=verified, failed=failed_count, complete=not failed_count))
+        print(f'ALL SELECTED COURSES PROCESSED: verified={verified}, failed={failed_count}', flush=True)
+        return 1 if failed_count else 0
 
 
 def main():

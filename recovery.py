@@ -347,7 +347,7 @@ def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=
 
 
 def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False):
-    from download import record, target, write_json, sha256_file
+    from download import record, target, write_json, sha256_file, inspect
     path = body_path(root, event)
     if item:
         try:
@@ -397,8 +397,13 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
                                    stopping=stopping, download_active=download_active, background=background)
         if digest == event['sha256'] and item:
             destination = target(root, item, event['course'])
-            copy_saved(path, destination)
-            Path(str(destination) + '.aria2').unlink(missing_ok=True)
+            control = Path(str(destination) + '.aria2')
+            if destination.exists() or control.exists():
+                status, _ = inspect(root, item, event['course'], path=destination, stopping=stopping)
+                if status != 'valid':
+                    raise FileExistsError('Refusing to replace an unverified original: ' + str(destination))
+            else:
+                copy_saved(path, destination)
             record(root / '.download', item, event['course'], 0, 'valid', 'Recovered all ranges and SHA-256 verified')
             if not background:
                 reconcile_course(root, event['course'])

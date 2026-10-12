@@ -116,7 +116,7 @@ class Background:
                                   stopping=self.stopping, download_active=self.download_active, background=True)
             except InterruptedError:
                 raise
-            except ValueError as error:
+            except (ValueError, FileExistsError) as error:
                 event['recovery_error'] = str(error)
                 print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)
                 r.recovery_state(self.root, event, 'finished')
