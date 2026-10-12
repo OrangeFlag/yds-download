@@ -75,6 +75,81 @@ class SharedRangeChecks(unittest.TestCase):
             with patch('sys.argv', ['semester_queue.py', str(queue), '--defer-range']), patch.object(semester_queue, 'transfer_process', side_effect=AssertionError('Completed archive downloaded again')):
                 semester_queue.main()
 
+    def test_cached_copy_retirement_requires_unchanged_full_sha_proof(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / '.download'
+            state.mkdir()
+            local = root / 'renamed.mp4'
+            local.write_bytes(b'lecture')
+            item = dict(path='/Course/video.mp4', size=7, sha256=hashlib.sha256(b'lecture').hexdigest(), file='https://example.invalid/video')
+            source = 'https://disk.yandex.ru/d/test'
+            job = dict(item=item, course='Course', attempt=3, source=source, state='pending')
+            path = state / 'task.json'
+            d.write_json(path, job)
+            bg = SimpleNamespace(root=root, state=state, source=source, checkpoint=Mock())
+            proof = dict(item, source=source, status='valid', local=str(local), mtime_ns=local.stat().st_mtime_ns)
+            with patch.object(d, 'sha256_file', side_effect=AssertionError('Redundant SHA')):
+                for change in ({'mtime_ns': 0}, {'status': 'partial'}, {'source': 'other'}, {'sha256': '0'*64}, {'mtime_ns': None}):
+                    self.assertFalse(q.retire_cached_copy(bg, path, job, [dict(proof, **change)]))
+                Path(str(local) + '.aria2').touch()
+                self.assertFalse(q.retire_cached_copy(bg, path, job, [proof]))
+                Path(str(local) + '.aria2').unlink()
+                self.assertTrue(q.retire_cached_copy(bg, path, job, [proof]))
+            self.assertEqual(json.loads(path.read_text())['state'], 'applied')
+            self.assertTrue(json.loads(path.read_text())['superseded_by_local_copy'])
+            self.assertEqual(bg.checkpoint.call_args.args[3], 'finished')
+            self.assertEqual(d.read_events(state / 'events.jsonl')[-1]['local'], str(local))
+
+    def test_finished_archive_retires_obsolete_range_without_network_or_sha(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / '.download'
+            (state / 'tasks').mkdir(parents=True)
+            source = 'https://disk.yandex.ru/d/test'
+            local = root / 'external-renamed.mp4'
+            local.write_bytes(b'lecture')
+            item = dict(path='/Course/video.mp4', size=7, sha256=hashlib.sha256(b'lecture').hexdigest(), file='https://example.invalid/video')
+            d.write_json(state / 'source.json', dict(source=source))
+            catalog = state / 'catalog.json'
+            d.write_json(catalog, dict(source=source))
+            d.write_json(state / 'settings.json', dict(retries=2, tuning=resolve()))
+            d.write_json(state / 'courses.json', ['Course'])
+            d.write_json(state / 'summary.json', dict(pending_courses=[], complete=True))
+            d.write_json(state / 'course-history.json', {'Course': dict(state='finished', verified=1, failed=0)})
+            d.write_json(state / '01-manifest.json', [{k:v for k,v in item.items() if k != 'file'}])
+            d.write_json(state / 'local-copies.json', [dict(item, source=source, status='valid', local=str(local), mtime_ns=local.stat().st_mtime_ns)])
+            task = state / 'tasks' / 'old.json'
+            d.write_json(task, dict(kind='range', source=source, item=item, event={}, course='Course', attempt=3, state='pending'))
+            stale = state / 'tasks' / 'stale.json'
+            d.write_json(stale, dict(kind='range', source=source, item=dict(item, sha256='0'*64), event={}, course='Course', attempt=3, state='pending'))
+            queue = state / 'queue.json'
+            d.write_json(queue, dict(archives=[dict(state='finished', destination=str(root), catalog=str(catalog))]))
+            stopping = Event()
+            finish = q.finish_courses
+            def finalize(*args):
+                finish(*args)
+                stopping.set()
+            with patch('recovery.finish_recovery', side_effect=AssertionError('Redundant Range')), patch.object(d, 'sha256_file', side_effect=AssertionError('Redundant SHA')), patch.object(q, 'finish_courses', side_effect=finalize):
+                q.run([queue], stopping=stopping)
+            self.assertEqual(json.loads(task.read_text())['state'], 'applied')
+            self.assertTrue(json.loads(stale.read_text())['superseded_by_manifest'])
+            self.assertEqual(d.read_events(state / 'events.jsonl')[-1]['sha256'], item['sha256'])
+            self.assertEqual(json.loads((state / 'transfer-state.json').read_text())[item['path']]['phase'], 'finished')
+            self.assertTrue(json.loads((state / 'summary.json').read_text())['complete'])
+            self.assertFalse(d.target(root, item, 'Course').exists())
+            # A crash after task application must still finalize the pending summary.
+            d.write_json(state / 'summary.json', dict(downloads_complete=True, pending_courses=['Course']))
+            d.write_json(state / 'course-history.json', {'Course': dict(state='recovering')})
+            stopping.clear()
+            with patch('recovery.finish_recovery', side_effect=AssertionError('Applied task restarted')), patch.object(q, 'finish_courses', side_effect=finalize):
+                q.run([queue], stopping=stopping)
+            self.assertTrue(json.loads((state / 'summary.json').read_text())['complete'])
+            with (state / 'download.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
     def test_worker_recovers_four_files_without_ordinary_downloads(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -45,6 +45,7 @@ class RangeBudget:
 class JsonCache:
     def __init__(self):
         self.entries = {}
+        self.directories = {}
 
     def read(self, path, default=None):
         if not path.exists():
@@ -57,8 +58,44 @@ class JsonCache:
             self.entries[path] = saved
         return saved[1]
 
+    def tasks(self, directory):
+        if not directory.exists():
+            return []
+        stamp = Background.stat(directory)
+        saved = self.directories.get(directory)
+        if saved is None or saved[0] != stamp:
+            saved = stamp, [(path, self.read(path)) for path in sorted(directory.glob('*.json'))]
+            self.directories[directory] = saved
+        return saved[1]
 
-def finish_courses(background, config):
+
+def retire_cached_copy(background, path, job, proofs):
+    item = job['item']
+    destination = d.target(background.root, item, job['course'])
+    for proof in proofs:
+        if (proof.get('status') != 'valid' or proof.get('path') != item['path']
+                or proof.get('source', background.source).rstrip('/') != background.source.rstrip('/')
+                or (proof.get('size'), proof.get('sha256')) != (item['size'], item['sha256'])
+                or proof.get('mtime_ns') is None):
+            continue
+        local = Path(proof['local']) if proof.get('local') else destination
+        try:
+            stat = local.stat()
+        except FileNotFoundError:
+            continue
+        if ((stat.st_size, stat.st_mtime_ns) != (item['size'], proof['mtime_ns'])
+                or not local.is_file() or Path(str(local) + '.aria2').exists()):
+            continue
+        event = d.record(background.state, item, job['course'], job['attempt'], 'valid',
+                         'Cached SHA-256 verified local copy; obsolete Range task retired', local=local)
+        background.checkpoint(item, job['course'], job['attempt'], 'finished', event)
+        job.update(state='applied', result={'event': event}, time=now(), superseded_by_local_copy=True)
+        d.write_json(path, job)
+        return True
+    return False
+
+
+def finish_courses(background, config, changed_courses=()):
     root, state = background.root, background.state
     courses = json.loads((state / 'courses.json').read_text())
     history_path = state / 'course-history.json'
@@ -69,10 +106,10 @@ def finish_courses(background, config):
                 if row.get('source', '').rstrip('/') == background.source.rstrip('/') and row.get('status') == 'valid'}
     jobs = [json.loads(path.read_text()) for path in background.directory.glob('*.json')]
     for index, course in enumerate(courses, 1):
-        if history.get(course, {}).get('state') == 'finished':
+        pending = any(job['course'] == course and job['state'] != 'applied' for job in jobs)
+        if history.get(course, {}).get('state') == 'finished' and not pending and course not in changed_courses:
             continue
         entries = json.loads((state / f'{index:02d}-manifest.json').read_text())
-        pending = any(job['course'] == course and job['state'] != 'applied' for job in jobs)
         valid = 0
         for item in entries:
             for proof in (events.get(item['path'], {}), external.get(item['path'], {})):
@@ -131,7 +168,10 @@ def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None):
                         root = Path(archive['destination']).resolve()
                         state = root / '.download'
                         summary = cache.read(state / 'summary.json', {})
-                        if not summary.get('downloads_complete') or not summary.get('pending_courses'):
+                        if not summary.get('downloads_complete') and archive.get('state') != 'finished':
+                            continue
+                        tasks = cache.tasks(state / 'tasks')
+                        if not summary.get('pending_courses') and not any(job['kind'] == 'range' and job['state'] in ('pending', 'running', 'done') for _, job in tasks):
                             continue
                         if root not in roots:
                             lock = (state / 'download.lock').open('a')
@@ -154,16 +194,33 @@ def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None):
                                 raise
                             roots[root] = background, lock, config
                             priorities[root] = priority
+                            background.cached_events = {row['path']: row for row in d.read_events(state / 'events.jsonl')}
+                            background.manifest_items = {(course, item['path']): (item['size'], item['sha256'])
+                                for index, course in enumerate(cache.read(state / 'courses.json'), 1)
+                                for item in cache.read(state / f'{index:02d}-manifest.json')}
                         background = roots[root][0]
-                        for path in sorted(background.directory.glob('*.json')):
+                        retired = set()
+                        external = cache.read(state / 'local-copies.json', [])
+                        for path, job in tasks:
                             if path in background.futures:
                                 continue
-                            job = cache.read(path)
                             if job['kind'] == 'range' and job['state'] in ('pending', 'running', 'done'):
                                 if job['source'] != background.source:
                                     raise ValueError('Range task source mismatch')
                                 d.target(root, job['item'], job['course'])
+                                item = job['item']
+                                if background.manifest_items.get((job['course'], item['path'])) != (item['size'], item['sha256']):
+                                    job.update(state='applied', time=now(), superseded_by_manifest=True)
+                                    d.write_json(path, job)
+                                    continue
+                                proofs = [background.cached_events.get(job['item']['path'], {})]
+                                proofs.extend(row for row in external if row.get('source', '').rstrip('/') == background.source.rstrip('/') and row.get('path') == job['item']['path'])
+                                if retire_cached_copy(background, path, job, proofs):
+                                    retired.add(job['course'])
+                                    continue
                                 eligible.append((priority, background, job))
+                        if retired:
+                            finish_courses(background, config, retired)
                 active = sum(len(background.futures) for background, _, _ in roots.values())
                 while eligible and active < files:
                     # Reserve one slot for courses when personal files also have pending work.
