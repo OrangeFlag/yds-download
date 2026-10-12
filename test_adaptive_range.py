@@ -31,7 +31,7 @@ class AdaptiveRangeTest(unittest.TestCase):
                            range_rps=100000, range_retry_delay=0)
 
     def run_ranges(self, serve):
-        with patch.object(download, 'files', return_value=[self.item]), \
+        with patch.object(download, 'api', return_value=self.item), \
                 patch.object(download.OPENER, 'open', side_effect=serve):
             return recovery.retry_ranges(self.root, self.event, self.item, 2, self.tuning)
 
@@ -99,3 +99,48 @@ class AdaptiveRangeTest(unittest.TestCase):
         rows = self.event['range_attempts'][-1]['ranges']
         self.assertEqual([(r['start'], r['end']) for r in rows], [(0, 1024)])
         self.assertEqual(json.loads(Path(str(self.body) + '.ranges.json').read_text())['salvage_cursor'], 1024)
+
+    def test_recovery_fetches_only_this_file_once_for_multiple_passes(self):
+        def unavailable(request, timeout):
+            raise urllib.error.HTTPError(request.full_url, 500, 'Unavailable', {}, None)
+        with patch.object(download, 'api', return_value=dict(self.item, type='file')) as metadata, \
+                patch.object(download, 'files', side_effect=AssertionError('Directory was enumerated')), \
+                patch.object(download.OPENER, 'open', side_effect=unavailable):
+            recovery.retry_ranges(self.root, self.event, self.item, 2, self.tuning)
+        metadata.assert_called_once_with('https://disk.yandex.ru/d/test', self.item['path'])
+
+    def test_expired_download_link_refreshes_only_this_file(self):
+        fresh = dict(self.item, file='https://example.invalid/fresh')
+        urls = []
+        def serve(request, timeout):
+            urls.append(request.full_url)
+            if request.full_url == self.item['file']:
+                raise urllib.error.HTTPError(request.full_url, 403, 'Expired', {}, None)
+            start, last = map(int, request.get_header('Range')[6:].split('-'))
+            return Response(start, last + 1, len(self.content), self.content[start:last + 1])
+        with patch.object(download, 'api', side_effect=[self.item, fresh]) as metadata, \
+                patch.object(download, 'files', side_effect=AssertionError('Directory was enumerated')), \
+                patch.object(download.OPENER, 'open', side_effect=serve):
+            ranges = recovery.retry_ranges(self.root, self.event, self.item, 2, self.tuning)
+        self.assertEqual(metadata.call_count, 2)
+        self.assertIn(fresh['file'], urls)
+        self.assertTrue(ranges)
+
+    def test_changed_metadata_refuses_range_writes(self):
+        fresh = dict(self.item, sha256='0' * 64)
+        with patch.object(download, 'api', return_value=fresh):
+            with self.assertRaisesRegex(ValueError, 'Source file changed'):
+                recovery.retry_ranges(self.root, self.event, self.item, 2, self.tuning)
+        self.assertFalse(self.body.exists())
+
+    def test_single_public_file_uses_root_metadata_after_path_404(self):
+        item = dict(self.item, path='/test.mp4')
+        event = dict(self.event, path='/test.mp4', course='.')
+        missing = urllib.error.HTTPError('hidden', 404, 'Not found', {}, None)
+        def unavailable(request, timeout):
+            raise urllib.error.HTTPError(request.full_url, 500, 'Unavailable', {}, None)
+        with patch.object(download, 'api', side_effect=[missing, dict(item, type='file', name='test.mp4')]) as metadata, \
+                patch.object(download.OPENER, 'open', side_effect=unavailable):
+            recovery.retry_ranges(self.root, event, item, 2, self.tuning)
+        self.assertEqual(metadata.call_count, 2)
+        self.assertEqual(metadata.call_args.args, ('https://disk.yandex.ru/d/test',))

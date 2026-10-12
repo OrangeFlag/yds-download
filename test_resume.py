@@ -37,7 +37,9 @@ class ResumeChecks(unittest.TestCase):
         download.write_json(self.state / 'source.json', dict(source=self.source, title='test'))
         self.status('running')
         self.requests = []
+        self.real_api = download.api
         for target, kwargs in (
+                ('download.api', dict(return_value=self.item)),
                 ('download.files', dict(return_value=[self.item])),
                 ('download.time.sleep', {}),
                 ('pipeline.transfer_process', dict(side_effect=AssertionError('aria2 restarted an archived file')))):
@@ -318,7 +320,7 @@ class ResumeChecks(unittest.TestCase):
             raise error
         with patch.object(download.OPENER, 'open', side_effect=fail):
             with self.assertRaises(urllib.error.HTTPError):
-                download.api(self.source, '/Course')
+                self.real_api(self.source, '/Course')
         self.assertEqual(len(attempts), 1)
 
     def test_listing_does_not_retry_permanent_404(self):

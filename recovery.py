@@ -150,7 +150,7 @@ def expand_probes(ranges, total, outcomes, block, limit, minimum, discoveries=No
 
 def retry_ranges(root, event, item, retries, tuning=None, stopping=None, download_active=None):
     tuning = resolve(tuning)
-    from download import OPENER, write_json, files
+    from download import OPENER, write_json, api
     if item['size'] != event['size'] or item['sha256'] != event['sha256']:
         raise ValueError('Source file changed; refuse to combine ranges')
     path = body_path(root, event)
@@ -167,6 +167,8 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     write_json(journal, dict(size=event['size'], sha256=event['sha256'], ranges=additional, salvage_cursor=cursor, control_imported=True))
     total = event['size']
     missing_bytes = total - sum(end - start for start, end in ranges)
+    if not missing_bytes:
+        return ranges
     if shutil.disk_usage(root).free < missing_bytes + tuning['free_space_mib'] * 1024 ** 2:
         raise RuntimeError('Insufficient disk space for range recovery')
     rate_lock = Lock()
@@ -226,6 +228,25 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
             return bounds, None, 'HTTP ' + str(error.code) if hasattr(error, 'code') else type(error).__name__
     attempts = []
     max_passes = tuning['range_max_passes'] or min(4, 2 * retries) + 2
+    source = json.loads((root / '.download/source.json').read_text())['source']
+    metadata_path = event['path']
+    def refresh():
+        nonlocal metadata_path
+        try:
+            fresh = api(source, metadata_path)
+        except urllib.error.HTTPError as error:
+            if error.code != 404 or event['course'] != '.':
+                raise
+            fresh = api(source)
+            if fresh.get('type') != 'file' or '/' + fresh.get('name', '') != event['path']:
+                raise ValueError('Source file disappeared; refuse to combine ranges')
+            metadata_path = '/'
+        if (fresh.get('size'), fresh.get('sha256')) != (event['size'], event['sha256']):
+            raise ValueError('Source file changed or disappeared; refuse to combine ranges')
+        from download import target
+        target(root, dict(fresh, path=event['path']), event['course'])
+        return fresh
+    item = refresh()
     failed_count = 0
     remaining_span = total
     for attempt in range(1, max_passes + 1):
@@ -254,11 +275,8 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                     pause = min(delay, 0.25)
                     time.sleep(pause)
                     delay -= pause
-        source = json.loads((root / '.download/source.json').read_text())['source']
-        fresh = next((row for row in files(source, '/' + event['course']) if row['path'] == event['path']), None)
-        if not fresh or (fresh['size'], fresh['sha256']) != (event['size'], event['sha256']):
-            raise ValueError('Source file changed or disappeared; refuse to combine ranges')
-        item = fresh
+        if attempts and any(row['error'] in ('HTTP 401', 'HTTP 403') for row in attempts[-1]['ranges']):
+            item = refresh()
         outcomes = []
         def save_result(future):
             nonlocal additional, ranges

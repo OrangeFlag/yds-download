@@ -122,7 +122,7 @@ class ReviewRegression(unittest.TestCase):
         self.body.write_bytes(b'B' * self.item['size'])
         self.journal(self.body, [[0, self.item['size']]])
         old_body = self.body
-        with patch.object(download, 'files', return_value=[self.item]), \
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), \
                 patch.object(download.OPENER, 'open', side_effect=self.serve), \
                 patch.object(recovery, 'promote_partial', side_effect=AssertionError('Bad SHA promoted')):
             self.assertTrue(recovery.finish_recovery(self.root, self.event, self.item, retries=0))
@@ -165,7 +165,7 @@ class ReviewRegression(unittest.TestCase):
             if request.full_url.endswith('/old'):
                 raise urllib.error.HTTPError('hidden', 403, '', {}, None)
             return self.serve(request, timeout)
-        with patch.object(download, 'files', return_value=[fresh]), patch.object(download.OPENER, 'open', side_effect=serve):
+        with patch.object(download, 'api', return_value=fresh), patch.object(download, 'files', return_value=[fresh]), patch.object(download.OPENER, 'open', side_effect=serve):
             ranges = recovery.retry_ranges(self.root, self.event, self.item, 2)
         self.assertEqual(ranges, [[0, self.item['size']]])
         self.assertIn(fresh['file'], urls)
@@ -176,7 +176,7 @@ class ReviewRegression(unittest.TestCase):
             if any(start <= bad <= last for bad in (0, 1024 ** 2)):
                 raise urllib.error.HTTPError('hidden', 500, '', {}, None)
             return self.serve(request, timeout)
-        with patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=serve):
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=serve):
             ranges = recovery.retry_ranges(self.root, self.event, self.item, 2)
         self.assertGreater(sum(end - start for start, end in ranges), 1024 ** 2)
 
@@ -184,7 +184,7 @@ class ReviewRegression(unittest.TestCase):
         def serve(request, timeout):
             start, last = map(int, request.get_header('Range')[6:].split('-'))
             return Response(start, last + 1, self.item['size'], self.content[start:start + 100], timeout=True)
-        with patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=serve):
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=serve):
             ranges = recovery.retry_ranges(self.root, self.event, self.item, 0)
         self.assertGreater(sum(end - start for start, end in ranges), 0)
 
@@ -192,7 +192,7 @@ class ReviewRegression(unittest.TestCase):
         original = self.root / 'Course/video.mp4'
         original.parent.mkdir()
         original.write_bytes(b'B' * self.item['size'])
-        with patch.object(download, 'files', return_value=[self.item]), \
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), \
                 patch.object(download.OPENER, 'open', side_effect=self.serve):
             recovery.recover_corrupted(self.root, self.source, retries=0, retry=True)
         self.assertTrue(self.body.exists())
@@ -239,7 +239,7 @@ class ReviewRegression(unittest.TestCase):
             start, last = map(int, request.get_header('Range')[6:].split('-'))
             end = min(last + 1, start + 100)
             return Response(start, end, self.item['size'], self.content[start:end])
-        with patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=serve):
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=serve):
             ranges = recovery.retry_ranges(self.root, self.event, self.item, 0)
         self.assertGreater(sum(end - start for start, end in ranges), 0)
 
@@ -247,7 +247,7 @@ class ReviewRegression(unittest.TestCase):
         def interrupt(futures, **kwargs):
             wait_for_requests(futures)
             raise KeyboardInterrupt
-        with patch.object(download, 'files', return_value=[self.item]), \
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), \
                 patch.object(download.OPENER, 'open', side_effect=self.serve), \
                 patch.object(recovery, 'wait', side_effect=interrupt):
             with self.assertRaises(KeyboardInterrupt):
@@ -311,7 +311,7 @@ class ReviewRegression(unittest.TestCase):
         self.assertIn('progress_error', progress.progress(self.body, self.item['size'], sha256=self.item['sha256']))
         Path(str(self.body) + '.ranges.json').unlink()
         self.assertIsNone(progress.progress(self.body, self.item['size'], sha256=self.item['sha256'])['downloaded_bytes'])
-        with patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=self.serve):
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=self.serve):
             recovery.retry_ranges(self.root, self.event, self.item, 0)
         self.assertEqual(self.body.read_bytes(), self.content)
         self.assertEqual(control.read_bytes(), b'\x00\x01')
@@ -397,7 +397,7 @@ class ReviewRegression(unittest.TestCase):
             if start < 16 * block:
                 raise urllib.error.HTTPError(request.full_url, 500, 'Unavailable', {}, None)
             return self.serve(request, timeout)
-        with patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=serve):
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=serve):
             self.assertFalse(recovery.finish_recovery(self.root, self.event, self.item, retries=0))
         self.assertEqual(self.event['downloaded_bytes'], 10 * block)
         self.assertFalse((self.state / 'partial-copies.json').exists())
@@ -406,7 +406,7 @@ class ReviewRegression(unittest.TestCase):
         self.body.write_bytes(self.content)
         self.journal(self.body, [[0, 3 * self.item['size'] // 4]])
         error = urllib.error.HTTPError('https://example.invalid', 500, 'Unavailable', {}, None)
-        with patch.object(download, 'files', side_effect=error):
+        with patch.object(download, 'api', side_effect=error), patch.object(download, 'files', side_effect=error):
             recovery.recover_corrupted(self.root, self.source, retry=True)
         copy = json.loads((self.state / 'partial-copies.json').read_text())[0]
         self.assertEqual(copy['downloaded_percent'], 75)
@@ -416,7 +416,7 @@ class ReviewRegression(unittest.TestCase):
         self.body.write_bytes(self.content)
         self.journal(self.body, [[0, 3 * self.item['size'] // 4]])
         error = urllib.error.HTTPError('https://example.invalid', 500, 'Unavailable', {}, None)
-        with patch.object(download, 'files', side_effect=error):
+        with patch.object(download, 'api', side_effect=error), patch.object(download, 'files', side_effect=error):
             self.assertTrue(recovery.finish_recovery(self.root, self.event, self.item, retries=0))
         copy = json.loads((self.state / 'partial-copies.json').read_text())[0]
         self.assertEqual(copy['downloaded_percent'], 75)
@@ -425,7 +425,7 @@ class ReviewRegression(unittest.TestCase):
         self.item['size'] = 33 * 16 * 1024 ** 2
         self.event['size'] = self.item['size']
         error = urllib.error.HTTPError('https://example.invalid', 500, 'Unavailable', {}, None)
-        with patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=error):
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=error):
             recovery.retry_ranges(self.root, self.event, self.item, 2)
         attempts = self.event['range_attempts']
         self.assertEqual(len(attempts), 2)
@@ -444,7 +444,7 @@ class ReviewRegression(unittest.TestCase):
             if start == 0:
                 raise urllib.error.HTTPError(request.full_url, 500, 'Unavailable', {}, None)
             return self.serve(request, timeout)
-        with patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=serve):
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), patch.object(download.OPENER, 'open', side_effect=serve):
             ranges = recovery.retry_ranges(self.root, self.event, self.item, 2)
         second = self.event['range_attempts'][1]
         self.assertEqual(sorted((r['start'], r['end']) for r in second['ranges']),
@@ -466,7 +466,7 @@ class ReviewRegression(unittest.TestCase):
             if start < 16 * block:
                 raise urllib.error.HTTPError(request.full_url, 500, 'Unavailable', {}, None)
             return self.serve(request, timeout)
-        with patch.object(download, 'files', return_value=[self.item]), \
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), \
                 patch.object(download.OPENER, 'open', side_effect=serve):
             self.assertFalse(recovery.finish_recovery(self.root, self.event, self.item, retries=0))
         self.assertEqual(self.event['downloaded_bytes'], 10 * block)
@@ -493,7 +493,7 @@ class ReviewRegression(unittest.TestCase):
             self.assertFalse(Path(str(original) + '.aria2').exists())
             return 1
         error = urllib.error.HTTPError('https://example.invalid', 500, 'Unavailable', {}, None)
-        with patch.object(download, 'files', return_value=[self.item]), \
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), \
                 patch('pipeline.transfer_process', side_effect=aria), \
                 patch.object(download.OPENER, 'open', side_effect=error):
             self.assertEqual(download.download(dict(source=self.source, title='test'),
@@ -511,7 +511,7 @@ class ReviewRegression(unittest.TestCase):
         half = self.item['size'] // 2
         def prefix(request, timeout):
             return Response(0, half, self.item['size'], self.content[:half])
-        with patch.object(download, 'files', side_effect=[[self.item], KeyboardInterrupt]), \
+        with patch.object(download, 'api', return_value=self.item), patch.object(recovery.time, 'sleep', side_effect=KeyboardInterrupt), \
                 patch.object(download.OPENER, 'open', side_effect=prefix):
             with self.assertRaises(KeyboardInterrupt):
                 recovery.finish_recovery(self.root, self.event, self.item, retries=0)
@@ -523,7 +523,7 @@ class ReviewRegression(unittest.TestCase):
         def serve(request, timeout):
             starts.append(int(request.get_header('Range')[6:].split('-')[0]))
             return self.serve(request, timeout)
-        with patch.object(download, 'files', return_value=[self.item]), \
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), \
                 patch.object(download.OPENER, 'open', side_effect=serve):
             recovery.recover_corrupted(self.root, self.source, retries=0, retry=True)
         self.assertEqual(starts, [half])
@@ -538,7 +538,7 @@ class ReviewRegression(unittest.TestCase):
         original.parent.mkdir()
         original.write_bytes(self.content)
         error = urllib.error.HTTPError('https://example.invalid', 500, 'Unavailable', {}, None)
-        with patch.object(download, 'files', return_value=[self.item]), \
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), \
                 patch.object(download.OPENER, 'open', side_effect=error), \
                 patch('pipeline.transfer_process', side_effect=AssertionError('Ready file requeued')):
             self.assertEqual(download.download(dict(source=self.source, title='test'),
@@ -558,7 +558,7 @@ class ReviewRegression(unittest.TestCase):
         copy = dict(self.event, source=self.source, status='valid',
                     local=str(self.root / 'removed-external.mp4'), mtime_ns=0)
         download.write_json(self.state / 'local-copies.json', [copy])
-        with patch.object(download, 'files', return_value=[self.item]), \
+        with patch.object(download, 'api', return_value=self.item), patch.object(download, 'files', return_value=[self.item]), \
                 patch.object(download.OPENER, 'open', side_effect=AssertionError('Deep downloaded')):
             self.assertEqual(download.download(dict(source=self.source, title='test'),
                                              ['Course'], self.root, retries=0, deep=True), 0)
