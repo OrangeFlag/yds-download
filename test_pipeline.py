@@ -2,6 +2,8 @@
 import hashlib
 from collections import namedtuple
 import json
+import os
+import signal
 from pathlib import Path
 import tempfile
 import sys
@@ -92,6 +94,22 @@ class PipelineChecks(unittest.TestCase):
         with patch('builtins.print') as message:
             self.assertEqual(download.cli(Mock(side_effect=KeyboardInterrupt)), 130)
         message.assert_called_once_with('STOPPED: interrupted; resume state retained', flush=True)
+
+    def test_repeated_sigint_does_not_interrupt_cleanup_or_stop_message(self):
+        cleaned = []
+        previous = signal.getsignal(signal.SIGINT)
+        def entrypoint():
+            try:
+                os.kill(os.getpid(), signal.SIGINT)
+            finally:
+                os.kill(os.getpid(), signal.SIGINT)
+                cleaned.append(True)
+        def stop_message(*args, **kwargs):
+            os.kill(os.getpid(), signal.SIGINT)
+        with patch('builtins.print', side_effect=stop_message):
+            self.assertEqual(download.cli(entrypoint), 130)
+        self.assertEqual(cleaned, [True])
+        self.assertEqual(signal.getsignal(signal.SIGINT), previous)
 
     def test_queue_interrupt_stops_and_reaps_download_process(self):
         process = Mock()

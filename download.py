@@ -10,6 +10,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import signal
 import subprocess
 import time
 from threading import RLock, Lock
@@ -595,11 +596,19 @@ def main():
 
 
 def cli(entrypoint):
+    def interrupt(signum, frame):
+        # systemd and the queue parent may both signal the same child.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGINT, interrupt)
     try:
         return entrypoint()
     except KeyboardInterrupt:
         print('STOPPED: interrupted; resume state retained', flush=True)
         return 130
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 if __name__ == '__main__':
