@@ -41,6 +41,12 @@ def copy_saved(source, destination):
 
 
 def promote_partial(root, event):
+    from download import STATE_LOCK
+    with STATE_LOCK:
+        return _promote_partial(root, event)
+
+
+def _promote_partial(root, event):
     from download import write_json
     if event.get('sha256_mismatch'):
         return False
@@ -148,7 +154,7 @@ def expand_probes(ranges, total, outcomes, block, limit, minimum, discoveries=No
     return planned
 
 
-def retry_ranges(root, event, item, retries, tuning=None, stopping=None, download_active=None):
+def retry_ranges(root, event, item, retries, tuning=None, stopping=None, download_active=None, request_budget=None):
     tuning = resolve(tuning)
     from download import OPENER, write_json, api
     if item['size'] != event['size'] or item['sha256'] != event['sha256']:
@@ -176,6 +182,12 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     foreground_limit = Lock()
     next_request = 0.0
     def fetch(bounds):
+        if request_budget is not None:
+            try:
+                with request_budget.request(stopping):
+                    return fetch_range(bounds)
+            except InterruptedError:
+                return bounds, None, 'Interrupted'
         if download_active is not None and download_active.is_set():
             while not foreground_limit.acquire(timeout=0.25):
                 if stopping.is_set():
@@ -420,14 +432,14 @@ def recovery_state(root, event, state):
         write_json(path, ledger)
 
 
-def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False):
+def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None):
     if event.get('sha256_rejected_paths'):
         _redownload = False
     if item is None:
-        return _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background)
+        return _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background, request_budget)
     recovery_state(root, event, 'running')
     try:
-        result = _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background)
+        result = _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background, request_budget)
     except ValueError:
         recovery_state(root, event, 'finished')
         raise
@@ -435,13 +447,13 @@ def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=
     return result
 
 
-def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False):
+def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None):
     from download import record, target, write_json, sha256_file, inspect
     path = body_path(root, event)
     if item:
         try:
             if background:
-                retry_ranges(root, event, item, retries, tuning, stopping, download_active)
+                retry_ranges(root, event, item, retries, tuning, stopping, download_active, request_budget)
             else:
                 retry_ranges(root, event, item, retries, tuning)
         except InterruptedError:
@@ -483,7 +495,7 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
             event.setdefault('sha256_rejected_paths', []).append(event['corrupted_path'])
             new_recovery_body(root, event, 'SHA-256 mismatch; retry in a separate body')
             return finish_recovery(root, event, item, retries, _redownload=False, tuning=tuning,
-                                   stopping=stopping, download_active=download_active, background=background)
+                                   stopping=stopping, download_active=download_active, background=background, request_budget=request_budget)
         if digest == event['sha256'] and item:
             destination = target(root, item, event['course'])
             control = Path(str(destination) + '.aria2')

@@ -1,4 +1,6 @@
 """Adaptive salvage must find distant islands without claiming unprobed holes."""
+from contextlib import contextmanager
+from threading import Event
 import hashlib
 import json
 from pathlib import Path
@@ -34,6 +36,36 @@ class AdaptiveRangeTest(unittest.TestCase):
         with patch.object(download, 'api', return_value=self.item), \
                 patch.object(download.OPENER, 'open', side_effect=serve):
             return recovery.retry_ranges(self.root, self.event, self.item, 2, self.tuning)
+
+    def test_shared_budget_stop_retains_other_completed_response(self):
+        stopping = Event()
+        reading = Event()
+        class Budget:
+            calls = 0
+            @contextmanager
+            def request(self, _):
+                self.calls += 1
+                if self.calls == 2:
+                    self_reading = reading.wait(2)
+                    stopping.set()
+                    if not self_reading:
+                        raise AssertionError('First request did not start')
+                    raise InterruptedError('Stopped while waiting for budget')
+                yield
+        class SlowResponse(Response):
+            def read1(response, size):
+                reading.set()
+                if not stopping.wait(2):
+                    raise AssertionError('Stop did not arrive')
+                return super(SlowResponse, response).read1(size)
+        def serve(request, timeout):
+            return SlowResponse(0, 64 * 1024, len(self.content), self.content[:64 * 1024])
+        tuning = dict(self.tuning, range_workers=2, range_block_size_kib=64, range_max_passes=1)
+        with patch.object(download, 'api', return_value=self.item), patch.object(download.OPENER, 'open', side_effect=serve):
+            with self.assertRaises(InterruptedError):
+                recovery.retry_ranges(self.root, self.event, self.item, 2, tuning, stopping=stopping, request_budget=Budget())
+        self.assertEqual(saved_ranges(self.body, len(self.content), self.item['sha256']), [[0, 64 * 1024]])
+        self.assertEqual(self.body.read_bytes(), self.content[:64 * 1024])
 
     def test_distant_island_is_discovered_and_expanded_with_fixed_budget(self):
         calls = []

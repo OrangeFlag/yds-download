@@ -15,6 +15,7 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('queue', type=Path)
+    parser.add_argument('--defer-range', action='store_true', help='Continue archives while range_queue.py recovers failures')
     args = parser.parse_args()
     path = args.queue.resolve()
     with path.with_suffix('.lock').open('a') as lock:
@@ -36,8 +37,15 @@ def main():
                     raise RuntimeError('Current archive did not finish; queue remains paused')
         data = json.loads(path.read_text())
         for job in data['archives']:
-            if not job.get('enabled', True) or (job.get('state') == 'finished' and not (data.get('deep', False) or data.get('retry_check', False))):
+            if not job.get('enabled', True) or ((job.get('state') == 'finished' or (args.defer_range and job.get('downloads_complete'))) and not (data.get('deep', False) or data.get('retry_check', False))):
                 continue
+            if args.defer_range and not (data.get('deep') or data.get('retry_check')):
+                summary_path = Path(job['destination']) / '.download/summary.json'
+                summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+                if summary.get('downloads_complete'):
+                    job.update(downloads_complete=True, state='recovering' if summary.get('pending_courses') else 'finished')
+                    write_json(path, data)
+                    continue
             previous_state = job.get('state', 'pending')
             if not (data.get('deep') and not data.get('retry_check')):
                 job['state'] = 'running'
@@ -47,6 +55,8 @@ def main():
                        '--catalog', job['catalog'], '--destination', job['destination'],
                        '--retries', str(data.get('retries', 2))]
             command += arguments({**data.get('tuning', {}), **job.get('tuning', {})})
+            if args.defer_range and not data.get('deep'):
+                command += ['--defer-range']
             if data.get('retry_check', False):
                 command += ['--retry-check']
             if data.get('deep', False):
@@ -62,8 +72,26 @@ def main():
                 write_json(path, data)
                 raise RuntimeError('Download stopped: ' + job['title'] + '; exit=' + str(code))
             job['state'] = previous_state if data.get('deep') and not data.get('retry_check') else 'finished'
+            if args.defer_range and not data.get('deep'):
+                summary = json.loads((Path(job['destination']) / '.download/summary.json').read_text())
+                job['downloads_complete'] = summary.get('downloads_complete', False)
+                if summary.get('pending_courses'):
+                    job['state'] = 'recovering'
             write_json(path, data)
             print('ARCHIVE FINISHED: ' + job['title'] + '; exit=' + str(code), flush=True)
+        if args.defer_range:
+            while any(job.get('state') == 'recovering' for job in data['archives']):
+                changed = False
+                for job in data['archives']:
+                    if job.get('state') != 'recovering':
+                        continue
+                    summary = json.loads((Path(job['destination']) / '.download/summary.json').read_text())
+                    if summary.get('downloads_complete') and not summary.get('pending_courses'):
+                        job.update(state='finished', exit_code=1 if summary.get('failed') else 0)
+                        changed = True
+                if changed:
+                    write_json(path, data)
+                time.sleep(10)
         print('ALL ARCHIVES PROCESSED', flush=True)
 
 if __name__ == '__main__':

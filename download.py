@@ -271,11 +271,11 @@ def list_course(source, course, retries=2, retry_delay=60):
             time.sleep(retry_delay)
 
 
-def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None):
+def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None, defer_range=False):
     if deep:
         return download_deep(data, courses, root, retries, report_repo, mark, git_push, deep, retry_check, tuning)
     from pipeline import run
-    return run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning)
+    return run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range)
 
 
 def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None):
@@ -527,6 +527,7 @@ def main():
     fetching.add_argument('--include', action='append', help='Exact course name; repeatable')
     fetching.add_argument('--exclude', action='append', default=[], help='Exact course name; repeatable')
     fetching.add_argument('--retry-check', action='store_true', help='Retry independent missing ranges of previous failures before ordinary courses')
+    fetching.add_argument('--defer-range', action='store_true', help='Leave durable Range tasks for range_queue.py')
     fetching.add_argument('--deep', action='store_true', help='Verify local SHA-256 without downloading; combine with --retry-check to repair')
     fetching.add_argument('--retries', type=int, default=2, help='Retries after the first attempt (default: 2)')
     fetching.add_argument('--report-repo', type=Path, help='Update course cards after each course')
@@ -586,7 +587,7 @@ def main():
             available = {item['name'] for item in catalog(data['source'])['courses']}
             if {PurePosixPath(name).parts[0] for name in chosen} - available:
                 raise ValueError('Selected courses no longer exist in the source folder')
-        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep, args.retry_check, tuning)
+        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep, args.retry_check, tuning, args.defer_range)
     except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(2, f'Error: {error}\n')
 

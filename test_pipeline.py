@@ -129,6 +129,19 @@ class PipelineChecks(unittest.TestCase):
         self.assertEqual(self.calls, ['First', 'Second'])
         self.assertEqual(json.loads((self.root / '.download/01-status.json').read_text())['state'], 'finished')
 
+    def test_deferred_range_leaves_durable_work_without_waiting(self):
+        self.items['First']['size'] = 20
+        with patch.object(recovery, 'retry_ranges', side_effect=AssertionError('Range blocked archive handoff')):
+            self.assertEqual(self.run_download(defer_range=True), 1)
+        state = self.root / '.download'
+        jobs = [json.loads(path.read_text()) for path in (state / 'tasks').glob('*.json')]
+        self.assertEqual([(job['course'], job['state']) for job in jobs if job['kind'] == 'range'], [('First', 'pending')])
+        self.assertEqual(json.loads((state / '01-status.json').read_text())['state'], 'recovering')
+        self.assertTrue(json.loads((state / 'summary.json').read_text())['downloads_complete'])
+        with patch('pipeline.transfer_process', side_effect=AssertionError('Ordinary download repeated')):
+            with patch.object(download, 'list_course', side_effect=lambda source, course, *args: [self.items[course]]):
+                self.assertEqual(download.download(self.data, ['First', 'Second'], self.root, retries=0, defer_range=True), 1)
+
     def test_sha_mismatch_has_bounded_fresh_downloads(self):
         bad = self.root / 'First/video.mp4'
         bad.parent.mkdir()

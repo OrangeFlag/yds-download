@@ -1,4 +1,5 @@
 """Update existing backup course cards from verified downloader events."""
+import fcntl
 import json
 from local_paths import local_path
 import os
@@ -17,6 +18,16 @@ def normalized(value):
 
 
 def update_report(destination, repo, mark, git_push=False, message=None):
+    repo = repo.resolve()
+    if (repo / ".git").exists():
+        common = Path(subprocess.check_output(["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True).strip())
+        with (common / "yds-report.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return _update_report(destination, repo, mark, git_push, message)
+    return _update_report(destination, repo, mark, git_push, message)
+
+
+def _update_report(destination, repo, mark, git_push=False, message=None):
     from download import read_events
     if not mark or any(c in mark for c in '|\n\r'):
         raise ValueError('Mark must be nonempty and contain no pipes or line breaks')

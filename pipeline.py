@@ -52,13 +52,21 @@ def failure_manifests(root, event):
 
 
 class Background:
-    def __init__(self, root, source, retries, tuning):
+    def __init__(self, root, source, retries, tuning, defer_range=False, range_pool=None, budget=None):
         self.root, self.source, self.retries, self.tuning = root, source, retries, tuning
         self.state = root / '.download'
         self.directory = self.state / 'tasks'
         self.directory.mkdir(exist_ok=True)
         self.pools = {kind: ThreadPoolExecutor(max_workers=1, thread_name_prefix=kind) for kind in ('sha', 'range')}
         self.futures = {}
+        self.jobs = {}
+        self.deferred = {}
+        self.defer_range = defer_range
+        self.budget = budget
+        self.shared_pool = range_pool
+        if range_pool is not None:
+            self.pools['range'].shutdown()
+            self.pools['range'] = range_pool
         self.stopping = Event()
         self.download_active = Event()
         self.wake = Event()
@@ -107,6 +115,10 @@ class Background:
                     if saved.get('state') == 'finished':
                         job.update(state='done', result=dict(event=proof))
         d.write_json(path, job)
+        self.jobs[path] = job
+        if kind == 'range' and self.defer_range:
+            self.deferred[path] = job
+            return
         self.futures[path] = self.pools[kind].submit(self.work, path, job)
         self.futures[path].add_done_callback(lambda future: self.wake.set())
 
@@ -134,7 +146,8 @@ class Background:
             event = job['event']
             try:
                 r.finish_recovery(self.root, event, job['item'], self.retries, tuning=self.tuning,
-                                  stopping=self.stopping, download_active=self.download_active, background=True)
+                                  stopping=self.stopping, download_active=self.download_active if self.budget is None else None,
+                                  background=True, request_budget=self.budget)
             except InterruptedError:
                 raise
             except (ValueError, FileExistsError) as error:
@@ -208,6 +221,7 @@ class Background:
             job['state'] = 'applied'
             d.write_json(path, job)
             del self.futures[path]
+            self.jobs.pop(path, None)
 
     def transfer(self, pending, course, previous_attempt=0):
         if previous_attempt:
@@ -268,10 +282,12 @@ class Background:
     def close(self):
         self.stopping.set()
         for pool in self.pools.values():
+            if pool is self.shared_pool:
+                continue
             pool.shutdown(wait=True, cancel_futures=True)
 
 
-def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning):
+def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range=False):
     tuning = resolve(tuning)
     if not all(shutil.which(name) for name in ('aria2c', 'cp')):
         raise RuntimeError('Install aria2c and coreutils first')
@@ -285,12 +301,14 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
         if identity.exists() and json.loads(identity.read_text())['source'] != source:
             raise ValueError('Use a separate destination for a different public folder/year')
         d.write_json(identity, dict(source=source, title=data['title']))
-        d.write_json(state / 'settings.json', dict(retries=retries, deep=False, retry_check=retry_check, tuning=tuning))
+        d.write_json(state / 'settings.json', dict(retries=retries, deep=False, retry_check=retry_check, tuning=tuning, defer_range=defer_range))
         events = {row['path']: row for row in d.read_events(state / 'events.jsonl', repair=True)}
         history_path = state / 'course-history.json'
         history = json.loads(history_path.read_text()) if history_path.exists() else {}
         for path in state.glob('*-status.json'):
             old = json.loads(path.read_text())
+            if not isinstance(old, dict):
+                continue
             if old.get('state') == 'running' and not old.get('time'):
                 old['time'] = datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat()
             if old.get('source') == source and old.get('time', '') >= history.get(old['course'], {}).get('time', ''):
@@ -318,7 +336,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
         for index, course in enumerate(courses, 1):
             lines += [f'{index:02d}. {course}', source.rstrip('/') + '/' + d.urllib.parse.quote(course, safe=''), '']
         (root / 'Порядок скачивания.txt').write_text('\n'.join(lines))
-        background = Background(root, source, retries, tuning)
+        background = Background(root, source, retries, tuning, defer_range=defer_range)
         for path in background.directory.glob('*.json'):
             job = json.loads(path.read_text())
             if (job['source'] == source and job['course'] in courses
@@ -326,12 +344,20 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                     and background.continuation(job['item']).get('phase') == 'verifying'):
                 background.submit('sha', job['item'], job['course'], job['attempt'])
         active = {}
+        event_stamp = None
+        proofs = {}
+        last_summary = None
 
         def finalize():
+            nonlocal event_stamp, proofs, last_summary
             background.poll()
-            proofs = {row['path']: row for row in d.read_events(state / 'events.jsonl')}
+            event_path = state / 'events.jsonl'
+            stamp = Background.stat(event_path) if event_path.exists() else None
+            if stamp != event_stamp:
+                proofs = {row['path']: row for row in d.read_events(event_path)}
+                event_stamp = stamp
             for course, (index, entries) in list(active.items()):
-                jobs = [json.loads(path.read_text()) for path in background.futures if json.loads(path.read_text())['course'] == course]
+                jobs = [job for job in background.jobs.values() if job['course'] == course]
                 waiting = bool(background.transferring == course or jobs or any(name == course for _, name, _ in background.retry))
                 valid = 0
                 for item in entries:
@@ -363,15 +389,16 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                          failed=sum(history.get(course, {}).get('failed', 0) for course in courses),
                          pending_courses=list(active), complete=False)
             summary_path = state / 'summary.json'
-            if not summary_path.exists() or json.loads(summary_path.read_text()) != summary:
+            if last_summary != summary:
                 d.write_json(summary_path, summary)
+                last_summary = summary
 
         background.on_tick = finalize
         try:
             for index, course in enumerate(courses, 1):
                 background.retry_ready()
                 finalize()
-                events.update({row['path']: row for row in d.read_events(state / 'events.jsonl') if row['status'] == 'valid'})
+                events.update({path: row for path, row in proofs.items() if row['status'] == 'valid'})
                 previous = history.get(course, {})
                 if previous.get('state') == 'finished' and previous.get('source') == source and not (retry_check and previous.get('failed')):
                     d.write_json(state / f'{index:02d}-status.json', previous)
@@ -453,6 +480,6 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             background.close()
         failed = sum(history[course]['failed'] for course in courses)
         verified = sum(history[course]['verified'] for course in courses)
-        d.write_json(state / 'summary.json', dict(verified=verified, failed=failed, pending_courses=[], complete=not failed))
+        d.write_json(state / 'summary.json', dict(verified=verified, failed=failed, pending_courses=list(active), downloads_complete=True, complete=not failed and not active))
         print(f'ALL SELECTED COURSES PROCESSED: verified={verified}, failed={failed}', flush=True)
-        return 1 if failed else 0
+        return 1 if failed or active else 0
