@@ -98,6 +98,28 @@ class PipelineChecks(unittest.TestCase):
         process.send_signal.assert_called_once_with(pipeline.signal.SIGINT)
         self.assertEqual(process.wait.call_count, 2)
 
+    def test_restart_applies_saved_sha_before_earlier_course_transfer(self):
+        state = self.root / '.download'
+        state.mkdir()
+        second = self.root / 'Second/video.mp4'
+        second.parent.mkdir()
+        second.write_bytes(self.content)
+        background = pipeline.Background(self.root, self.data['source'], 0, pipeline.resolve())
+        background.checkpoint(self.items['Second'], 'Second', 1, 'verifying')
+        background.submit('sha', self.items['Second'], 'Second', 1)
+        next(iter(background.futures.values())).result()
+        background.close()
+        original = self.transfer
+        def transfer(command, **kwargs):
+            kwargs['on_tick']()
+            proofs = list(download.read_events(state / 'events.jsonl'))
+            self.assertTrue(any(row['path'] == self.items['Second']['path'] and row['status'] == 'valid' for row in proofs),
+                            'Saved result waited for its course to be reached')
+            return original(command, **kwargs)
+        with patch.object(download, 'list_course', side_effect=lambda source, course, *args: [self.items[course]]), \
+                patch('pipeline.transfer_process', side_effect=transfer):
+            self.assertEqual(download.download(self.data, ['First', 'Second'], self.root, retries=0), 0)
+
     def test_range_does_not_block_next_course(self):
         self.items['First']['size'] = 20
         def ranges(root, event, item, *args, **kwargs):

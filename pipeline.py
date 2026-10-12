@@ -319,6 +319,12 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             lines += [f'{index:02d}. {course}', source.rstrip('/') + '/' + d.urllib.parse.quote(course, safe=''), '']
         (root / 'Порядок скачивания.txt').write_text('\n'.join(lines))
         background = Background(root, source, retries, tuning)
+        for path in background.directory.glob('*.json'):
+            job = json.loads(path.read_text())
+            if (job['source'] == source and job['course'] in courses
+                    and job['kind'] == 'sha' and job['state'] == 'done'
+                    and background.continuation(job['item']).get('phase') == 'verifying'):
+                background.submit('sha', job['item'], job['course'], job['attempt'])
         active = {}
 
         def finalize():
@@ -365,6 +371,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             for index, course in enumerate(courses, 1):
                 background.retry_ready()
                 finalize()
+                events.update({row['path']: row for row in d.read_events(state / 'events.jsonl') if row['status'] == 'valid'})
                 previous = history.get(course, {})
                 if previous.get('state') == 'finished' and previous.get('source') == source and not (retry_check and previous.get('failed')):
                     d.write_json(state / f'{index:02d}-status.json', previous)
