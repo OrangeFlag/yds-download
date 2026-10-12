@@ -17,7 +17,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('queue', type=Path)
     parser.add_argument('--defer-range', action='store_true', help='Continue archives while range_queue.py recovers failures')
+    parser.add_argument('--range-budget', type=Path, help='Shared budget directory for overlapping foreground and worker Range')
+    parser.add_argument('--range-files', type=int, default=16)
     args = parser.parse_args()
+    if args.range_budget is not None and (not args.defer_range or args.range_files < 1):
+        parser.error('--range-budget requires --defer-range and positive --range-files')
     path = args.queue.resolve()
     with path.with_suffix('.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -58,6 +62,8 @@ def main():
             command += arguments({**data.get('tuning', {}), **job.get('tuning', {})})
             if args.defer_range and not data.get('deep'):
                 command += ['--defer-range']
+                if args.range_budget is not None:
+                    command += ['--range-budget', str(args.range_budget.resolve()), '--range-files', str(args.range_files)]
             if data.get('retry_check', False):
                 command += ['--retry-check']
             if data.get('deep', False):

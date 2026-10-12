@@ -20,7 +20,7 @@ OPTIONS = {
     'retry_delay': (10, 0, None, 'Delay between download retries, seconds'),
     'listing_retry_delay': (60, 0, None, 'Delay between course-listing retries, seconds'),
     'free_space_mib': (1024, 0, None, 'Free space to retain in addition to required bytes, MiB'),
-    'range_workers': (4, 1, None, 'Simultaneous Range requests'),
+    'range_workers': (2, 1, None, 'Simultaneous Range requests'),
     'range_rps': (12.0, 0.01, None, 'Range requests/second per recovery'),
     'range_timeout': (30, 1, None, 'Range request timeout, seconds'),
     'range_retry_delay': (10, 0, None, 'Delay between Range passes, seconds'),

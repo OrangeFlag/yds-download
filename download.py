@@ -271,11 +271,11 @@ def list_course(source, course, retries=2, retry_delay=60):
             time.sleep(retry_delay)
 
 
-def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None, defer_range=False):
+def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None, defer_range=False, range_budget=None, range_files=16):
     if deep:
         return download_deep(data, courses, root, retries, report_repo, mark, git_push, deep, retry_check, tuning)
     from pipeline import run
-    return run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range)
+    return run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range, range_budget, range_files)
 
 
 def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None):
@@ -532,6 +532,8 @@ def main():
     fetching.add_argument('--retries', type=int, default=2, help='Retries after the first attempt (default: 2)')
     fetching.add_argument('--report-repo', type=Path, help='Update course cards after each course')
     fetching.add_argument('--mark', help='Custom copy owner mark for reports')
+    fetching.add_argument('--range-budget', type=Path, help='Shared budget directory; run Range during downloads and hand unfinished work off at archive end')
+    fetching.add_argument('--range-files', type=int, default=16, help='Range files during overlapping downloads (default: 16)')
     fetching.add_argument('--git-push', action='store_true', help='Commit and push reports after each course')
     add_arguments(fetching)
     salvage = commands.add_parser('recover', help='Retain videos with over 50 percent confirmed bytes next to originals')
@@ -587,7 +589,7 @@ def main():
             available = {item['name'] for item in catalog(data['source'])['courses']}
             if {PurePosixPath(name).parts[0] for name in chosen} - available:
                 raise ValueError('Selected courses no longer exist in the source folder')
-        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep, args.retry_check, tuning, args.defer_range)
+        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep, args.retry_check, tuning, args.defer_range, args.range_budget, args.range_files)
     except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(2, f'Error: {error}\n')
 

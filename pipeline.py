@@ -1,5 +1,5 @@
 """Ordered course transfers with durable SHA and Range background tasks."""
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from datetime import datetime
 import fcntl
 import hashlib
@@ -52,12 +52,12 @@ def failure_manifests(root, event):
 
 
 class Background:
-    def __init__(self, root, source, retries, tuning, defer_range=False, range_pool=None, budget=None):
+    def __init__(self, root, source, retries, tuning, defer_range=False, range_pool=None, budget=None, range_files=1):
         self.root, self.source, self.retries, self.tuning = root, source, retries, tuning
         self.state = root / '.download'
         self.directory = self.state / 'tasks'
         self.directory.mkdir(exist_ok=True)
-        self.pools = {kind: ThreadPoolExecutor(max_workers=1, thread_name_prefix=kind) for kind in ('sha', 'range')}
+        self.pools = {kind: ThreadPoolExecutor(max_workers=range_files if kind == 'range' else 1, thread_name_prefix=kind) for kind in ('sha', 'range')}
         self.futures = {}
         self.jobs = {}
         self.deferred = {}
@@ -198,7 +198,17 @@ class Background:
         for path, future in list(self.futures.items()):
             if not future.done():
                 continue
-            job = future.result()
+            try:
+                job = future.result()
+            except (CancelledError, InterruptedError):
+                if not self.stopping.is_set() or self.jobs[path]['kind'] != 'range':
+                    raise
+                job = self.jobs[path]
+                job.update(state='pending', time=now())
+                d.write_json(path, job)
+                self.deferred[path] = job
+                del self.futures[path]
+                continue
             item, course, attempt = job['item'], job['course'], job['attempt']
             result = job['result']
             if job['kind'] == 'sha':
@@ -287,7 +297,7 @@ class Background:
             pool.shutdown(wait=True, cancel_futures=True)
 
 
-def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range=False):
+def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range=False, range_budget=None, range_files=16):
     tuning = resolve(tuning)
     if not all(shutil.which(name) for name in ('aria2c', 'cp')):
         raise RuntimeError('Install aria2c and coreutils first')
@@ -336,7 +346,14 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
         for index, course in enumerate(courses, 1):
             lines += [f'{index:02d}. {course}', source.rstrip('/') + '/' + d.urllib.parse.quote(course, safe=''), '']
         (root / 'Порядок скачивания.txt').write_text('\n'.join(lines))
-        background = Background(root, source, retries, tuning, defer_range=defer_range)
+        budget = None
+        if range_budget is not None:
+            if not defer_range or range_files < 1:
+                raise ValueError('Overlapping Range requires --defer-range and positive --range-files')
+            from request_budget import ProcessRangeBudget
+            budget = ProcessRangeBudget(range_budget)
+        background = Background(root, source, retries, tuning, defer_range=defer_range and budget is None,
+                                budget=budget, range_files=range_files if budget else 1)
         for path in background.directory.glob('*.json'):
             job = json.loads(path.read_text())
             if (job['source'] == source and job['course'] in courses
@@ -469,12 +486,14 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                 if pending:
                     background.transfer(pending, course)
                 finalize()
-            while background.futures or background.retry:
+            while background.retry or any(background.jobs[path]['kind'] == 'sha' or not defer_range for path in background.futures):
                 background.retry_ready()
                 finalize()
                 if background.futures and not background.retry:
                     background.wake.wait(1)
                     background.wake.clear()
+            if budget is not None:
+                background.close()
             finalize()
         finally:
             background.close()

@@ -154,13 +154,17 @@ def finish_courses(background, config, changed_courses=()):
                  failed=failed, pending_courses=pending, downloads_complete=True, complete=not failed and not pending))
 
 
-def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None, secondary_slots=1):
+def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None, secondary_slots=1, budget_directory=None):
     if files < 1 or per_file < 1:
         raise ValueError('Range file limits must be positive')
     if not 1 <= secondary_slots <= max(1, files - 1):
         raise ValueError('Secondary slots must leave a slot for the first queue')
     stopping = stopping if stopping is not None else Event()
-    budget = RangeBudget(requests, rps)
+    if budget_directory is None:
+        budget = RangeBudget(requests, rps)
+    else:
+        from request_budget import ProcessRangeBudget
+        budget = ProcessRangeBudget(budget_directory, requests, rps)
     cache = JsonCache()
     roots = {}
     priorities = {}
@@ -278,6 +282,7 @@ def main():
     parser.add_argument('--requests-per-file', type=int, default=2)
     parser.add_argument('--requests', type=int, default=8)
     parser.add_argument('--rps', type=float, default=12)
+    parser.add_argument('--budget', type=Path, help='Share the HTTP budget with overlapping ordinary downloaders')
     args = parser.parse_args()
     stopping = Event()
     for number in (signal.SIGINT, signal.SIGTERM):
@@ -285,7 +290,7 @@ def main():
     # Prevent two workers from multiplying the global limits.
     with args.queue[0].with_suffix('.range.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots)
+        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget)
 
 
 if __name__ == '__main__':

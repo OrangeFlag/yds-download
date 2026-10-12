@@ -334,7 +334,7 @@ python3 download.py download --help
 | `--retry-delay` | `10` | Delay between download retries, seconds |
 | `--listing-retry-delay` | `60` | Delay between course-listing retries, seconds |
 | `--free-space-mib` | `1024` | Free space to retain in addition to required bytes, MiB |
-| `--range-workers` | `4` | Simultaneous Range requests |
+| `--range-workers` | `2` | Simultaneous Range requests |
 | `--range-rps` | `12` | Range requests/second per recovery |
 | `--range-timeout` | `30` | Range request timeout, seconds |
 | `--range-retry-delay` | `10` | Delay between Range passes, seconds |
@@ -456,3 +456,28 @@ journalctl --user -u yds-download-range.service -n 30
 и p95 времени до первых данных среди непустых ответов этого прохода. Сетевое
 время суммируется по параллельным запросам и может превышать время прохода.
 Эти измерения появляются у новых запросов; у прежних записей полей нет.
+
+### Range одновременно с обычным скачиванием
+
+Передайте всем трём процессам один каталог бюджета:
+
+```sh
+python3 semester_queue.py PERSONAL_QUEUE.json --defer-range --range-budget /data/.download/http-budget --range-files 16
+python3 semester_queue.py SEMESTER_QUEUE.json --defer-range --range-budget /data/.download/http-budget --range-files 16
+python3 range_queue.py --queue PERSONAL_QUEUE.json --queue SEMESTER_QUEUE.json --files 16 --secondary-slots 8 --budget /data/.download/http-budget
+```
+
+Загрузчик выполняет Range в отдельном пуле параллельно aria2 и SHA,
+сохраняя исключительное владение состоянием своего архива. После завершения
+обычных загрузок, SHA и повторных попыток он останавливает оставшиеся Range,
+сохраняет блоки и передаёт незавершённые задачи worker'у без ожидания их окончания.
+Бюджет ограничивает суммарно все процессы восемью Range HTTP-запросами и
+12 стартами запросов в секунду. Лимиты worker'а `--requests` / `--rps` должны
+совпадать с бюджетом загрузчиков (8 / 12); несовпадение отвергается.
+`--range-files` ограничивает файлы каждого загрузчика; `--range-workers` —
+запросы одного файла. Без `--range-budget` прежний отложенный режим сохраняется.
+
+Для личных папок с множеством таймаутов используйте фиксированные
+`download_concurrency: 8`, `auto_concurrency: false`, `range_retry_delay: 3`
+в `tuning` очереди. Поднимайте параллельность до 16 после измерения темпа
+обработки и нагрузки диска; действующие таймауты и проверки SHA сохраняются.
