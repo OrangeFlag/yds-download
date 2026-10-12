@@ -14,7 +14,8 @@ from threading import Event, Lock, Semaphore
 import time
 
 import download as d
-from pipeline import Background, now
+from pipeline import Background, failure_manifests, now
+import recovery as r
 from settings import resolve
 
 
@@ -86,8 +87,19 @@ def retire_cached_copy(background, path, job, proofs):
         if ((stat.st_size, stat.st_mtime_ns) != (item['size'], proof['mtime_ns'])
                 or not local.is_file() or Path(str(local) + '.aria2').exists()):
             continue
+        recovery_path = background.state / 'recovery-state.json'
+        saved = json.loads(recovery_path.read_text()).get(item['path'], {}).get('event', {}) if recovery_path.exists() else {}
+        previous = saved if (saved.get('size'), saved.get('sha256')) == (item['size'], item['sha256']) else job.get('event', {})
+        archived = previous.get('corrupted_path')
+        if archived:
+            r.body_path(background.root, dict(corrupted_path=archived))
         event = d.record(background.state, item, job['course'], job['attempt'], 'valid',
                          'Cached SHA-256 verified local copy; obsolete Range task retired', local=local)
+        event = dict(previous, **event, range_recovered_complete=True)
+        if archived:
+            event['corrupted_path'] = archived
+            failure_manifests(background.root, event)
+        r.recovery_state(background.root, event, 'finished')
         background.checkpoint(item, job['course'], job['attempt'], 'finished', event)
         job.update(state='applied', result={'event': event}, time=now(), superseded_by_local_copy=True)
         d.write_json(path, job)
@@ -106,7 +118,7 @@ def finish_courses(background, config, changed_courses=()):
                 if row.get('source', '').rstrip('/') == background.source.rstrip('/') and row.get('status') == 'valid'}
     jobs = [json.loads(path.read_text()) for path in background.directory.glob('*.json')]
     for index, course in enumerate(courses, 1):
-        pending = any(job['course'] == course and job['state'] != 'applied' for job in jobs)
+        pending = any(job['kind'] == 'range' and job['course'] == course and job['state'] != 'applied' for job in jobs)
         if history.get(course, {}).get('state') == 'finished' and not pending and course not in changed_courses:
             continue
         entries = json.loads((state / f'{index:02d}-manifest.json').read_text())
@@ -156,9 +168,10 @@ def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None):
                 # Poll applies every result under the archive's exclusive download lock.
                 for root, (background, lock, config) in list(roots.items()):
                     before = len(background.futures)
+                    changed_courses = {job['course'] for job in background.jobs.values()}
                     background.poll()
                     if len(background.futures) != before:
-                        finish_courses(background, config)
+                        finish_courses(background, config, changed_courses)
                 eligible = []
                 for priority, queue in enumerate(queues):
                     config = cache.read(queue)
@@ -194,7 +207,7 @@ def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None):
                                 raise
                             roots[root] = background, lock, config
                             priorities[root] = priority
-                            background.cached_events = {row['path']: row for row in d.read_events(state / 'events.jsonl')}
+                            background.cached_events = {row['path']: row for row in d.read_events(state / 'events.jsonl', repair=True)}
                             background.manifest_items = {(course, item['path']): (item['size'], item['sha256'])
                                 for index, course in enumerate(cache.read(state / 'courses.json'), 1)
                                 for item in cache.read(state / f'{index:02d}-manifest.json')}

@@ -88,7 +88,15 @@ class SharedRangeChecks(unittest.TestCase):
             source = 'https://disk.yandex.ru/d/test'
             job = dict(item=item, course='Course', attempt=3, source=source, state='pending')
             path = state / 'task.json'
+            job['event'] = dict(item, corrupted_path='corrupted/old/Course/video.mp4', course='Course', status='missing')
             d.write_json(path, job)
+            (root / 'corrupted/old').mkdir(parents=True)
+            d.write_json(root / 'corrupted/failed.json', [job['event']])
+            d.write_json(root / 'corrupted/old/failed.json', [job['event']])
+            (root / 'corrupted/new').mkdir()
+            latest = dict(job['event'], corrupted_path='corrupted/new/Course/video.mp4', range_attempts=[{'pass': 1}])
+            d.write_json(root / 'corrupted/new/failed.json', [latest])
+            d.write_json(state / 'recovery-state.json', {item['path']: dict(state='running', event=latest)})
             bg = SimpleNamespace(root=root, state=state, source=source, checkpoint=Mock())
             proof = dict(item, source=source, status='valid', local=str(local), mtime_ns=local.stat().st_mtime_ns)
             with patch.object(d, 'sha256_file', side_effect=AssertionError('Redundant SHA')):
@@ -101,6 +109,11 @@ class SharedRangeChecks(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text())['state'], 'applied')
             self.assertTrue(json.loads(path.read_text())['superseded_by_local_copy'])
             self.assertEqual(bg.checkpoint.call_args.args[3], 'finished')
+            self.assertEqual(json.loads((root / 'corrupted/failed.json').read_text()), [])
+            self.assertEqual(json.loads((root / 'corrupted/new/failed.json').read_text()), [])
+            self.assertEqual(json.loads((state / 'recovery-state.json').read_text())[item['path']]['event']['corrupted_path'], latest['corrupted_path'])
+            self.assertEqual(json.loads((state / 'recovery-state.json').read_text())[item['path']]['event']['range_attempts'], latest['range_attempts'])
+            self.assertEqual(json.loads((state / 'recovery-state.json').read_text())[item['path']]['state'], 'finished')
             self.assertEqual(d.read_events(state / 'events.jsonl')[-1]['local'], str(local))
 
     def test_finished_archive_retires_obsolete_range_without_network_or_sha(self):
@@ -149,6 +162,48 @@ class SharedRangeChecks(unittest.TestCase):
             self.assertTrue(json.loads((state / 'summary.json').read_text())['complete'])
             with (state / 'download.lock').open('a') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_legacy_recovery_repairs_journal_and_publishes_new_course_totals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / '.download'
+            (state / 'tasks').mkdir(parents=True)
+            source = 'https://disk.yandex.ru/d/test'
+            item = dict(path='/Course/video.mp4', size=7, sha256=hashlib.sha256(b'lecture').hexdigest(), file='https://example.invalid/video')
+            event = dict(item, course='Course', attempt=3, status='missing', time='2026-01-01', corrupted_path='corrupted/old/Course/video.mp4')
+            d.write_json(state / 'source.json', dict(source=source))
+            catalog = state / 'catalog.json'
+            d.write_json(catalog, dict(source=source))
+            d.write_json(state / 'settings.json', dict(retries=2, tuning=resolve()))
+            d.write_json(state / 'courses.json', ['Course'])
+            d.write_json(state / 'summary.json', dict(downloads_complete=True, pending_courses=[], failed=1))
+            d.write_json(state / 'course-history.json', {'Course': dict(state='finished', verified=0, failed=1)})
+            d.write_json(state / '01-manifest.json', [{k:v for k,v in item.items() if k != 'file'}])
+            (state / 'events.jsonl').write_text(json.dumps(event) + '\n{"path":')
+            d.write_json(state / 'tasks/stale-sha.json', dict(kind='sha', source=source, item=item, course='Course', attempt=1, state='running'))
+            key = hashlib.sha256(json.dumps([source, item['path'], item['size'], item['sha256'], 'range']).encode()).hexdigest()
+            task = state / 'tasks' / (key + '.json')
+            d.write_json(task, dict(kind='range', source=source, item=item, event=event, course='Course', attempt=3, state='pending'))
+            queue = state / 'queue.json'
+            d.write_json(queue, dict(report_repo=str(root / 'reports'), mark='Walterit', git_push=True, archives=[dict(state='finished', destination=str(root), catalog=str(catalog))]))
+            stopping = Event()
+            def recover(root, event, item, *args, **kwargs):
+                local = d.target(root, item, 'Course')
+                local.parent.mkdir()
+                local.write_bytes(b'lecture')
+                d.record(state, item, 'Course', 3, 'valid', 'SHA-256 verified')
+                event['range_recovered_complete'] = True
+            finish = q.finish_courses
+            def finalize(*args):
+                try:
+                    finish(*args)
+                finally:
+                    stopping.set()
+            with patch('recovery.finish_recovery', side_effect=recover), patch('report.update_report') as report, patch.object(q, 'finish_courses', side_effect=finalize):
+                q.run([queue], stopping=stopping)
+            self.assertTrue(json.loads((state / 'summary.json').read_text())['complete'])
+            report.assert_called_once()
+            self.assertEqual(d.read_events(state / 'events.jsonl')[-1]['status'], 'valid')
 
     def test_worker_recovers_four_files_without_ordinary_downloads(self):
         with tempfile.TemporaryDirectory() as directory:
