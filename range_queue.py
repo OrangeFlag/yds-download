@@ -154,9 +154,11 @@ def finish_courses(background, config, changed_courses=()):
                  failed=failed, pending_courses=pending, downloads_complete=True, complete=not failed and not pending))
 
 
-def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None):
+def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None, secondary_slots=1):
     if files < 1 or per_file < 1:
         raise ValueError('Range file limits must be positive')
+    if not 1 <= secondary_slots <= max(1, files - 1):
+        raise ValueError('Secondary slots must leave a slot for the first queue')
     stopping = stopping if stopping is not None else Event()
     budget = RangeBudget(requests, rps)
     cache = JsonCache()
@@ -236,12 +238,12 @@ def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None):
                             finish_courses(background, config, retired)
                 active = sum(len(background.futures) for background, _, _ in roots.values())
                 while eligible and active < files:
-                    # Reserve one slot for courses when personal files also have pending work.
+                    # Reserve slots for courses while retaining priority for personal files.
                     chosen = 0
                     if len(queues) > 1 and any(row[0] > 0 for row in eligible):
                         first_active = sum(len(bg.futures) for bg, _, config in roots.values()
                                            if priorities[bg.root] == 0)
-                        if first_active >= max(1, files - 1):
+                        if first_active >= max(1, files - secondary_slots):
                             chosen = next(i for i, row in enumerate(eligible) if row[0] > 0)
                     _, background, job = eligible.pop(chosen)
                     print('RANGE START: ' + str(background.root) + job['item']['path'], flush=True)
@@ -272,6 +274,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--queue', action='append', required=True, type=Path, help='Repeat in priority order')
     parser.add_argument('--files', type=int, default=4)
+    parser.add_argument('--secondary-slots', type=int, default=1, help='File slots reserved for later queues while the first queue has work')
     parser.add_argument('--requests-per-file', type=int, default=2)
     parser.add_argument('--requests', type=int, default=8)
     parser.add_argument('--rps', type=float, default=12)
@@ -282,7 +285,7 @@ def main():
     # Prevent two workers from multiplying the global limits.
     with args.queue[0].with_suffix('.range.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping)
+        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots)
 
 
 if __name__ == '__main__':
