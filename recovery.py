@@ -230,12 +230,26 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
         data = bytearray()
         retry = network.RequestRetry(item['sha256'] + item['path'], stopping)
         auth_replayed = False
+        after_eof = False
+        previous_eof_bytes = 0
         while True:
             if refresh_errors:
                 result = bounds, data or None, 'Interrupted'
                 break
             timing['last_failure'] = None
-            result = fetch_limited((bounds[0] + len(data), bounds[1]), timing)
+            before_attempt = timing['request_attempts']
+            before_seconds = timing['request_seconds']
+            request_start = bounds[0] + len(data)
+            result = fetch_limited((request_start, bounds[1]), timing)
+            if after_eof and timing['request_attempts'] > before_attempt and metrics is not None:
+                try:
+                    metrics.eof_retry(dict(path=event['path'], sha256=event['sha256'],
+                        attempt=timing['request_attempts'], start=request_start, end=bounds[1],
+                        accepted_bytes=len(result[1]) if result[1] else 0,
+                        request_seconds=timing['request_seconds']-before_seconds,
+                        previous_eof_bytes=previous_eof_bytes, error=result[2]))
+                except (OSError, ValueError, TypeError, AttributeError) as error:
+                    metrics.warning(error)
             data.extend(result[1] or b'')
             failed_url = timing.pop('_request_url', None)
             details = timing['last_failure']
@@ -261,6 +275,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                     finally:
                         refresh_lock.release()
                     auth_replayed = True
+                    after_eof = False
                     timing['retry_reasons']['link_expired'] = 1
                     continue
                 again = (not refresh_errors and len(data) < bounds[1] - bounds[0] and result[2] is not None
@@ -271,6 +286,9 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
             if not again:
                 result = bounds, data or None, result[2]
                 break
+            after_eof = (result[2] == 'Incomplete response'
+                         or details['error_type'] in ('SSLEOFError', 'IncompleteRead', 'RemoteDisconnected'))
+            previous_eof_bytes = len(result[1]) if result[1] else 0
             reason = details['category']
             timing['retry_reasons'][reason] = timing['retry_reasons'].get(reason, 0) + 1
         timing['seconds'] = time.monotonic() - started

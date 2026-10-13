@@ -60,6 +60,129 @@ class PipelineChecks(unittest.TestCase):
                                           tuning={'range_rps': 4}), 0)
         self.assertEqual(json.loads((budget / 'config.json').read_text())['rps'], 4)
 
+    def test_file_timing_separates_queue_and_processing_across_interrupt(self):
+        from datetime import datetime,timedelta,timezone
+        clock={'seconds':0}
+        stamp=lambda:(datetime(2026,10,13,tzinfo=timezone.utc)+timedelta(seconds=clock['seconds'])).isoformat()
+        (self.root/'.download').mkdir()
+        with patch.object(pipeline,'now',side_effect=stamp), \
+                patch.object(pipeline.time,'monotonic',side_effect=lambda:clock['seconds']):
+            bg=pipeline.Background(self.root,self.data['source'],0,pipeline.resolve(),defer_range=True)
+            self.addCleanup(bg.close)
+            item=self.items['First'];event=dict(item,course='First',corrupted_path='corrupted/v')
+            bg.submit('range',item,'First',0,event)
+            path,job=next(iter(bg.jobs.items()))
+            clock['seconds']=10
+            def stop(*args,**kwargs):
+                clock['seconds']=15
+                raise InterruptedError('original interruption')
+            with patch.object(recovery,'finish_recovery',side_effect=stop):
+                with self.assertRaisesRegex(InterruptedError,'original interruption'):
+                    bg.work(path,job)
+            saved=json.loads(path.read_text())
+            self.assertEqual(saved['timing']['processing_seconds'],5)
+            self.assertEqual(saved['timing']['queue_seconds'],10)
+            clock['seconds']=30
+            bg.submit('range',item,'First',0,event)
+            job=bg.jobs[path];clock['seconds']=40
+            def finish(*args,**kwargs):clock['seconds']=50
+            with patch.object(recovery,'finish_recovery',side_effect=finish):bg.work(path,job)
+            saved=json.loads(path.read_text())
+            self.assertEqual(saved['timing']['processing_seconds'],15)
+            self.assertEqual(saved['timing']['queue_seconds'],35)
+            self.assertEqual(saved['timing']['runs'],2)
+            clock['seconds']=60
+            bg.submit('range',item,'First',0,event,force=True)
+            job=bg.jobs[path];clock['seconds']=65
+            def finish_again(*args,**kwargs):clock['seconds']=70
+            with patch.object(recovery,'finish_recovery',side_effect=finish_again):bg.work(path,job)
+            saved=json.loads(path.read_text())
+            self.assertEqual(saved['timing']['processing_seconds'],20)
+            self.assertEqual(saved['timing']['queue_seconds'],40)
+            self.assertEqual(saved['timing']['runs'],3)
+
+    def test_unclean_stop_is_marked_once_without_inventing_processing_time(self):
+        (self.root/'.download').mkdir()
+        bg=pipeline.Background(self.root,self.data['source'],0,pipeline.resolve(),defer_range=True)
+        self.addCleanup(bg.close)
+        item=self.items['First'];event=dict(item,course='First',corrupted_path='corrupted/v')
+        bg.submit('range',item,'First',0,event)
+        path,job=next(iter(bg.jobs.items()))
+        job.update(state='running',timing=dict(started_at='2026-10-13T00:00:00+00:00',
+                   processing_seconds=5,queue_seconds=3,coverage_since='2026-10-12T00:00:00+00:00'))
+        download.write_json(path,job)
+        bg.submit('range',item,'First',0,event)
+        bg.submit('range',item,'First',0,event)
+        saved=json.loads(path.read_text())['timing']
+        self.assertEqual(saved['unmeasured_interrupts'],1)
+        self.assertEqual(saved['processing_seconds'],5)
+        self.assertEqual(saved['queue_seconds'],3)
+
+    def test_finished_recovery_proof_keeps_timing_without_repeating_work(self):
+        (self.root/'.download').mkdir()
+        bg=pipeline.Background(self.root,self.data['source'],0,pipeline.resolve(),defer_range=True)
+        self.addCleanup(bg.close)
+        item=self.items['First'];event=dict(item,course='First',corrupted_path='corrupted/v')
+        bg.submit('range',item,'First',0,event)
+        path,job=next(iter(bg.jobs.items()))
+        job.update(state='running',timing=dict(started_at='2026-10-13T00:00:00+00:00',
+                   processing_seconds=5,queue_seconds=10,runs=2))
+        download.write_json(path,job)
+        recovery.recovery_state(self.root,event,'finished')
+        with patch.object(recovery,'prefer_saved_event',return_value=True), \
+                patch.object(bg,'range_result_current',return_value=True):
+            bg.submit('range',item,'First',0,event)
+        saved=json.loads(path.read_text())
+        self.assertEqual(saved['state'],'done')
+        self.assertEqual(saved['timing']['processing_seconds'],5)
+        self.assertEqual(saved['timing']['queue_seconds'],10)
+        self.assertEqual(saved['timing']['unmeasured_interrupts'],1)
+        self.assertNotIn('started_at',saved['timing'])
+        self.assertNotIn('queued_since',saved['timing'])
+
+    def test_forced_job_ignores_unreadable_optional_timing_history(self):
+        (self.root/'.download').mkdir()
+        bg=pipeline.Background(self.root,self.data['source'],0,pipeline.resolve(),defer_range=True)
+        self.addCleanup(bg.close)
+        item=self.items['First'];event=dict(item,course='First',corrupted_path='corrupted/v')
+        bg.submit('range',item,'First',0,event)
+        path=next(iter(bg.jobs))
+        for content in ('{truncated', '[]'):
+            path.write_text(content)
+            bg.submit('range',item,'First',0,event,force=True)
+            self.assertEqual(json.loads(path.read_text())['state'],'pending')
+
+    def test_timing_and_optional_checkpoint_errors_do_not_mask_interruption(self):
+        (self.root/'.download').mkdir()
+        bg=pipeline.Background(self.root,self.data['source'],0,pipeline.resolve(),defer_range=True)
+        self.addCleanup(bg.close)
+        item=self.items['First'];event=dict(item,course='First',corrupted_path='corrupted/v')
+        bg.submit('range',item,'First',0,event)
+        path,job=next(iter(bg.jobs.items()))
+        original=download.write_json
+        def write(path,job):
+            if job.get('timing',{}).get('stopped_at'):
+                raise OSError('Checkpoint unavailable')
+            return original(path,job)
+        with patch.object(recovery,'finish_recovery',side_effect=InterruptedError('original interruption')), \
+                patch.object(download,'write_json',side_effect=write):
+            with self.assertRaisesRegex(InterruptedError,'original interruption'):
+                bg.work(path,job)
+
+    def test_broken_optional_timing_does_not_fail_successful_work(self):
+        (self.root/'.download').mkdir()
+        bg=pipeline.Background(self.root,self.data['source'],0,pipeline.resolve(),defer_range=True)
+        self.addCleanup(bg.close)
+        item=self.items['First'];event=dict(item,course='First',corrupted_path='corrupted/v')
+        bg.submit('range',item,'First',0,event)
+        path,job=next(iter(bg.jobs.items()))
+        with patch.object(recovery,'finish_recovery'), \
+                patch.object(bg.metrics,'begin_file',side_effect=ValueError('Bad metrics')), \
+                patch.object(bg.metrics,'finish_file',side_effect=ValueError('Bad metrics')):
+            result=bg.work(path,job)
+        self.assertEqual(result['state'],'done')
+        self.assertEqual(json.loads(path.read_text())['state'],'done')
+
     def ready_range_jobs(self, count):
         from concurrent.futures import Future
         (self.root / '.download').mkdir()

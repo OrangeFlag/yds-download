@@ -3,6 +3,7 @@ from collections import Counter, deque
 from copy import deepcopy
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -31,6 +32,8 @@ class Metrics:
         self.counters, self.previous = Counter(), Counter()
         self.errors, self.gauges, self.tasks = {}, {}, {}
         self.first_bytes = deque(maxlen=1024)
+        self.eof_retries = deque(maxlen=1024)
+        self.eof_sequence = 0
         self.sample = lambda: None
         self.previous_time = time.monotonic()
         self.disk_name = self.disk_device()
@@ -62,6 +65,54 @@ class Metrics:
                 self.tasks.pop(str(key), None)
             else:
                 self.tasks[str(key)] = kind, state, queued_at
+
+    def warning(self, error):
+        with self.lock:
+            if self.warned:
+                return
+            self.warned = True
+        try:
+            print('METRICS WARNING: '+type(error).__name__, flush=True)
+        except OSError:
+            pass
+
+    def eof_retry(self, detail):
+        with self.lock:
+            self.eof_sequence += 1
+            if len(self.eof_retries) == self.eof_retries.maxlen:
+                self.counters['range_eof_retry_buffer_overwrites'] += 1
+            self.eof_retries.append(dict(detail, sequence=self.eof_sequence))
+            self.add(range_eof_retry_attempts=1,
+                     range_eof_retry_useful_attempts=int(detail['accepted_bytes'] > 0),
+                     range_eof_retry_accepted_bytes=detail['accepted_bytes'],
+                     range_eof_retry_request_seconds=detail['request_seconds'])
+
+    def begin_file(self, job, timestamp):
+        if not isinstance(job.get('timing'), dict):
+            job['timing'] = {}
+        timing = job.setdefault('timing', {})
+        for key in ('processing_seconds', 'queue_seconds'):
+            value = timing.get(key, 0)
+            timing[key] = value if isinstance(value, (int, float)) and math.isfinite(value) and value >= 0 else 0
+        try:
+            queued = max(0, (datetime.fromisoformat(timestamp) - datetime.fromisoformat(timing['queued_since'])).total_seconds())
+        except (ValueError, TypeError, KeyError, OverflowError):
+            queued = 0
+        timing['queue_seconds'] += queued
+        timing['runs'] = (timing.get('runs', 0) if isinstance(timing.get('runs', 0), int) else 0) + 1
+        timing['started_at'] = timestamp
+        timing.pop('stopped_at', None)
+        timing.pop('queued_since', None)
+        return queued
+
+    def finish_file(self, job, seconds, queued, timestamp, outcome):
+        timing = job['timing']
+        timing['processing_seconds'] += max(0, seconds)
+        timing.update(stopped_at=timestamp, outcome=outcome)
+        if outcome != 'done':
+            timing['queued_since'] = timestamp
+        self.add(**{job['kind']+'_work_runs': 1, job['kind']+'_processing_seconds': max(0, seconds),
+                    job['kind']+'_queue_seconds': queued, job['kind']+'_'+outcome+'_work_runs': 1})
 
     def range_request(self, row):
         with self.lock:
@@ -154,7 +205,7 @@ class Metrics:
                                interval_counters={k:v-self.previous.get(k,0) for k,v in self.counters.items()},
                                errors=deepcopy(self.errors), gauges=deepcopy(self.gauges), tasks=queue, oldest_pending_seconds=oldest,
                                first_byte_p95_last_1024=first[min(len(first)-1,int(len(first)*.95))] if first else None,
-                               host_rates=rates)
+                               host_rates=rates, range_eof_retry_details=list(self.eof_retries))
                 self.path.parent.mkdir(parents=True,exist_ok=True)
                 with self.path.open('a',encoding='utf-8') as stream:
                     stream.write(json.dumps(row,ensure_ascii=False)+'\n')
@@ -162,11 +213,13 @@ class Metrics:
                 temporary = latest.with_name(latest.name+'.tmp')
                 temporary.write_text(json.dumps(row,ensure_ascii=False,indent=2),encoding='utf-8')
                 temporary.replace(latest)
+                with self.lock:
+                    cutoff = row['range_eof_retry_details'][-1]['sequence'] if row['range_eof_retry_details'] else 0
+                    while self.eof_retries and self.eof_retries[0]['sequence'] <= cutoff:
+                        self.eof_retries.popleft()
                 self.previous = row['counters']; self.previous_time = now; self.host_previous = host
         except (OSError, ValueError, KeyError, TypeError) as error:
-            if not self.warned:
-                print('METRICS WARNING: '+type(error).__name__,flush=True)
-                self.warned = True
+            self.warning(error)
 
     def loop(self):
         while not self.stop.wait(self.interval):

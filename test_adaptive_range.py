@@ -193,6 +193,33 @@ class AdaptiveRangeTest(unittest.TestCase):
         self.assertFalse(stop.is_set())
         self.assertEqual(network.retry_request(lambda:'healthy',stop,target='unrelated'),'healthy')
 
+    def test_eof_retry_measures_only_new_tail_bytes_without_changing_requests(self):
+        from metrics import Metrics
+        requests=[]
+        self.tuning['range_block_size_kib']=128
+        self.item['file']+='?token=HIDDEN'
+        def serve(request,**kwargs):
+            requests.append(request.get_header('Range'))
+            if len(requests)==1:
+                return Response(0,len(self.content),len(self.content),self.content[:16384])
+            return Response(16384,len(self.content),len(self.content),self.content[16384:])
+        with Metrics(self.root/'.download/metrics.jsonl','test',start=False) as metrics, \
+                patch('network.RequestRetry.retry',return_value=True), \
+                patch.object(download,'api',return_value=self.item), \
+                patch.object(download.OPENER,'open',side_effect=serve):
+            ranges=recovery.retry_ranges(self.root,self.event,self.item,2,self.tuning,metrics=metrics)
+            metrics.snapshot()
+        self.assertEqual(requests,['bytes=0-131071','bytes=16384-131071'])
+        self.assertEqual(ranges,[[0,len(self.content)]])
+        rows=[json.loads(line) for line in (self.root/'.download/metrics.jsonl').read_text().splitlines()]
+        detail=rows[0]['range_eof_retry_details'][0]
+        self.assertEqual(detail['accepted_bytes'],len(self.content)-16384)
+        self.assertEqual(detail['previous_eof_bytes'],16384)
+        self.assertEqual(detail['start'],16384)
+        self.assertEqual(rows[0]['counters']['range_eof_retry_accepted_bytes'],len(self.content)-16384)
+        self.assertNotIn('HIDDEN',json.dumps(rows))
+        self.assertNotIn('range_eof_retry_details',json.dumps(self.event))
+
     def test_request_measurements_distinguish_wait_network_and_save(self):
         def serve(request, timeout):
             start, end = map(int, request.get_header('Range')[6:].split('-'))

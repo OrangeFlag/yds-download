@@ -54,6 +54,8 @@ class MetricsChecks(unittest.TestCase):
                 return original(path, data, *args, **kwargs)
             def update():
                 m.add(range_requests=1)
+                m.eof_retry(dict(path='/v',sha256='a'*64,attempt=2,start=0,end=7,
+                                 accepted_bytes=7,request_seconds=.5,previous_eof_bytes=0,error=None))
                 m.gauge('archives', {'finished': 1})
                 m.range_request(dict(saved_bytes=0, error='HTTP 500', seconds=1,
                                      request_seconds=1, save_seconds=0, first_byte_seconds=None))
@@ -75,6 +77,7 @@ class MetricsChecks(unittest.TestCase):
             m.snapshot()
             latest = json.loads(m.path.with_name('metrics-latest.json').read_text())
             self.assertEqual(latest['interval_counters']['range_requests'], 2)
+            self.assertEqual(len(latest['range_eof_retry_details']), 1)
             m.close()
 
     def test_range_pass_counts_bytes_errors_and_wait_separately(self):
@@ -88,6 +91,38 @@ class MetricsChecks(unittest.TestCase):
             self.assertEqual(row['counters']['range_requests'],2)
             self.assertEqual(row['counters']['range_wait_seconds'],2)
             self.assertEqual(row['errors']['range'], {'HTTP 500':1})
+            m.close()
+
+    def test_eof_detail_buffer_is_bounded_and_counters_keep_all_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            m=Metrics(Path(directory)/'metrics.jsonl','test',start=False)
+            for index in range(1030):
+                m.eof_retry(dict(path='/v',sha256='a'*64,attempt=index+2,start=index,end=index+7,
+                                 accepted_bytes=7,request_seconds=.5,previous_eof_bytes=0,error=None))
+            self.assertEqual(len(m.eof_retries),1024)
+            m.snapshot()
+            row=json.loads(m.path.read_text().splitlines()[-1])
+            self.assertEqual(row['counters']['range_eof_retry_accepted_bytes'],7210)
+            self.assertEqual(row['counters']['range_eof_retry_buffer_overwrites'],6)
+            self.assertEqual(len(row['range_eof_retry_details']),1024)
+            self.assertFalse(m.eof_retries)
+            m.close()
+
+    def test_failed_metrics_write_retains_eof_details_and_accepts_new_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            m=Metrics(Path(directory)/'metrics.jsonl','test',start=False)
+            detail=dict(path='/v',sha256='a'*64,attempt=2,start=0,end=7,
+                        accepted_bytes=7,request_seconds=.5,previous_eof_bytes=0,error=None)
+            m.eof_retry(detail)
+            with patch.object(Path,'write_text',side_effect=OSError('Disk unavailable')):
+                m.snapshot()
+            self.assertEqual(len(m.eof_retries),1)
+            m.eof_retry(detail)
+            m.snapshot()
+            self.assertFalse(m.eof_retries)
+            row=json.loads(m.path.with_name('metrics-latest.json').read_text())
+            self.assertEqual(row['counters']['range_eof_retry_attempts'],2)
+            self.assertEqual([v['sequence'] for v in row['range_eof_retry_details']],[1,2])
             m.close()
 
     def test_aria_reads_each_line_once_and_counts_resumed_bytes_correctly(self):

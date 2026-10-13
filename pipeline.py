@@ -184,8 +184,18 @@ class Background:
                    state='pending', time=now(), queued_at=now())
         if event is not None:
             job['event'] = event
-        if path.exists() and not force:
-            old = json.loads(path.read_text())
+        old = {}
+        if path.exists():
+            try:
+                old = json.loads(path.read_text())
+                if not isinstance(old, dict):
+                    raise ValueError('Invalid background task')
+            except (OSError, ValueError) as error:
+                if not force:
+                    raise
+                old = {}
+                self.metrics.warning(error)
+        if old and not force:
             job['queued_at'] = old.get('queued_at') or old.get('time',job['time'])
             if old['state'] == 'done':
                 # Reapply a result saved just before interruption, but never trust changed bytes.
@@ -204,6 +214,20 @@ class Background:
                     job['event'] = proof
                     if saved.get('state') == 'finished' and self.range_result_current(item, proof):
                         job.update(state='done', result=dict(event=proof))
+        previous = old.get('timing')
+        timing = dict(previous) if isinstance(previous, dict) else {}
+        if timing.get('started_at') and not timing.get('stopped_at'):
+            value = timing.get('unmeasured_interrupts', 0)
+            timing['unmeasured_interrupts'] = (value if isinstance(value, int) else 0) + 1
+            timing.pop('started_at', None)
+            timing.pop('queued_since', None)
+        if job['state'] != 'done':
+            timing.setdefault('coverage_since', job['time'])
+            timing.setdefault('queued_since', job['time'])
+            job['timing'] = timing
+        elif timing:
+            timing.pop('queued_since', None)
+            job['timing'] = timing
         d.write_json(path, job)
         self.jobs[path] = job
         self.metrics.task(path,kind,job['state'],job.get('queued_at') or job.get('time',now()))
@@ -229,37 +253,58 @@ class Background:
         job['state'] = 'running'
         self.metrics.task(path,job['kind'],'running',job.get('queued_at') or job.get('time',now()))
         started = time.monotonic()
-        d.write_json(path, job)
-        if job['kind'] == 'sha':
-            local = d.target(self.root, job['item'], job['course'])
-            before = self.stat(local) if local.exists() else None
-            status, detail = d.inspect(self.root, job['item'], job['course'], stopping=self.stopping)
-            after = self.stat(local) if local.exists() else None
-            if status == 'valid' and before != after:
-                status, detail = 'invalid', 'File changed during SHA verification'
-            result = dict(status=status, detail=detail, stat=before)
-        else:
-            event = job['event']
-            event.pop('range_recovered_complete', None)
+        queued = 0
+        try:
+            queued = self.metrics.begin_file(job, now())
+        except (OSError, ValueError, TypeError, KeyError, OverflowError) as error:
+            self.metrics.warning(error)
+        outcome = 'failed'
+        try:
+            d.write_json(path, job)
+            if job['kind'] == 'sha':
+                local = d.target(self.root, job['item'], job['course'])
+                before = self.stat(local) if local.exists() else None
+                status, detail = d.inspect(self.root, job['item'], job['course'], stopping=self.stopping)
+                after = self.stat(local) if local.exists() else None
+                if status == 'valid' and before != after:
+                    status, detail = 'invalid', 'File changed during SHA verification'
+                result = dict(status=status, detail=detail, stat=before)
+            else:
+                event = job['event']
+                event.pop('range_recovered_complete', None)
+                try:
+                    r.finish_recovery(self.root, event, job['item'], self.retries, tuning=self.tuning,
+                                      stopping=self.stopping, download_active=self.download_active if self.budget is None else None,
+                                      background=True, request_budget=self.budget, metrics=self.metrics)
+                except InterruptedError:
+                    raise
+                except (ValueError, FileExistsError) as error:
+                    event['recovery_error'] = str(error)
+                    print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)
+                    r.recovery_state(self.root, event, 'finished')
+                result = dict(event=event)
+            seconds = time.monotonic()-started
+            if job['kind'] == 'sha':
+                self.metrics.add(sha_checks=1, sha_seconds=seconds, sha_verified_bytes=job['item']['size'] if result['status']=='valid' else 0)
+                self.metrics.add(**{'sha_'+result['status']+'_files':1})
+            else:
+                self.metrics.add(range_finished_files=1, range_full_files=int(event.get('range_recovered_complete',False)))
+            self.metrics.task(path,job['kind'],'done',job.get('queued_at') or job.get('time',now()))
+            job.update(state='done', result=result, time=now())
+            outcome = 'done'
+        except InterruptedError:
+            outcome = 'interrupted'
+            raise
+        finally:
             try:
-                r.finish_recovery(self.root, event, job['item'], self.retries, tuning=self.tuning,
-                                  stopping=self.stopping, download_active=self.download_active if self.budget is None else None,
-                                  background=True, request_budget=self.budget, metrics=self.metrics)
-            except InterruptedError:
-                raise
-            except (ValueError, FileExistsError) as error:
-                event['recovery_error'] = str(error)
-                print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)
-                r.recovery_state(self.root, event, 'finished')
-            result = dict(event=event)
-        seconds = time.monotonic()-started
-        if job['kind'] == 'sha':
-            self.metrics.add(sha_checks=1, sha_seconds=seconds, sha_verified_bytes=job['item']['size'] if result['status']=='valid' else 0)
-            self.metrics.add(**{'sha_'+result['status']+'_files':1})
-        else:
-            self.metrics.add(range_finished_files=1, range_full_files=int(event.get('range_recovered_complete',False)))
-        self.metrics.task(path,job['kind'],'done',job.get('queued_at') or job.get('time',now()))
-        job.update(state='done', result=result, time=now())
+                self.metrics.finish_file(job, time.monotonic()-started, queued, now(), outcome)
+            except (OSError, ValueError, TypeError, KeyError, OverflowError) as error:
+                self.metrics.warning(error)
+            if outcome != 'done':
+                try:
+                    d.write_json(path, job)
+                except OSError as error:
+                    self.metrics.warning(error)
         d.write_json(path, job)
         return job
 
