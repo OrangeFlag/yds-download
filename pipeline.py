@@ -14,6 +14,7 @@ from threading import Event
 import time
 
 import download as d
+import network
 import recovery as r
 from settings import resolve
 
@@ -22,7 +23,16 @@ def now():
     return datetime.now().astimezone().isoformat()
 
 
-def transfer_process(command, *, env, on_tick, stop_timeout=30):
+def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
+    while True:
+        code = _transfer_process_once(command, env=env, on_tick=on_tick, stop_timeout=stop_timeout)
+        if (command[0] != 'aria2c' or code in (0, 9, 130, -2, 143, -15)
+                or stopping is not None and stopping.is_set()
+                or not network.wait_if_offline(stopping)):
+            return code
+
+
+def _transfer_process_once(command, *, env, on_tick, stop_timeout=30):
     process = subprocess.Popen(command, env=env)
     try:
         while True:
@@ -324,7 +334,7 @@ class Background:
         self.download_active.set()
         self.transferring = course
         try:
-            code = transfer_process(command, env=d.ENV, on_tick=self.on_tick)
+            code = transfer_process(command, env=d.ENV, on_tick=self.on_tick, stopping=self.stopping)
         finally:
             self.download_active.clear()
             self.transferring = None

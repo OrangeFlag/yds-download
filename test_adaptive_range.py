@@ -38,6 +38,34 @@ class AdaptiveRangeTest(unittest.TestCase):
                 patch.object(download.OPENER, 'open', side_effect=serve):
             return recovery.retry_ranges(self.root, self.event, self.item, 2, self.tuning)
 
+    def test_local_outage_preserves_prefix_and_resumes_missing_bytes(self):
+        requests = []
+        def serve(request, **kwargs):
+            requests.append(request.headers['Range'])
+            if len(requests) == 1:
+                return Response(0, len(self.content), len(self.content), self.content[:16384], timeout=True)
+            return Response(16384, len(self.content), len(self.content), self.content[16384:])
+        self.tuning['range_block_size_kib'] = 128
+        with patch('network.wait_if_offline', return_value=True):
+            ranges = self.run_ranges(serve)
+        self.assertEqual(requests, ['bytes=0-131071', 'bytes=16384-131071'])
+        self.assertEqual(ranges, [[0, len(self.content)]])
+        self.assertEqual(self.body.read_bytes(), self.content)
+
+    def test_local_outage_retries_same_range_without_spending_pass(self):
+        requests = []
+        def serve(request, **kwargs):
+            requests.append(request.headers['Range'])
+            if len(requests) == 1:
+                raise urllib.error.URLError('No route to host')
+            return Response(0, len(self.content), len(self.content), self.content)
+        self.tuning['range_block_size_kib'] = 128
+        with patch('network.wait_if_offline', return_value=True):
+            ranges = self.run_ranges(serve)
+        self.assertEqual(requests, ['bytes=0-131071', 'bytes=0-131071'])
+        self.assertEqual(ranges, [[0, len(self.content)]])
+        self.assertEqual(len(self.event['range_attempts']), 1)
+
     def test_request_measurements_distinguish_wait_network_and_save(self):
         def serve(request, timeout):
             start, end = map(int, request.get_header('Range')[6:].split('-'))

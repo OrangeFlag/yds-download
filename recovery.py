@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from threading import Event, Lock
 import urllib.request
 import urllib.error
+import network
 from progress import merge_ranges, saved_ranges, progress
 from settings import resolve
 
@@ -189,7 +190,21 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     def fetch(bounds):
         started = time.monotonic()
         timing = dict(request_seconds=0.0, first_byte_seconds=None)
-        result = fetch_limited(bounds, timing)
+        data = bytearray()
+        while True:
+            result = fetch_limited((bounds[0] + len(data), bounds[1]), timing)
+            data.extend(result[1] or b'')
+            connection = result[2] in ('URLError', 'TimeoutError', 'ConnectionError', 'ConnectionResetError',
+                                      'ConnectionAbortedError', 'OSError', 'Incomplete response')
+            try:
+                retry = (len(data) < bounds[1] - bounds[0] and connection
+                         and network.wait_if_offline(stopping, force=result[2] != 'Incomplete response' or fine))
+            except InterruptedError:
+                result = bounds, data or None, 'Interrupted'
+                break
+            if not retry:
+                result = bounds, data or None, result[2]
+                break
         timing['seconds'] = time.monotonic() - started
         return (*result, timing)
     def fetch_limited(bounds, timing):
@@ -270,7 +285,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
         except (OSError, http.client.HTTPException) as error:
             return bounds, None, 'HTTP ' + str(error.code) if hasattr(error, 'code') else type(error).__name__
         finally:
-            timing['request_seconds'] = time.monotonic() - request_started
+            timing['request_seconds'] += time.monotonic() - request_started
     attempts = []
     max_passes = tuning['range_max_passes'] or min(4, 2 * retries) + 2
     source = json.loads((root / '.download/source.json').read_text())['source']
@@ -278,11 +293,11 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     def refresh():
         nonlocal metadata_path
         try:
-            fresh = api(source, metadata_path)
+            fresh = network.retry_while_offline(lambda: api(source, metadata_path), stopping)
         except urllib.error.HTTPError as error:
             if error.code != 404 or event['course'] != '.':
                 raise
-            fresh = api(source)
+            fresh = network.retry_while_offline(lambda: api(source), stopping)
             if fresh.get('type') != 'file' or '/' + fresh.get('name', '') != event['path']:
                 raise ValueError('Source file disappeared; refuse to combine ranges')
             metadata_path = '/'

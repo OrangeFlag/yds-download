@@ -17,6 +17,7 @@ from threading import RLock, Lock
 import urllib.error
 import urllib.parse
 import urllib.request
+import network
 from settings import OPTIONS, add_arguments, resolve
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -281,7 +282,7 @@ def bind_resume(root, entries, previous, events, deep_only):
 def list_course(source, course, retries=2, retry_delay=60):
     for attempt in range(retries + 1):
         try:
-            return sorted(files(source, '/' + course), key=lambda item: item['size'])
+            return sorted(network.retry_while_offline(lambda: files(source, '/' + course)), key=lambda item: item['size'])
         except (OSError, RuntimeError) as error:
             if (isinstance(error, urllib.error.HTTPError)
                     and 400 <= error.code < 500 and error.code not in (408, 429)) or attempt == retries:
