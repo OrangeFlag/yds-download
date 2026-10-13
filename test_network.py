@@ -1,6 +1,9 @@
 import unittest
+import errno
+import io
+from contextlib import redirect_stdout
 from threading import Event
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 import urllib.error
 import network
 
@@ -37,6 +40,38 @@ class NetworkChecks(unittest.TestCase):
             self.assertTrue(guard.wait_if_offline(stop))
             self.assertTrue(guard.wait_if_offline(stop))
         self.assertEqual([call.args[0] for call in stop.wait.call_args_list], [0, .1, 0])
+
+    def test_failed_probes_log_all_errors_then_successful_node(self):
+        guard = network.NetworkGuard()
+        stop = Mock(); stop.is_set.return_value = False; stop.wait.return_value = False
+        errors = ExceptionGroup('create_connection failed', [
+            OSError(errno.EHOSTUNREACH, 'No route to host'),
+            OSError(errno.ENETUNREACH, 'Network is unreachable')])
+        output = io.StringIO()
+        with patch.object(network.socket, 'create_connection', side_effect=[errors, TimeoutError('timed out'), MagicMock()]) as connect, \
+                redirect_stdout(output):
+            self.assertTrue(guard.wait_if_offline(stop))
+        log = output.getvalue()
+        self.assertIn('NETWORK PROBE FAILED:', log)
+        self.assertIn('cloud-api.yandex.net:443', log)
+        self.assertIn('EHOSTUNREACH(113)', log)
+        self.assertIn('ENETUNREACH(101)', log)
+        self.assertIn('api.github.com:443', log)
+        self.assertIn('TimeoutError', log)
+        self.assertIn('NETWORK PROBE OK:', log)
+        self.assertRegex(log, r'waited=\d+\.\d{3}s; rechecks=1')
+        self.assertNotIn('NETWORK OFFLINE', log)
+        stop.wait.assert_called_once_with(0)
+        self.assertTrue(all(call.kwargs.get('all_errors') for call in connect.call_args_list))
+
+    def test_one_reachable_probe_does_not_pause_requests(self):
+        guard = network.NetworkGuard()
+        stop = Mock(); stop.is_set.return_value = False
+        with patch.object(network.socket, 'create_connection', side_effect=[OSError(errno.EHOSTUNREACH, 'No route to host'), MagicMock()]):
+            self.assertFalse(guard.wait_if_offline(stop))
+        stop.wait.assert_not_called()
+        self.assertIn('api.github.com:443', guard.probe_success)
+        self.assertIn('EHOSTUNREACH(113)', guard.probe_errors[0])
 
     def test_online_error_does_not_retry_forever(self):
         with patch('network.wait_if_offline', return_value=False):
