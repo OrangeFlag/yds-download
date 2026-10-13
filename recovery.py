@@ -219,24 +219,52 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     stopping = stopping if stopping is not None else Event()
     foreground_limit = Lock()
     next_request = 0.0
+    refresh_lock = Lock()
+    refresh_errors = []
+    pass_refreshed = False
     def fetch(bounds):
+        nonlocal item, pass_refreshed
         started = time.monotonic()
         timing = dict(request_seconds=0.0, first_byte_seconds=None, request_attempts=0,
                       retry_reasons={}, request_errors={}, last_failure=None)
         data = bytearray()
         retry = network.RequestRetry(item['sha256'] + item['path'], stopping)
+        auth_replayed = False
         while True:
             timing['last_failure'] = None
             result = fetch_limited((bounds[0] + len(data), bounds[1]), timing)
             data.extend(result[1] or b'')
+            failed_url = timing.pop('_request_url', None)
             details = timing['last_failure']
             if details:
                 key = f'{details["phase"]}:{details["category"]}:{details["errno"]}:{details["http_status"]}'
                 timing['request_errors'][key] = timing['request_errors'].get(key, 0) + 1
             try:
+                if details and details['http_status'] in (401, 403) and not auth_replayed:
+                    while not refresh_lock.acquire(timeout=.25):
+                        if stopping.is_set():
+                            raise InterruptedError('Link refresh interrupted')
+                    try:
+                        if stopping.is_set():
+                            raise InterruptedError('Link refresh interrupted')
+                        if not pass_refreshed and item['file'] == failed_url:
+                            item = refresh()
+                            pass_refreshed = True
+                    except InterruptedError:
+                        raise
+                    except Exception as error:
+                        refresh_errors.append(error)
+                        stopping.set()
+                        raise InterruptedError('Link metadata unavailable') from error
+                    finally:
+                        refresh_lock.release()
+                    auth_replayed = True
+                    timing['retry_reasons']['link_expired'] = 1
+                    continue
                 again = (len(data) < bounds[1] - bounds[0] and result[2] is not None
                          and details is not None and retry.retry(details))
             except InterruptedError:
+                stopping.set()
                 result = bounds, data or None, 'Interrupted'
                 break
             if not again:
@@ -276,7 +304,8 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
             next_request = time.monotonic() + 1 / tuning['range_rps']
         if stopping.is_set():
             return bounds, None, 'Interrupted'
-        request = urllib.request.Request(item['file'], headers={'Range': f'bytes={start}-{end - 1}', 'Accept-Encoding': 'identity'})
+        timing['_request_url'] = item['file']
+        request = urllib.request.Request(timing['_request_url'], headers={'Range': f'bytes={start}-{end - 1}', 'Accept-Encoding': 'identity'})
         request_started = time.monotonic()
         timing['request_attempts'] += 1
         timing['last_failure'] = None
@@ -362,6 +391,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     failed_count = 0
     remaining_span = total
     for attempt in range(1, max_passes + 1):
+        pass_refreshed = False
         pass_started = time.monotonic()
         if stopping.is_set():
             raise InterruptedError('Range interrupted')
@@ -388,8 +418,6 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                     pause = min(delay, 0.25)
                     time.sleep(pause)
                     delay -= pause
-        if attempts and any(row['error'] in ('HTTP 401', 'HTTP 403') for row in attempts[-1]['ranges']):
-            item = refresh()
         outcomes = []
         def save_result(future):
             nonlocal additional, ranges
@@ -445,6 +473,8 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                 for row in outcomes[first_outcome:]:
                     row['mode'] = mode
             if stopping.is_set():
+                if refresh_errors:
+                    raise refresh_errors[0]
                 raise InterruptedError('Range interrupted')
             return len(batch) - submitted
 

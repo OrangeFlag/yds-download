@@ -195,6 +195,45 @@ class NetworkChecks(unittest.TestCase):
                                  env={},on_tick=lambda:None,stopping=self.stop),1)
             transfer.assert_called_once()
 
+    def test_tls_eof_is_ambiguous_and_certificate_error_is_not(self):
+        import ssl
+        for phase in ('connect', 'body'):
+            info = network.failure(ssl.SSLEOFError(ssl.SSL_ERROR_EOF, 'TLS closed'), phase)
+            self.assertEqual((info['category'],info['phase']), ('ambiguous',phase))
+        self.assertEqual(network.failure(ssl.SSLCertVerificationError(1,'Invalid certificate'))['category'],'other')
+
+    def test_multiline_aria_cause_retains_file_retry_budget(self):
+        import pipeline
+        with tempfile.TemporaryDirectory() as directory:
+            log=Path(directory)/'aria.log'
+            def run(*args, **kwargs):
+                with log.open('a') as stream:
+                    stream.write('Download aborted. URI=https://example.invalid/a\n'
+                                 'Exception: [AbstractCommand.cc] errorCode=1 URI=hidden\n'
+                                 '  -> [SocketCore.cc] errorCode=1 cause: No route to host\n')
+                return 1
+            with patch.object(pipeline,'_transfer_process_once') as transfer:
+                transfer.side_effect = lambda *a,**k: run(*a,**k) if transfer.call_count==1 else 0
+                self.assertEqual(pipeline.transfer_process(['aria2c','--log='+str(log)],env={},
+                                 on_tick=lambda:None,stopping=self.stop),0)
+            self.assertEqual(transfer.call_count,2)
+
+    def test_aria_completion_after_timeouts_prevents_false_outage(self):
+        import pipeline
+        with tempfile.TemporaryDirectory() as directory:
+            log=Path(directory)/'aria.log'
+            self.stop.wait.side_effect=[False,False,True]
+            def run(*args,**kwargs):
+                with log.open('a') as stream:
+                    for name in ('a','b','c'):
+                        stream.write('Download aborted. URI=https://example.invalid/'+name+'\nException: errorCode=2 Timeout.\n')
+                    stream.write('Download complete: healthy-file\n')
+                return 1
+            with patch.object(pipeline,'_transfer_process_once',side_effect=run) as transfer:
+                self.assertEqual(pipeline.transfer_process(['aria2c','--log='+str(log)],env={},
+                                 on_tick=lambda:None,stopping=self.stop),1)
+            self.assertEqual(transfer.call_count,3)
+
     def test_subprocess_failure_uses_cause_not_exit_status(self):
         error = subprocess.CalledProcessError(128, ['git', 'push'], stderr='connect: No route to host')
         self.assertEqual(network.failure(error)['category'], 'routing')

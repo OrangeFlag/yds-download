@@ -53,27 +53,42 @@ def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
         if (command[0] != 'aria2c' or code in (0, 9, 130, -2, 143, -15)
                 or stopping is not None and stopping.is_set() or log is None):
             return code
-        failures, completed = {}, set()
+        failures, completed = {}, {}
         target = str(log)
+        message = []
+        error_target, error_position = target, 0
+        def finish_error():
+            if message:
+                failures[error_target] = error_position, network.failure(''.join(message))
+                message.clear()
         with log.open() as stream:
             stream.seek(offset)
-            for line in stream:
-                if 'Download aborted. URI=' in line:
-                    target = aria_resource(line.partition('URI=')[2].strip())
-                elif line.startswith('Exception:'):
-                    failures[target] = network.failure(line)
-                elif 'Download complete:' in line:
-                    local = line.partition('Download complete:')[2].strip()
-                    completed.add(local)
-                    network.GUARD.observe(local)
+            for position, line in enumerate(stream):
+                if line.startswith('Exception:'):
+                    finish_error()
+                    error_target, error_position = target, position
+                    message.append(line)
+                elif message and line.lstrip().startswith('->'):
+                    message.append(line)
+                else:
+                    finish_error()
+                    if 'Download aborted. URI=' in line:
+                        target = aria_resource(line.partition('URI=')[2].strip())
+                    elif 'Download complete:' in line:
+                        local = line.partition('Download complete:')[2].strip()
+                        completed[local] = position
+            finish_error()
         error = None
+        observations = [(position, local, None) for local, position in completed.items()]
         priority = {'other': 0, 'http': 1, 'ambiguous': 2, 'routing': 3}
-        for target, current in failures.items():
-            if destinations.get(target) and destinations[target] <= completed:
+        for target, (position, current) in failures.items():
+            if destinations.get(target) and destinations[target] <= completed.keys():
                 continue
-            network.GUARD.observe(target, current)
+            observations.append((position, target, current))
             if error is None or priority[current['category']] > priority[error['category']]:
                 error, retry.target = current, target
+        for _, target, current in sorted(observations, key=lambda row: row[0]):
+            network.GUARD.observe(target, current)
         if error is None or not retry.retry(error):
             return code
 

@@ -6,6 +6,7 @@ import http.client
 import json
 import re
 import socket
+import ssl
 import subprocess
 import time
 from threading import Event, Lock
@@ -37,7 +38,7 @@ def failure(error, phase='unknown'):
     if number in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN) or (
             isinstance(error, socket.gaierror) and number == socket.EAI_AGAIN):
         category = 'routing'
-    elif isinstance(error, (TimeoutError, ConnectionError, http.client.HTTPException,
+    elif isinstance(error, (TimeoutError, ConnectionError, ssl.SSLEOFError, http.client.HTTPException,
                             json.JSONDecodeError, UnicodeDecodeError, urllib.error.URLError)):
         category = 'ambiguous'
     elif isinstance(error, (str, subprocess.CalledProcessError, subprocess.TimeoutExpired)):

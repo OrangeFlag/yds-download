@@ -116,6 +116,71 @@ class AdaptiveRangeTest(unittest.TestCase):
         self.assertEqual(rows[0]['request_attempts'], 1)
         self.assertEqual(rows[0]['request_errors'], {'connect:routing:113:None': 1})
 
+    def test_expired_url_refreshes_in_final_pass(self):
+        old=dict(self.item,file='https://example.invalid/expired')
+        fresh=dict(self.item,file='https://example.invalid/fresh')
+        self.tuning.update(range_block_size_kib=128,range_max_passes=1)
+        def serve(request,**kwargs):
+            if request.full_url==old['file']:
+                raise urllib.error.HTTPError(request.full_url,403,'Expired',{},None)
+            return Response(0,len(self.content),len(self.content),self.content)
+        with patch.object(download,'api',side_effect=[old,fresh]) as api, \
+                patch.object(download.OPENER,'open',side_effect=serve) as requests:
+            ranges=recovery.retry_ranges(self.root,self.event,self.item,2,self.tuning)
+        self.assertEqual(ranges,[[0,len(self.content)]])
+        self.assertEqual(api.call_count,2)
+        self.assertEqual(requests.call_count,2)
+
+    def test_expired_url_refresh_preserves_prefix_on_stop(self):
+        import network
+        stop=Event(); calls=[]
+        self.tuning.update(range_block_size_kib=128,range_max_passes=1)
+        def metadata(*args,**kwargs):
+            if len(calls)==2:
+                stop.set()
+                raise InterruptedError('Stop during metadata')
+            return self.item
+        def serve(request,**kwargs):
+            calls.append(request.get_header('Range'))
+            if len(calls)==1:
+                return Response(0,len(self.content),len(self.content),self.content[:16384],timeout=True)
+            raise urllib.error.HTTPError(request.full_url,403,'Expired',{},None)
+        with patch.object(network.RequestRetry,'retry',new=self.actual_retry), \
+                patch.object(download,'api',side_effect=metadata), \
+                patch.object(download.OPENER,'open',side_effect=serve):
+            with self.assertRaises(InterruptedError):
+                recovery.retry_ranges(self.root,self.event,self.item,2,self.tuning,stopping=stop)
+        self.assertEqual(calls,['bytes=0-131071','bytes=16384-131071'])
+        self.assertEqual(self.body.read_bytes(),self.content[:16384])
+        self.assertEqual(saved_ranges(self.body,len(self.content),self.item["sha256"]),[[0,16384]])
+
+    def test_expired_url_refresh_rejects_changed_source(self):
+        self.tuning.update(range_block_size_kib=128,range_max_passes=1)
+        changed=dict(self.item,sha256='0'*64)
+        with patch.object(download,'api',side_effect=[self.item,changed]), \
+                patch.object(download.OPENER,'open',side_effect=urllib.error.HTTPError('hidden',403,'Expired',{},None)):
+            with self.assertRaisesRegex(ValueError,'Source file changed'):
+                recovery.retry_ranges(self.root,self.event,self.item,2,self.tuning)
+        self.assertFalse(self.body.exists())
+
+    def test_parallel_expired_ranges_share_one_refresh(self):
+        from threading import Barrier
+        old=dict(self.item,file='https://example.invalid/old')
+        fresh=dict(self.item,file='https://example.invalid/new')
+        barrier=Barrier(2)
+        self.tuning.update(range_block_size_kib=64,range_max_passes=1,range_workers=2)
+        def serve(request,**kwargs):
+            if request.full_url==old['file']:
+                barrier.wait(timeout=2)
+                raise urllib.error.HTTPError(request.full_url,403,'Expired',{},None)
+            start,end=map(int,request.get_header('Range')[6:].split('-'));end+=1
+            return Response(start,end,len(self.content),self.content[start:end])
+        with patch.object(download,'api',side_effect=[old,fresh]) as api, \
+                patch.object(download.OPENER,'open',side_effect=serve):
+            ranges=recovery.retry_ranges(self.root,self.event,self.item,2,self.tuning)
+        self.assertEqual(ranges,[[0,len(self.content)]])
+        self.assertEqual(api.call_count,2)
+
     def test_request_measurements_distinguish_wait_network_and_save(self):
         def serve(request, timeout):
             start, end = map(int, request.get_header('Range')[6:].split('-'))
