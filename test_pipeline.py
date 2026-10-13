@@ -33,6 +33,7 @@ class PipelineChecks(unittest.TestCase):
         self.addCleanup(self.second_started.set)
 
     def transfer(self, command, **kwargs):
+        self.assertIn('--disable-ipv6=true', command)
         text = (self.root / '.download/queue.txt').read_text()
         course = 'Second' if '/Second' in text else 'First'
         self.calls.append(course)
@@ -47,6 +48,69 @@ class PipelineChecks(unittest.TestCase):
         with patch.object(download, 'list_course', side_effect=lambda source, course, *args: [self.items[course]]), \
                 patch('pipeline.transfer_process', side_effect=self.transfer):
             return download.download(self.data, ['First', 'Second'], self.root, retries=0, **kwargs)
+
+    def ready_range_jobs(self, count):
+        from concurrent.futures import Future
+        (self.root / '.download').mkdir()
+        background = pipeline.Background(self.root, self.data['source'], 0, pipeline.resolve())
+        self.addCleanup(background.close)
+        paths = []
+        for index in range(count):
+            item = dict(self.items['First'], path=f'/First/file{index}.mp4')
+            event = dict(item, course='First', attempt=1, status='partial', detail='Missing bytes',
+                         time='2026-01-01', corrupted_path=f'corrupted/old/First/file{index}.mp4')
+            job = dict(kind='range', source=self.data['source'], item=item, course='First',
+                       attempt=1, state='done', event=event, result=dict(event=event))
+            path = background.directory / f'{index}.json'
+            download.write_json(path, job)
+            future = Future(); future.set_result(job)
+            background.futures[path] = future
+            background.jobs[path] = job
+            paths.append(path)
+        return background, paths
+
+    def test_poll_batches_ledger_and_failure_manifest_before_applied_jobs(self):
+        background, paths = self.ready_range_jobs(70)
+        original = download.write_json
+        writes = []
+        def write(path, data):
+            if path == background.ledger_path or path == self.root / 'corrupted/failed.json':
+                writes.append(path)
+            if path in paths and data['state'] == 'applied':
+                ledger = json.loads(background.ledger_path.read_text())
+                failures = json.loads((self.root / 'corrupted/failed.json').read_text())
+                self.assertEqual(ledger[data['item']['path']]['phase'], 'finished')
+                self.assertIn(data['item']['path'], [row['path'] for row in failures])
+            original(path, data)
+        with patch.object(background, 'range_result_current', return_value=True),                 patch.object(download, 'write_json', side_effect=write):
+            background.poll()
+            self.assertEqual(len(background.futures), 6)
+            self.assertEqual(writes.count(background.ledger_path), 1)
+            self.assertEqual(writes.count(self.root / 'corrupted/failed.json'), 1)
+            background.poll()
+        self.assertFalse(background.futures)
+        self.assertEqual(writes.count(background.ledger_path), 2)
+        self.assertEqual(len(json.loads((self.root / 'corrupted/failed.json').read_text())), 70)
+
+    def test_interrupted_batch_retains_done_tasks_for_reapplication(self):
+        background, paths = self.ready_range_jobs(3)
+        original = download.write_json
+        def interrupt(path, data):
+            if path == background.ledger_path:
+                raise KeyboardInterrupt
+            original(path, data)
+        with patch.object(background, 'range_result_current', return_value=True):
+            with patch.object(download, 'write_json', side_effect=interrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    background.poll()
+            self.assertTrue(all(json.loads(path.read_text())['state'] == 'done' for path in paths))
+            background.poll()
+        self.assertTrue(all(json.loads(path.read_text())['state'] == 'applied' for path in paths))
+
+    def test_deep_transfer_uses_ipv4(self):
+        with patch.object(download, 'list_course', return_value=[self.items['First']]),                 patch('pipeline.transfer_process', side_effect=self.transfer):
+            self.assertEqual(download.download(self.data, ['First'], self.root, retries=0,
+                                               deep=True, retry_check=True), 0)
 
     def test_transfer_batches_ledger_before_transfer_and_sha(self):
         state = self.root / '.download'

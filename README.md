@@ -542,3 +542,8 @@ python3 range_queue.py --queue PERSONAL_QUEUE.json --queue SEMESTER_QUEUE.json -
 tail -f "$DEST/.download/metrics.jsonl"
 python3 -m json.tool "$DEST/.download/metrics-latest.json"
 ```
+
+aria2 использует IPv4 (`--disable-ipv6=true`): в текущей сети нет маршрута IPv6.
+Готовые SHA/Range-результаты применяются пакетами до 64 файлов. Общие журналы
+сохраняются до отметки задач `applied`; незавершённый пакет повторно применяется
+после перезапуска без повторного скачивания подтверждённых блоков.

@@ -41,15 +41,25 @@ def transfer_process(command, *, env, on_tick, stop_timeout=30):
 
 
 def failure_manifests(root, event):
+    failure_manifests_batch(root, [event])
+
+
+def failure_manifests_batch(root, events):
     with d.STATE_LOCK:
-        paths = [root / 'corrupted/failed.json', (root / event['corrupted_path']).parents[len(Path(event['path']).parts) - 2] / 'failed.json']
-        for path in dict.fromkeys(paths):
+        updates = {}
+        for event in events:
+            paths = [root / 'corrupted/failed.json', (root / event['corrupted_path']).parents[len(Path(event['path']).parts) - 2] / 'failed.json']
+            for path in dict.fromkeys(paths):
+                if path not in updates:
+                    rows = json.loads(path.read_text()) if path.exists() else []
+                    updates[path] = {(row['path'], row['sha256']): row for row in rows}
+                key = event['path'], event['sha256']
+                updates[path].pop(key, None)
+                if not event.get('range_recovered_complete'):
+                    updates[path][key] = event
+        for path, rows in updates.items():
             path.parent.mkdir(parents=True, exist_ok=True)
-            rows = json.loads(path.read_text()) if path.exists() else []
-            rows = [row for row in rows if not (row['path'] == event['path'] and row['sha256'] == event['sha256'])]
-            if not event.get('range_recovered_complete'):
-                rows.append(event)
-            d.write_json(path, rows)
+            d.write_json(path, list(rows.values()))
 
 
 class Background:
@@ -222,7 +232,10 @@ class Background:
             self.submit('range', item, course, attempt, self.archive(item, course, attempt, event), force=True)
 
     def poll(self):
+        completed, failures = [], []
         for path, future in list(self.futures.items()):
+            if len(completed) >= 64:
+                break
             if not future.done():
                 continue
             try:
@@ -249,7 +262,7 @@ class Background:
                 if event['status'] != 'valid':
                     self.failed(item, course, attempt, event)
                 else:
-                    self.checkpoint(item, course, attempt, 'finished', event)
+                    self.checkpoint(item, course, attempt, 'finished', event, persist=False)
             else:
                 event = result['event']
                 if not self.range_result_current(item, event):
@@ -260,8 +273,15 @@ class Background:
                 if not event.get('range_recovered_complete'):
                     with (self.state / 'events.jsonl').open('a') as log:
                         log.write(json.dumps(event, ensure_ascii=False) + '\n')
-                failure_manifests(self.root, event)
-                self.checkpoint(item, course, attempt, 'finished', event)
+                failures.append(event)
+                self.checkpoint(item, course, attempt, 'finished', event, persist=False)
+            completed.append((path, job))
+        if not completed:
+            return
+        # Done tasks remain replayable until both aggregate journals are durable.
+        failure_manifests_batch(self.root, failures)
+        d.write_json(self.ledger_path, self.ledger)
+        for path, job in completed:
             job['state'] = 'applied'
             self.metrics.task(path,job['kind'],'applied',job.get('queued_at') or job.get('time',now()))
             d.write_json(path, job)
@@ -292,7 +312,7 @@ class Background:
         (self.state / 'queue.txt').write_text(''.join(lines))
         t = self.tuning
         command = ['aria2c', '--input-file=' + str(self.state / 'queue.txt'), '--continue=true',
-                   '--always-resume=true', '--check-integrity=false', '--auto-file-renaming=false', '--allow-overwrite=true',
+                   '--disable-ipv6=true', '--always-resume=true', '--check-integrity=false', '--auto-file-renaming=false', '--allow-overwrite=true',
                    f"--max-concurrent-downloads={t['download_concurrency']}",
                    '--optimize-concurrent-downloads=' + (f"{t['auto_concurrency_a']:g}:{t['auto_concurrency_b']:g}" if t['auto_concurrency'] else 'false'),
                    f"--max-connection-per-server={t['connections']}", f"--split={t['split']}",

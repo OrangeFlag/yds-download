@@ -461,7 +461,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                 from pipeline import transfer_process
                 code = transfer_process([
                     'aria2c', '--input-file=' + str(state / 'queue.txt'),
-                    '--continue=true', '--always-resume=true', '--check-integrity=true',
+                    '--disable-ipv6=true', '--continue=true', '--always-resume=true', '--check-integrity=true',
                     '--auto-file-renaming=false', '--allow-overwrite=true',
                     f"--max-concurrent-downloads={tuning['download_concurrency']}",
                     '--optimize-concurrent-downloads=' + (
