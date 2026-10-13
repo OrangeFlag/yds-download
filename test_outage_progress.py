@@ -60,3 +60,46 @@ class OutageProgressChecks(unittest.TestCase):
             with self.assertRaises(OSError) as error:
                 recovery.recover_corrupted(self.root, 'source', retry=True)
         self.assertEqual(error.exception.errno, errno.EIO)
+
+    def test_partial_publication_replays_after_registry_write_outage(self):
+        destination = self.root / 'Course/video (partially available).mp4'
+        original = download.write_json
+        def write(path, value):
+            if path.name == 'partial-copies.json' and destination.exists():
+                raise OSError(errno.EIO, 'Disk interrupted after copy publication')
+            return original(path, value)
+        with patch.object(download, 'write_json', side_effect=write):
+            with self.assertRaises(OSError):
+                recovery.promote_partial(self.root, self.event)
+        self.assertTrue(destination.exists())
+        self.assertTrue(recovery.promote_partial(self.root, self.event))
+        copy = json.loads((self.root / '.download/partial-copies.json').read_text())[0]
+        self.assertEqual(copy['downloaded_bytes'], 600)
+        self.assertNotIn('pending_stat', copy)
+
+    def test_partial_refresh_replays_both_sides_of_publication(self):
+        self.assertTrue(recovery.promote_partial(self.root, self.event))
+        destination = self.root / 'Course/video (partially available).mp4'
+        self.body.write_bytes(self.content[:650])
+        download.write_json(self.journal, dict(size=1024, sha256=self.item['sha256'], ranges=[[0, 650]]))
+        replace = Path.replace
+        def interrupted(path, target):
+            if path.name.startswith('.partial-'):
+                raise OSError(errno.EIO, 'Disk lost before replacement')
+            return replace(path, target)
+        with patch.object(Path, 'replace', interrupted):
+            with self.assertRaises(OSError):
+                recovery.promote_partial(self.root, self.event)
+        self.assertEqual(destination.stat().st_size, 600)
+        write_json = download.write_json
+        def write(path, value):
+            if path.name == 'partial-copies.json' and destination.stat().st_size == 650:
+                raise OSError(errno.EIO, 'Disk lost after replacement')
+            return write_json(path, value)
+        with patch.object(download, 'write_json', side_effect=write):
+            with self.assertRaises(OSError):
+                recovery.promote_partial(self.root, self.event)
+        self.assertTrue(recovery.promote_partial(self.root, self.event))
+        copy = json.loads((self.root / '.download/partial-copies.json').read_text())[0]
+        self.assertEqual(copy['downloaded_bytes'], 650)
+        self.assertNotIn('pending_stat', copy)

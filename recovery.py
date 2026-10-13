@@ -32,7 +32,7 @@ def body_path(root, event):
     return path
 
 
-def copy_saved(source, destination, overwrite=True):
+def copy_saved(source, destination, overwrite=True, before_publish=None):
     destination.parent.mkdir(parents=True, exist_ok=True)
     # Preserve sparse holes and the archive used for future retries.
     with tempfile.NamedTemporaryFile(dir=destination.parent, prefix='.partial-', delete=False) as temporary:
@@ -52,6 +52,8 @@ def copy_saved(source, destination, overwrite=True):
         with name.open('rb') as stream:
             os.fsync(stream.fileno())
         stat = name.stat()
+        if before_publish is not None:
+            before_publish([stat.st_ino, stat.st_size, stat.st_mtime_ns])
         if overwrite:
             name.replace(destination)
         else:
@@ -92,6 +94,16 @@ def _promote_partial(root, event):
     copies = json.loads(registry.read_text()) if registry.exists() else []
     source = json.loads((root / '.download/source.json').read_text())['source']
     old = next((row for row in copies if row['source'] == source and row['path'] == event['path']), None)
+    if old and old.get('pending_stat'):
+        stat = destination.stat() if destination.exists() else None
+        stamp = [stat.st_ino, stat.st_size, stat.st_mtime_ns] if stat else None
+        if stamp == old['pending_stat']:
+            old = dict(old)
+            old.pop('pending_stat'); old.pop('previous', None)
+            copies = [row for row in copies if not (row['source'] == source and row['path'] == event['path'])] + [old]
+            write_json(registry, copies)
+        else:
+            old = old.get('previous')
     if old and destination.exists():
         stat = destination.stat()
         if (stat.st_size, stat.st_mtime_ns) != (old['local_size'], old['mtime_ns']):
@@ -101,14 +113,17 @@ def _promote_partial(root, event):
             return True
     if destination.exists() and not old:
         raise FileExistsError('Unregistered partial copy: ' + str(destination))
-    copy_saved(path, destination, overwrite=bool(old))
-    stat = destination.stat()
-    copy = dict(event, source=source, recovered_path=str(destination.relative_to(root)),
-                local_size=stat.st_size, mtime_ns=stat.st_mtime_ns,
-                recovery_time=datetime.now().astimezone().isoformat())
-    copies = [row for row in copies if not (row['source'] == source and row['path'] == event['path'])]
-    copies.append(copy)
-    write_json(registry, copies)
+    others = [row for row in copies if not (row['source'] == source and row['path'] == event['path'])]
+    copy = None
+    def prepare(stamp):
+        nonlocal copy
+        copy = dict(event, source=source, recovered_path=str(destination.relative_to(root)),
+                    local_size=stamp[1], mtime_ns=stamp[2], pending_stat=stamp, previous=old,
+                    recovery_time=datetime.now().astimezone().isoformat())
+        write_json(registry, others + [copy])
+    copy_saved(path, destination, overwrite=bool(old and destination.exists()), before_publish=prepare)
+    copy.pop('pending_stat'); copy.pop('previous')
+    write_json(registry, others + [copy])
     print(f'PARTIALLY AVAILABLE: {event["path"]}; bytes={event["downloaded_percent"]:.2f}%', flush=True)
     return True
 

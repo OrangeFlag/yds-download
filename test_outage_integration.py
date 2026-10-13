@@ -33,6 +33,15 @@ class OutageIntegrationChecks(unittest.TestCase):
         self.assertEqual(call.call_count, 2)
         wait.assert_called_once()
 
+    def test_api_incomplete_body_waits_without_spending_attempt(self):
+        import http.client
+        with patch.object(download.OPENER, 'open', side_effect=[http.client.IncompleteRead(b'{'), io.BytesIO(b'{"name":"course"}')]), \
+                patch('network.wait_if_offline', return_value=True) as wait, \
+                patch.object(download.time, 'sleep') as delay:
+            self.assertEqual(download.api('source'), {'name': 'course'})
+        wait.assert_called_once()
+        delay.assert_not_called()
+
     def test_api_wait_is_interruptible(self):
         from threading import Event
         with patch.object(download.OPENER, 'open', side_effect=urllib_error()), \

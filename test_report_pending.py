@@ -86,6 +86,80 @@ class PendingReportChecks(unittest.TestCase):
         wait.assert_called_once()
         self.assertFalse(paths[0].exists())
 
+    def publication_repo(self):
+        repo = self.root / 'repo'; repo.mkdir()
+        remote = self.root / 'remote'
+        subprocess.run(['git', 'init', '--bare', '-q', str(remote)], check=True)
+        subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+        for key, value in [('user.name', 'Test'), ('user.email', 'test@example.invalid')]:
+            subprocess.run(['git', '-C', str(repo), 'config', key, value], check=True)
+        subprocess.run(['git', '-C', str(repo), 'remote', 'add', 'origin', str(remote)], check=True)
+        source = 'https://disk.yandex.ru/d/test'
+        cards = repo / 'courses'; cards.mkdir()
+        card = cards / 'course.md'
+        card.write_text(f'- Источник: [disk]({source})\n- Путь: `Course`\n'
+                        '**Статус:** не все видео есть, какие-то не удается скачать\n'
+                        '| `v` | 7 | | | |\n')
+        subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(repo), 'commit', '-qm', 'Initial'], check=True)
+        d.write_json(self.root / '.download/source.json', {'source': source})
+        local = self.root / 'Course/v'; local.parent.mkdir(); local.write_bytes(b'lecture')
+        d.record(self.root / '.download', dict(path='/Course/v', size=7, sha256=hashlib.sha256(b'lecture').hexdigest()), 'Course', 1, 'valid', 'Verified')
+        return repo, card
+
+    def interrupt_commit(self, repo):
+        real_run = subprocess.run
+        def run(command, **kwargs):
+            if command[:3] == ['git', '-C', str(repo)] and command[3] == 'commit':
+                raise OSError(28, 'No space left on device')
+            return real_run(command, **kwargs)
+        with patch.object(report.subprocess, 'run', side_effect=run):
+            with self.assertRaises(OSError):
+                report.update_report(self.root, repo, 'Walterit', True)
+
+    def test_failed_commit_replays_own_edits_without_staged_deadlock(self):
+        repo, _ = self.publication_repo()
+        self.interrupt_commit(repo)
+        report.update_report(self.root, repo, 'Walterit', True)
+        committed = subprocess.check_output(['git', '-C', str(repo), 'show', 'HEAD:courses/course.md'], text=True)
+        self.assertIn('Walterit', committed)
+        self.assertEqual(subprocess.run(['git', '-C', str(repo), 'diff', '--cached', '--quiet']).returncode, 0)
+        self.assertFalse((repo / '.git/yds-report-transaction.json').exists())
+
+    def test_failed_commit_does_not_revert_later_user_edits(self):
+        repo, card = self.publication_repo()
+        self.interrupt_commit(repo)
+        card.write_text(card.read_text() + 'User edit\n')
+        body = card.read_bytes()
+        with self.assertRaises(RuntimeError):
+            report.update_report(self.root, repo, 'Walterit', True)
+        self.assertEqual(card.read_bytes(), body)
+
+    def test_failed_commit_preserves_later_unrelated_staged_edits(self):
+        repo, _ = self.publication_repo()
+        self.interrupt_commit(repo)
+        other = repo / 'other.txt'; other.write_text('User edit')
+        subprocess.run(['git', '-C', str(repo), 'add', '--', 'other.txt'], check=True)
+        index = subprocess.check_output(['git', '-C', str(repo), 'diff', '--cached'])
+        with self.assertRaises(RuntimeError):
+            report.update_report(self.root, repo, 'Walterit', True)
+        self.assertEqual(subprocess.check_output(['git', '-C', str(repo), 'diff', '--cached']), index)
+
+    def test_committed_report_replays_after_transaction_cleanup_outage(self):
+        repo, _ = self.publication_repo()
+        unlink = Path.unlink
+        def interrupted(path, *args, **kwargs):
+            if path.name == 'yds-report-transaction.json':
+                raise OSError(5, 'Storage failure after commit')
+            return unlink(path, *args, **kwargs)
+        with patch.object(Path, 'unlink', interrupted):
+            with self.assertRaises(OSError):
+                report.update_report(self.root, repo, 'Walterit', True)
+        head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'])
+        report.update_report(self.root, repo, 'Walterit', True)
+        self.assertEqual(subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD']), head)
+        self.assertFalse((repo / '.git/yds-report-transaction.json').exists())
+
     def test_stop_interrupts_shared_git_lock(self):
         repo = self.root / 'repo'; common = repo / '.git'; common.mkdir(parents=True)
         stopping = Event(); stopping.set()

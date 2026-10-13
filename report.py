@@ -118,6 +118,36 @@ def normalized(value):
     return unicodedata.normalize('NFC', value)
 
 
+def resume_publication(repo, transaction):
+    if not transaction.exists():
+        return
+    job = json.loads(transaction.read_text())
+    if job['repo'] != str(repo):
+        raise RuntimeError('Pending publication belongs to another working tree')
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(repo), *args], text=True, timeout=120)
+    head = git('rev-parse', 'HEAD').strip()
+    entries = job['files']
+    for name, bodies in entries.items():
+        path = repo / name
+        if not path.resolve().is_relative_to(repo) or path.read_text() not in bodies:
+            raise RuntimeError('Pending report file changed locally: ' + name)
+    staged = set(filter(None, git('diff', '--cached', '--name-only', '-z').split('\0')))
+    if staged - entries.keys() or any(git('show', ':' + name) != entries[name][1] for name in staged):
+        raise RuntimeError('Pending publication index contains unrelated edits')
+    if head == job['head']:
+        subprocess.run(['git', '-C', str(repo), 'reset', '-q', 'HEAD', '--', *entries], check=True, timeout=120)
+        for name, (original, _) in entries.items():
+            path = repo / name
+            temporary = path.with_name(path.name + '.tmp')
+            temporary.write_text(original); temporary.replace(path)
+    elif any(git('show', 'HEAD:' + name) != bodies[1] or (repo / name).read_text() != bodies[1]
+             for name, bodies in entries.items()):
+        raise RuntimeError('Pending publication HEAD changed; review it manually')
+    transaction.unlink()
+    storage.sync_directory(transaction.parent)
+
+
 def update_report(destination, repo, mark, git_push=False, message=None, stopping=None):
     repo = repo.resolve()
     if (repo / ".git").exists():
@@ -134,11 +164,13 @@ def update_report(destination, repo, mark, git_push=False, message=None, stoppin
                         time.sleep(.25)
             if stopping is not None and stopping.is_set():
                 raise InterruptedError('Report publishing interrupted')
-            return _update_report(destination, repo, mark, git_push, message, stopping)
+            transaction = common / 'yds-report-transaction.json'
+            resume_publication(repo, transaction)
+            return _update_report(destination, repo, mark, git_push, message, stopping, transaction)
     return _update_report(destination, repo, mark, git_push, message, stopping)
 
 
-def _update_report(destination, repo, mark, git_push=False, message=None, stopping=None):
+def _update_report(destination, repo, mark, git_push=False, message=None, stopping=None, transaction=None):
     from download import read_events
     if not mark or any(c in mark for c in '|\n\r'):
         raise ValueError('Mark must be nonempty and contain no pipes or line breaks')
@@ -355,6 +387,11 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
     paths = [str(path.relative_to(repo)) for path, _ in changes]
     if git_push and dirty.intersection(paths):
         raise RuntimeError('Report would include existing edits: ' + ', '.join(sorted(dirty.intersection(paths))))
+    if git_push and changes and transaction is not None:
+        from download import write_json
+        head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True, timeout=git_timeout).strip()
+        write_json(transaction, dict(repo=str(repo), head=head,
+                   files={str(path.relative_to(repo)): [path.read_text(), body] for path, body in changes}))
     for path, body in reports:
         path.parent.mkdir(exist_ok=True)
         temporary = path.with_name(path.name + '.tmp')
@@ -367,13 +404,16 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
     print(f'REPORT: {len(changes)} files updated; mark={mark}', flush=True)
     if git_push:
         git_env = os.environ.copy()
-        git_env.setdefault('GIT_SSH_COMMAND', 'ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=2')
+        git_env.setdefault('GIT_SSH_COMMAND', 'ssh -4 -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=2')
         def git(*args):
             subprocess.run(['git', '-C', str(repo), *args], check=True,
                            timeout=git_timeout if args[0] == 'push' else 120, env=git_env)
         if paths:
             git('add', '--', *paths)
             git('commit', '-m', message or f'Update {mark} verified download report')
+            if transaction is not None:
+                transaction.unlink()
+                storage.sync_directory(transaction.parent)
         # Also retry pushing an earlier local commit when this report is unchanged.
         if stopping is not None and stopping.is_set():
             raise InterruptedError('Report publishing interrupted')
