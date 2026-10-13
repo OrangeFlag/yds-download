@@ -35,12 +35,14 @@ class NetworkGuard:
                 return generation != self.generation
             self.generation += 1
             print('NETWORK OFFLINE: waiting; file retries retained', flush=True)
+            delay = 0
             while True:
-                if stopping.wait(5):
+                if stopping.wait(delay):
                     raise InterruptedError('Network wait interrupted')
                 if self.online():
                     print('NETWORK ONLINE: resuming interrupted requests', flush=True)
                     return True
+                delay = min(5, delay * 2 if delay else .1)
         finally:
             self.lock.release()
 

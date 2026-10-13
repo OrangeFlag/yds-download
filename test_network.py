@@ -13,7 +13,7 @@ class NetworkChecks(unittest.TestCase):
             self.assertFalse(guard.wait_if_offline(stop))
             self.assertTrue(guard.wait_if_offline(stop, force=False))
         self.assertEqual(probe.call_count, 3)
-        stop.wait.assert_called_once_with(5)
+        stop.wait.assert_called_once_with(0)
 
     def test_waits_until_connection_returns(self):
         guard = network.NetworkGuard()
@@ -21,6 +21,22 @@ class NetworkChecks(unittest.TestCase):
         with patch.object(guard, 'online', side_effect=[False, False, True]):
             self.assertTrue(guard.wait_if_offline(stop))
         self.assertEqual(stop.wait.call_count, 2)
+
+    def test_persistent_outage_backs_off_and_caps_wait(self):
+        guard = network.NetworkGuard()
+        stop = Mock(); stop.is_set.return_value = False; stop.wait.return_value = False
+        with patch.object(guard, 'online', side_effect=[False] * 10 + [True]):
+            self.assertTrue(guard.wait_if_offline(stop))
+        self.assertEqual([call.args[0] for call in stop.wait.call_args_list],
+                         [0, .1, .2, .4, .8, 1.6, 3.2, 5, 5, 5])
+
+    def test_next_outage_starts_with_immediate_retry_again(self):
+        guard = network.NetworkGuard()
+        stop = Mock(); stop.is_set.return_value = False; stop.wait.return_value = False
+        with patch.object(guard, 'online', side_effect=[False, False, True, False, True]):
+            self.assertTrue(guard.wait_if_offline(stop))
+            self.assertTrue(guard.wait_if_offline(stop))
+        self.assertEqual([call.args[0] for call in stop.wait.call_args_list], [0, .1, 0])
 
     def test_online_error_does_not_retry_forever(self):
         with patch('network.wait_if_offline', return_value=False):
