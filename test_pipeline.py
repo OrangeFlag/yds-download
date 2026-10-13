@@ -90,6 +90,80 @@ class PipelineChecks(unittest.TestCase):
         self.assertEqual(after['pending_courses'], before['pending_courses'])
         self.assertFalse(after['complete'])
 
+    def test_restart_restores_finished_recovery_before_course_finalization(self):
+        state = self.root / '.download'
+        state.mkdir()
+        item = self.items['First']
+        event = dict(item, course='First', attempt=1, status='missing', detail='No local file',
+                     time='2026-01-01', corrupted_path='corrupted/old/First/video.mp4',
+                     range_recovered_complete=True, recovered_stat=[1, 7, 1])
+        body = self.root / event['corrupted_path']
+        body.parent.mkdir(parents=True)
+        body.write_bytes(self.content)
+        download.write_json(Path(str(body) + '.ranges.json'),
+                            dict(size=7, sha256=item['sha256'], ranges=[[0, 7]]))
+        download.write_json(self.root / 'corrupted/old/failed.json', [event])
+        download.write_json(state / 'course-history.json', {'First': dict(
+            source=self.data['source'], state='recovering', verified=0, failed=0)})
+        download.write_json(state / 'transfer-state.json', {item['path']: dict(
+            source=self.data['source'], size=7, sha256=item['sha256'], course='First',
+            attempt=1, phase='finished', event=event)})
+        download.write_json(state / 'recovery-state.json', {item['path']: dict(state='finished', event=event)})
+        with patch.object(download, 'list_course', return_value=[item]), \
+                patch.object(recovery, 'retry_ranges'), \
+                patch('pipeline.transfer_process', side_effect=AssertionError('Unexpected transfer')):
+            self.assertEqual(download.download(self.data, ['First'], self.root, retries=0), 0)
+        self.assertEqual((self.root / 'First/video.mp4').read_bytes(), self.content)
+
+    def test_deep_retry_rejects_changed_or_missing_source_before_resuming(self):
+        item = self.items['First']
+        for fresh in ([dict(item, sha256='0' * 64, file='https://example.invalid/new')],
+                      [dict(item, size=8, file='https://example.invalid/new')], []):
+            with self.subTest(fresh=fresh), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                def partial(*args, **kwargs):
+                    local = root / 'First/video.mp4'
+                    local.parent.mkdir(exist_ok=True)
+                    local.write_bytes(self.content[:3])
+                    Path(str(local) + '.aria2').write_bytes(b'control')
+                    return 1
+                with patch.object(download, 'list_course', side_effect=[[item], fresh]), \
+                        patch.object(recovery, 'recover_corrupted', return_value=[]), \
+                        patch.object(recovery, 'finish_recovery'), \
+                        patch.object(download.subprocess, 'call', side_effect=partial) as transfer:
+                    with self.assertRaisesRegex(ValueError, 'Source changed'):
+                        download.download(self.data, ['First'], root, retries=1, deep=True,
+                                          retry_check=True, tuning={'retry_delay': 0})
+                    self.assertEqual(transfer.call_count, 1)
+                self.assertEqual((root / 'First/video.mp4').read_bytes(), self.content[:3])
+
+    def test_scoped_deep_preserves_shared_queue_selection_settings_and_slots(self):
+        self.items['First']['size'] = 20
+        with patch.object(recovery, 'retry_ranges', side_effect=AssertionError('Unexpected Range')):
+            self.assertEqual(self.run_download(defer_range=True), 1)
+        state = self.root / '.download'
+        settings = json.loads((state / 'settings.json').read_text())
+        settings['retries'] = 5
+        settings['tuning']['range_workers'] = 3
+        download.write_json(state / 'settings.json', settings)
+        saved = {name: (state / name).read_bytes() for name in (
+            'courses.json', 'catalog.json', 'settings.json', '01-manifest.json',
+            '02-manifest.json', '01-status.json')}
+        self.items['Third'] = dict(self.items['Second'], path='/Third/video.mp4')
+        local = self.root / 'Third/video.mp4'
+        local.parent.mkdir()
+        local.write_bytes(self.content)
+        for course in ('Second', 'Third'):
+            with self.subTest(course=course), patch.object(download, 'list_course', return_value=[self.items[course]]):
+                self.assertEqual(download.download(self.data, [course], self.root, retries=0, deep=True), 0)
+            for name, before in saved.items():
+                self.assertEqual((state / name).read_bytes(), before, name)
+            self.assertEqual(json.loads((state / '02-status.json').read_text())['course'], 'Second')
+            summary = json.loads((state / 'summary.json').read_text())
+            self.assertEqual(summary['verified'], 1)
+            self.assertEqual(summary['pending_courses'], ['First'])
+            self.assertFalse(summary['complete'])
+
     def test_sha_does_not_block_next_course(self):
         original = download.inspect
         def inspect(root, item, course, *args, **kwargs):

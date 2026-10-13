@@ -296,7 +296,10 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
         if identity.exists() and json.loads(identity.read_text(encoding='utf-8'))['source'] != source:
             raise ValueError('Use a separate destination for a different public folder/year')
         write_json(identity, dict(source=source, title=data['title']))
-        write_json(state / 'settings.json', dict(retries=retries, deep=deep, retry_check=retry_check, tuning=tuning))
+        preserve_queue = deep and not retry_check and (state / 'courses.json').exists()
+        queue_courses = json.loads((state / 'courses.json').read_text()) if preserve_queue else courses
+        if not preserve_queue or not (state / 'settings.json').exists():
+            write_json(state / 'settings.json', dict(retries=retries, deep=deep, retry_check=retry_check, tuning=tuning))
         summary_path = state / 'summary.json'
         handoff = json.loads(summary_path.read_text()) if deep and not retry_check and summary_path.exists() else {}
         handoff = {key: handoff[key] for key in ('downloads_complete', 'pending_courses') if key in handoff}
@@ -333,26 +336,29 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                         and local.stat().st_mtime_ns == event['mtime_ns']
                         and not Path(str(local) + '.aria2').exists()):
                     events[event['path']] = event
-        write_json(state / 'catalog.json', data)
-        write_json(state / 'courses.json', courses)
+        if not preserve_queue:
+            write_json(state / 'catalog.json', data)
+            write_json(state / 'courses.json', courses)
         lines = [data['title'] + ' — порядок скачивания', 'Источник: ' + source,
                  f'Курсы последовательно; первая попытка + {retries} повтора; неудачи: corrupted.', '']
         for index, course in enumerate(courses, 1):
             lines.extend([f'{index:02d}. {course}', source.rstrip('/') + '/' +
                           urllib.parse.quote(course, safe=''), ''])
-        (root / 'Порядок скачивания.txt').write_text('\n'.join(lines), encoding='utf-8')
+        if not preserve_queue:
+            (root / 'Порядок скачивания.txt').write_text('\n'.join(lines), encoding='utf-8')
         broken_root = root / 'corrupted' / datetime.now().strftime('%Y%m%d-%H%M%S-%f')
         prior_failures = {}
         for path in (root / 'corrupted').glob('*/failed.json'):
             for event in json.loads(path.read_text()):
-                if event['course'] in courses and event['time'] > prior_failures.get(event['path'], {}).get('time', ''):
+                if event['course'] in set(queue_courses) | set(courses) and event['time'] > prior_failures.get(event['path'], {}).get('time', ''):
                     prior_failures[event['path']] = event
         failed = [event for path, event in prior_failures.items()
                   if events.get(path, {}).get('status') != 'valid']
         verified = 0
         for index, course in enumerate(courses, 1):
             print(f'COURSE {index}/{len(courses)}: {course}', flush=True)
-            status_path = state / f'{index:02d}-status.json'
+            slot = queue_courses.index(course) + 1 if course in queue_courses else None
+            status_path = state / f'{slot:02d}-status.json' if slot is not None else None
             previous = history.get(course, {})
             if (not deep and previous.get('state') == 'finished' and previous.get('source') == source
                     and not (retry_check and previous.get('failed'))):
@@ -374,8 +380,9 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
             for manifest in sorted(state.glob('*-manifest.json'), key=lambda path: path.stat().st_mtime_ns):
                 previous_entries.update({row['path']: row for row in json.loads(manifest.read_text())})
             bind_resume(root, entries, previous_entries, events, deep and not retry_check)
-            write_json(state / f'{index:02d}-manifest.json', [
-                {k: item[k] for k in ('path', 'size', 'sha256')} for item in entries])
+            if not preserve_queue:
+                write_json(state / f'{index:02d}-manifest.json', [
+                    {k: item[k] for k in ('path', 'size', 'sha256')} for item in entries])
             print(f"FILES {len(entries)}; SIZE {sum(x['size'] for x in entries)/1024**3:.2f} GiB", flush=True)
             pending = []
             course_failed = []
@@ -422,7 +429,11 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                 if attempt > 1:
                     time.sleep(tuning['retry_delay'])
                     fresh = {item['path']: item for item in list_course(source, course, retries, tuning['listing_retry_delay'])}
-                    pending = [dict(item, file=fresh.get(item['path'], item)['file']) for item in pending]
+                    for item in pending:
+                        current = fresh.get(item['path'])
+                        if current is None or (current['size'], current['sha256']) != (item['size'], item['sha256']):
+                            raise ValueError('Source changed during download retry: ' + item['path'])
+                        item['file'] = current['file']
                 queue = []
                 for item in pending:
                     destination = target(root, item, course)
@@ -494,7 +505,8 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                                  state=previous.get('state', 'pending') if deep and not retry_check else 'finished',
                                  total=len(entries), verified=len(entries) - len(course_failed),
                                  failed=len(course_failed), time=datetime.now().astimezone().isoformat())
-            write_json(status_path, course_status)
+            if status_path is not None:
+                write_json(status_path, course_status)
             history[course] = course_status
             write_json(history_path, history)
             if report_repo:
@@ -505,13 +517,17 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                 except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
                     print(f'REPORT ERROR: {error}', flush=True)
             print(('COURSE VERIFIED COMPLETE: ' if complete else 'COURSE FINISHED WITH ERRORS: ') + course, flush=True)
-            write_json(state / 'summary.json', dict(handoff, verified=verified, failed=len(failed),
+            write_json(state / 'summary.json', dict(handoff,
+                       verified=sum(history.get(name, {}).get('verified', 0) for name in queue_courses) if preserve_queue else verified,
+                       failed=sum(history.get(name, {}).get('failed', 0) for name in queue_courses) if preserve_queue else len(failed),
                        last_finished_course=course, complete=False))
         (root / 'corrupted').mkdir(exist_ok=True)
         write_json(root / 'corrupted' / 'failed.json', failed)
         failed_count = sum(history[course]['failed'] for course in courses)
-        write_json(state / 'summary.json', dict(handoff, verified=verified, failed=failed_count,
-                   complete=not failed_count and not handoff.get('pending_courses')))
+        summary_verified = sum(history.get(course, {}).get('verified', 0) for course in queue_courses) if preserve_queue else verified
+        summary_failed = sum(history.get(course, {}).get('failed', 0) for course in queue_courses) if preserve_queue else failed_count
+        write_json(state / 'summary.json', dict(handoff, verified=summary_verified, failed=summary_failed,
+                   complete=not summary_failed and not handoff.get('pending_courses')))
         print(f'ALL SELECTED COURSES PROCESSED: verified={verified}, failed={failed_count}', flush=True)
         return 1 if failed_count else 0
 

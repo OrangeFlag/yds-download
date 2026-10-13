@@ -514,7 +514,9 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                         same = r.prefer_saved_event(root, archived, old)
                         if same:
                             archived = old
-                        if not retry_check and (same and ledger.get('state') == 'finished' or not ledger and archived.get('range_attempts')):
+                        if not retry_check and (same and ledger.get('state') == 'finished'
+                                                and background.range_result_current(item, archived)
+                                                or not ledger and archived.get('range_attempts')):
                             if not ledger:
                                 r.recovery_state(root, archived, 'finished')
                             with (state / 'events.jsonl').open('a') as log:
