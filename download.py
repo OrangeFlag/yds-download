@@ -175,25 +175,37 @@ def inspect(root, item, course, path=None, stopping=None):
         return 'missing', 'No local file'
     if Path(str(path) + '.aria2').exists():
         return 'partial', 'Resume metadata retained'
-    if path.stat().st_size != item['size']:
+    before = path.stat()
+    if before.st_size != item['size']:
         return 'invalid', 'Size mismatch'
     actual = sha256_file(path, stopping)
+    after = path.stat() if path.exists() else None
+    if (after is None or (before.st_ino, before.st_size, before.st_mtime_ns) !=
+            (after.st_ino, after.st_size, after.st_mtime_ns)):
+        return 'invalid', 'File changed during SHA verification'
     if actual != item['sha256']:
         return 'invalid', 'SHA-256 mismatch: ' + actual
     return 'valid', 'SHA-256 verified'
 
 
-def record(state, item, course, attempt, status, detail, local=None):
+def record(state, item, course, attempt, status, detail, local=None, verified_stat=None):
+    path = local if local is not None else local_path(state.parent, item['path'])
+    stamp = None
+    if status == 'valid':
+        stat = path.stat() if path.exists() else None
+        stamp = [stat.st_ino, stat.st_size, stat.st_mtime_ns] if stat is not None else None
+        if (stamp is None or stamp[1] != item['size'] or Path(str(path) + '.aria2').exists()
+                or verified_stat is not None and stamp != list(verified_stat)):
+            status, detail = 'invalid', 'File changed after SHA verification'
     event = dict(time=datetime.now().astimezone().isoformat(), course=course,
                  path=item['path'], attempt=attempt, status=status, detail=detail,
                  size=item['size'], sha256=item['sha256'])
     if local is not None:
         event['local'] = str(local)
-    local = local if local is not None else local_path(state.parent, item['path'])
     from progress import progress
-    event.update(progress(local, item['size'], valid=status == 'valid', sha256=item['sha256']))
+    event.update(progress(path, item['size'], valid=status == 'valid', sha256=item['sha256']))
     if status == 'valid':
-        event['mtime_ns'] = local.stat().st_mtime_ns
+        event['mtime_ns'] = stamp[2]
     with (state / 'events.jsonl').open('a', encoding='utf-8') as log:
         log.write(json.dumps(event, ensure_ascii=False) + '\n')
     print(f"{status.upper()}: {item['path']} (attempt {attempt}) {detail}", flush=True)
@@ -212,8 +224,11 @@ def inspect_copies(root, item, course, cached, source):
     locations.extend(Path(copy['local']) for copy in matching)
     result = None
     for local in dict.fromkeys(locations):
+        stat = local.stat() if local.exists() else None
+        verified_stat = [stat.st_ino, stat.st_size, stat.st_mtime_ns] if stat is not None else None
         status, detail = inspect(root, item, course, local)
-        event = record(state, item, course, 0, status, detail, local=local)
+        event = record(state, item, course, 0, status, detail, local=local, verified_stat=verified_stat)
+        status = event['status']
         for copy in matching:
             if Path(copy['local']) == local:
                 copy.update(event)
@@ -440,7 +455,8 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     queue.append(f"{item['file']}\n dir={destination.parent}\n out={destination.name}\n checksum=sha-256={item['sha256']}\n")
                 (state / 'queue.txt').write_text(''.join(queue), encoding='utf-8')
-                code = subprocess.call([
+                from pipeline import transfer_process
+                code = transfer_process([
                     'aria2c', '--input-file=' + str(state / 'queue.txt'),
                     '--continue=true', '--always-resume=true', '--check-integrity=true',
                     '--auto-file-renaming=false', '--allow-overwrite=true',
@@ -456,13 +472,19 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                     f"--connect-timeout={tuning['connect_timeout']}", f"--timeout={tuning['timeout']}",
                     f"--summary-interval={tuning['summary_interval']}", '--enable-color=false',
                     '--console-log-level=warn', '--log=' + str(state / 'aria2.log'), '--log-level=notice',
-                ], env=ENV)
+                ], env=ENV, on_tick=lambda: None)
                 if code == 9:
                     raise RuntimeError('aria2 reports insufficient disk space')
+                if code in (130, -2, 143, -15):
+                    raise KeyboardInterrupt
                 remaining = []
                 for item in pending:
+                    local = target(root, item, course)
+                    stat = local.stat() if local.exists() else None
+                    verified_stat = [stat.st_ino, stat.st_size, stat.st_mtime_ns] if stat is not None else None
                     status, detail = inspect(root, item, course)
-                    event = record(state, item, course, attempt, status, detail)
+                    event = record(state, item, course, attempt, status, detail, verified_stat=verified_stat)
+                    status = event['status']
                     if status == 'valid':
                         verified += 1
                     elif attempt < retries + 1:
@@ -616,19 +638,25 @@ def main():
 
 
 def cli(entrypoint):
+    exit_code = 130
+    numbers = (signal.SIGINT, signal.SIGTERM)
     def interrupt(signum, frame):
+        nonlocal exit_code
+        exit_code = 128 + signum
         # systemd and the queue parent may both signal the same child.
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        for number in numbers:
+            signal.signal(number, signal.SIG_IGN)
         raise KeyboardInterrupt
 
-    previous = signal.signal(signal.SIGINT, interrupt)
+    previous = {number: signal.signal(number, interrupt) for number in numbers}
     try:
         return entrypoint()
     except KeyboardInterrupt:
         print('STOPPED: interrupted; resume state retained', flush=True)
-        return 130
+        return exit_code
     finally:
-        signal.signal(signal.SIGINT, previous)
+        for number, handler in previous.items():
+            signal.signal(number, handler)
 
 
 if __name__ == '__main__':

@@ -28,14 +28,19 @@ def body_path(root, event):
     return path
 
 
-def copy_saved(source, destination):
+def copy_saved(source, destination, overwrite=True):
     destination.parent.mkdir(parents=True, exist_ok=True)
     # Preserve sparse holes and the archive used for future retries.
     with tempfile.NamedTemporaryFile(dir=destination.parent, prefix='.partial-', delete=False) as temporary:
         name = Path(temporary.name)
     try:
         subprocess.run(['cp', '--reflink=auto', '--sparse=always', '--', str(source), str(name)], check=True)
-        name.replace(destination)
+        stat = name.stat()
+        if overwrite:
+            name.replace(destination)
+        else:
+            os.link(name, destination)
+        return [stat.st_ino, stat.st_size, stat.st_mtime_ns]
     finally:
         name.unlink(missing_ok=True)
 
@@ -228,6 +233,12 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                     return bounds, None, 'Range not honoured'
                 length = int(served[2]) - start + 1
                 content_length = response.headers.get('Content-Length')
+                transfer_encoding = response.headers.get('Transfer-Encoding')
+                if transfer_encoding is not None and (transfer_encoding.strip().lower() != 'chunked'
+                                                       or not getattr(response, 'chunked', True)):
+                    return bounds, None, 'Unsupported Range Transfer-Encoding'
+                if content_length is not None and transfer_encoding is not None:
+                    return bounds, None, 'Ambiguous Range framing'
                 if content_length is not None:
                     content_length = content_length.strip()
                 if content_length is not None and (not re.fullmatch(r'[0-9]+', content_length)
@@ -243,6 +254,9 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                         if timing['first_byte_seconds'] is None:
                             timing['first_byte_seconds'] = time.monotonic() - request_started
                         data.extend(chunk)
+                    if len(data) == length and content_length is None and not stopping.is_set():
+                        if response.read1(1):
+                            return bounds, None, 'Oversized response'
                 except http.client.IncompleteRead as failure:
                     if failure.partial and timing['first_byte_seconds'] is None:
                         timing['first_byte_seconds'] = time.monotonic() - request_started
@@ -474,7 +488,19 @@ def prefer_saved_event(root, event, proof):
     return retained(proof) >= retained(event)
 
 
+def range_result_current(root, item, event):
+    if not event.get('range_recovered_complete'):
+        return True
+    from download import target
+    local = target(root, item, event['course'])
+    if not local.exists() or Path(str(local) + '.aria2').exists():
+        return False
+    stat = local.stat()
+    return stat.st_size == item['size'] and event.get('recovered_stat') == [stat.st_ino, stat.st_size, stat.st_mtime_ns]
+
+
 def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None, metrics=None):
+    event.pop('range_recovered_complete', None)
     if event.get('sha256_rejected_paths'):
         _redownload = False
     if item is None:
@@ -508,7 +534,30 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
         path = body_path(root, event)
     ranges = saved_ranges(path, event['size'], event['sha256'])
     if ranges == [[0, event['size']]] and path.exists():
-        digest = sha256_file(path, stopping)
+        before = path.stat()
+        archive_stat = [before.st_ino, before.st_size, before.st_mtime_ns]
+
+        def check_archive(copied=None):
+            stat = path.stat() if path.exists() else None
+            if stat is not None and archive_stat == [stat.st_ino, stat.st_size, stat.st_mtime_ns]:
+                return
+            event.update(sha256_mismatch=True, recovery_error='Archive changed after SHA verification')
+            # Discard byte proofs for the changed version; keep its body and control.
+            write_json(Path(str(path) + '.ranges.json'), dict(size=event['size'], sha256=event['sha256'],
+                       ranges=[], control_imported=True))
+            if copied is not None and copied.exists():
+                rejected = path.with_name(path.name + '.unverified-copy-' + datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+                copied.rename(rejected)
+                event.setdefault('preserved_archive_paths', []).append(str(rejected.relative_to(root)))
+            recovery_state(root, event, 'running')
+            raise OSError(event['recovery_error'])
+
+        try:
+            digest = sha256_file(path, stopping)
+        except OSError:
+            check_archive()
+            raise
+        check_archive()
         if digest != event['sha256']:
             rejected = dict(event, sha256_mismatch=True, recovery_error='SHA-256 mismatch: ' + digest)
             from download import STATE_LOCK
@@ -542,14 +591,20 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
             destination = target(root, item, event['course'])
             control = Path(str(destination) + '.aria2')
             if destination.exists() or control.exists():
+                stat = destination.stat() if destination.exists() else None
+                verified_stat = [stat.st_ino, stat.st_size, stat.st_mtime_ns] if stat is not None else None
                 status, _ = inspect(root, item, event['course'], path=destination, stopping=stopping)
                 if status != 'valid':
                     raise FileExistsError('Refusing to replace an unverified original: ' + str(destination))
+                check_archive()
             else:
-                copy_saved(path, destination)
-            stat = destination.stat()
-            event['recovered_stat'] = [stat.st_ino, stat.st_size, stat.st_mtime_ns]
-            record(root / '.download', item, event['course'], 0, 'valid', 'Recovered all ranges and SHA-256 verified')
+                verified_stat = copy_saved(path, destination, overwrite=False)
+                check_archive(destination)
+            proof = record(root / '.download', item, event['course'], 0, 'valid',
+                           'Recovered all ranges and SHA-256 verified', verified_stat=verified_stat)
+            if proof['status'] != 'valid':
+                raise FileExistsError('Recovered original changed after SHA verification: ' + str(destination))
+            event['recovered_stat'] = verified_stat
             if not background:
                 reconcile_course(root, event['course'])
             event['range_recovered_complete'] = True
@@ -606,12 +661,15 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
             reconcile_course(root, event['course'])
             continue
         ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
+        local_only = False
         saved = ledger.get(event['path'])
         if saved and not prefer_saved_event(root, event, saved['event']):
             saved = None
         if saved and (saved['event']['size'], saved['event']['sha256']) == (event['size'], event['sha256']):
             event = dict(saved['event'])
-            if retry and not force and saved['state'] == 'finished':
+            local_only = (event.get('range_recovered_complete', False)
+                          and not range_result_current(root, dict(event, file=source), event))
+            if retry and not force and saved['state'] == 'finished' and not local_only:
                 results.append(event)
                 print('RECOVERY SKIPPED: ' + event['path'] + '; attempt already finished', flush=True)
                 continue
@@ -625,14 +683,17 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
         original = local_path(root, event['path'])
         # Finish an archive move interrupted between manifest, body and control writes.
         control = Path(str(original) + '.aria2')
-        if retry and (control.exists() or (original.exists() and not archived.exists())):
+        if retry and not local_only and (control.exists() or (original.exists() and not archived.exists())):
             archived.parent.mkdir(parents=True, exist_ok=True)
             for src, out in ((original, archived), (control, Path(str(archived) + '.aria2'))):
                 if src.exists() and not out.exists():
                     src.rename(out)
         try:
             item = None
-            if retry:
+            if local_only:
+                if saved_ranges(archived, event['size'], event['sha256']) == [[0, event['size']]]:
+                    item = dict(event, file=source)
+            elif retry:
                 course = event['course']
                 if course not in metadata:
                     metadata[course] = {row['path']: row for row in files(source, '/' + course)}
@@ -643,7 +704,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                     ledger[event['path']] = dict(state='finished', event=dict(event))
                     write_json(ledger_path, ledger)
                     raise ValueError('File no longer listed in source')
-            finish_recovery(root, event, item, retries, tuning=tuning)
+            finish_recovery(root, event, item, retries, _redownload=not local_only, tuning=tuning)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
             event['recovery_error'] = str(error)
             print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)

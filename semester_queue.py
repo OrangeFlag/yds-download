@@ -78,7 +78,7 @@ def main():
             if data.get('git_push'):
                 command += ['--git-push']
             code = transfer_process(command, env=os.environ.copy(), on_tick=lambda: metrics.gauge('archives',dict(Counter(a.get('state','pending') for a in data['archives']))), stop_timeout=80)
-            if code in (130, -2):
+            if code in (130, -2, 143, -15):
                 raise KeyboardInterrupt
             job.update(exit_code=code, time=datetime.now().astimezone().isoformat())
             if code not in (0, 1):

@@ -130,7 +130,7 @@ class PipelineChecks(unittest.TestCase):
                 with patch.object(download, 'list_course', side_effect=[[item], fresh]), \
                         patch.object(recovery, 'recover_corrupted', return_value=[]), \
                         patch.object(recovery, 'finish_recovery'), \
-                        patch.object(download.subprocess, 'call', side_effect=partial) as transfer:
+                        patch.object(pipeline, 'transfer_process', side_effect=partial) as transfer:
                     with self.assertRaisesRegex(ValueError, 'Source changed'):
                         download.download(self.data, ['First'], root, retries=1, deep=True,
                                           retry_check=True, tuning={'retry_delay': 0})

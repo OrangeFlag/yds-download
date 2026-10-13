@@ -138,11 +138,7 @@ class Background:
         return [stat.st_ino, stat.st_size, stat.st_mtime_ns]
 
     def range_result_current(self, item, event):
-        if not event.get('range_recovered_complete'):
-            return True
-        local = d.target(self.root, item, event['course'])
-        return (local.exists() and event.get('recovered_stat') == self.stat(local)
-                and not Path(str(local) + '.aria2').exists())
+        return r.range_result_current(self.root, item, event)
 
     def work(self, path, job):
         if job['state'] == 'done':
@@ -244,7 +240,8 @@ class Background:
                 if result['status'] == 'valid' and (not local.exists() or result['stat'] != self.stat(local)
                                                    or Path(str(local) + '.aria2').exists()):
                     result.update(status='invalid', detail='File changed after SHA verification')
-                event = d.record(self.state, item, course, attempt, result['status'], result['detail'])
+                event = d.record(self.state, item, course, attempt, result['status'], result['detail'],
+                                 verified_stat=result['stat'])
                 if event['status'] != 'valid':
                     self.failed(item, course, attempt, event)
                 else:

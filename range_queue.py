@@ -95,7 +95,10 @@ def retire_cached_copy(background, path, job, proofs):
         if archived:
             r.body_path(background.root, dict(corrupted_path=archived))
         event = d.record(background.state, item, job['course'], job['attempt'], 'valid',
-                         'Cached SHA-256 verified local copy; obsolete Range task retired', local=local)
+                         'Cached SHA-256 verified local copy; obsolete Range task retired', local=local,
+                         verified_stat=[stat.st_ino, stat.st_size, stat.st_mtime_ns])
+        if event['status'] != 'valid':
+            continue
         event = dict(previous, **event, range_recovered_complete=True)
         if archived:
             event['corrupted_path'] = archived
