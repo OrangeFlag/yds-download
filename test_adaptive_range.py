@@ -130,6 +130,8 @@ class AdaptiveRangeTest(unittest.TestCase):
         self.assertEqual(ranges,[[0,len(self.content)]])
         self.assertEqual(api.call_count,2)
         self.assertEqual(requests.call_count,2)
+        self.assertEqual(self.event['range_attempts'][0]['ranges'][0]['request_errors'],
+                         {'headers:http:None:403':1})
 
     def test_expired_url_refresh_preserves_prefix_on_stop(self):
         import network
@@ -193,7 +195,89 @@ class AdaptiveRangeTest(unittest.TestCase):
         self.assertFalse(stop.is_set())
         self.assertEqual(network.retry_request(lambda:'healthy',stop,target='unrelated'),'healthy')
 
-    def test_eof_retry_measures_only_new_tail_bytes_without_changing_requests(self):
+    def test_body_eof_is_not_retried_and_accepted_prefix_is_saved(self):
+        import network
+        from metrics import Metrics
+        requests=[]
+        self.tuning.update(range_block_size_kib=128,range_max_passes=1)
+        self.item['file']+='?token=HIDDEN'
+        def serve(request,**kwargs):
+            requests.append(request.get_header('Range'))
+            start,end=map(int,request.get_header('Range')[6:].split('-'))
+            return Response(start,end+1,len(self.content),self.content[start:min(start+16384,end+1)])
+        with Metrics(self.root/'.download/metrics.jsonl','test',start=False) as metrics, \
+                patch.object(network.RequestRetry,'retry',new=self.actual_retry), \
+                patch.object(download,'api',return_value=self.item), \
+                patch.object(download.OPENER,'open',side_effect=serve):
+            ranges=recovery.retry_ranges(self.root,self.event,self.item,2,self.tuning,metrics=metrics)
+            metrics.snapshot()
+        self.assertEqual(requests,['bytes=0-131071'])
+        self.assertEqual(ranges,[[0,16384]])
+        self.assertEqual(self.body.read_bytes(),self.content[:16384])
+        rows=[json.loads(line) for line in (self.root/'.download/metrics.jsonl').read_text().splitlines()]
+        self.assertEqual(rows[0]['range_eof_retry_details'],[])
+        self.assertNotIn('HIDDEN',json.dumps(rows))
+
+    def test_body_eof_exceptions_preserve_prefix_without_immediate_retry(self):
+        import http.client,ssl,network
+        failures=[ssl.SSLEOFError(ssl.SSL_ERROR_EOF,'TLS closed'),
+                  http.client.IncompleteRead(self.content[16384:20480]),
+                  http.client.RemoteDisconnected('Connection closed')]
+        self.tuning.update(range_block_size_kib=128,range_max_passes=1)
+        for error in failures:
+            with self.subTest(error=type(error).__name__):
+                self.body.unlink(missing_ok=True)
+                Path(str(self.body)+'.ranges.json').unlink(missing_ok=True)
+                class Broken(Response):
+                    def read1(response,size):
+                        if not response.data:raise error
+                        return super().read1(size)
+                def serve(request,**kwargs):
+                    return Broken(0,len(self.content),len(self.content),self.content[:16384])
+                with patch.object(network.RequestRetry,'retry',new=self.actual_retry), \
+                        patch.object(download,'api',return_value=self.item), \
+                        patch.object(download.OPENER,'open',side_effect=serve) as requests:
+                    ranges=recovery.retry_ranges(self.root,self.event,self.item,2,self.tuning)
+                expected=20480 if isinstance(error,http.client.IncompleteRead) else 16384
+                self.assertEqual(requests.call_count,1)
+                self.assertEqual(ranges,[[0,expected]])
+                self.assertEqual(self.body.read_bytes(),self.content[:expected])
+
+    def test_body_eof_missing_tail_is_recovered_by_smaller_next_pass(self):
+        import network
+        requests=[]
+        self.tuning.update(range_block_size_kib=128,range_max_passes=3,range_failure_limit=10)
+        def serve(request,**kwargs):
+            start,end=map(int,request.get_header('Range')[6:].split('-'))
+            requests.append((start,end+1))
+            if len(requests)==1:
+                return Response(start,end+1,len(self.content),self.content[:16384])
+            return Response(start,end+1,len(self.content),self.content[start:end+1])
+        with patch.object(network.RequestRetry,'retry',new=self.actual_retry):
+            ranges=self.run_ranges(serve)
+        self.assertEqual(requests[0],(0,len(self.content)))
+        self.assertEqual(requests[1][0],16384)
+        self.assertLess(requests[1][1]-requests[1][0],len(self.content)-16384)
+        self.assertEqual(ranges,[[0,len(self.content)]])
+        self.assertEqual(self.body.read_bytes(),self.content)
+
+    def test_opener_incomplete_read_keeps_pre_body_retry(self):
+        import http.client,network
+        self.tuning.update(range_block_size_kib=128,range_max_passes=1)
+        replies=[http.client.IncompleteRead(b'redirect body'),
+                 Response(0,len(self.content),len(self.content),self.content)]
+        with patch.object(network.RequestRetry,'retry',new=self.actual_retry), \
+                patch.object(download,'api',return_value=self.item), \
+                patch.object(download.OPENER,'open',side_effect=replies) as requests:
+            ranges=recovery.retry_ranges(self.root,self.event,self.item,2,self.tuning)
+        self.assertEqual(requests.call_count,2)
+        self.assertEqual(ranges,[[0,len(self.content)]])
+        self.assertEqual(self.body.read_bytes(),self.content)
+        self.assertEqual(self.event['range_attempts'][0]['ranges'][0]['request_errors'],
+                         {'connect:ambiguous:None:None':1})
+
+    def test_connect_eof_retry_is_still_measured(self):
+        import ssl
         from metrics import Metrics
         requests=[]
         self.tuning['range_block_size_kib']=128
@@ -201,22 +285,22 @@ class AdaptiveRangeTest(unittest.TestCase):
         def serve(request,**kwargs):
             requests.append(request.get_header('Range'))
             if len(requests)==1:
-                return Response(0,len(self.content),len(self.content),self.content[:16384])
-            return Response(16384,len(self.content),len(self.content),self.content[16384:])
+                raise urllib.error.URLError(ssl.SSLEOFError(ssl.SSL_ERROR_EOF,'TLS connection closed'))
+            return Response(0,len(self.content),len(self.content),self.content)
         with Metrics(self.root/'.download/metrics.jsonl','test',start=False) as metrics, \
                 patch('network.RequestRetry.retry',return_value=True), \
                 patch.object(download,'api',return_value=self.item), \
                 patch.object(download.OPENER,'open',side_effect=serve):
             ranges=recovery.retry_ranges(self.root,self.event,self.item,2,self.tuning,metrics=metrics)
             metrics.snapshot()
-        self.assertEqual(requests,['bytes=0-131071','bytes=16384-131071'])
+        self.assertEqual(requests,['bytes=0-131071','bytes=0-131071'])
         self.assertEqual(ranges,[[0,len(self.content)]])
         rows=[json.loads(line) for line in (self.root/'.download/metrics.jsonl').read_text().splitlines()]
         detail=rows[0]['range_eof_retry_details'][0]
-        self.assertEqual(detail['accepted_bytes'],len(self.content)-16384)
-        self.assertEqual(detail['previous_eof_bytes'],16384)
-        self.assertEqual(detail['start'],16384)
-        self.assertEqual(rows[0]['counters']['range_eof_retry_accepted_bytes'],len(self.content)-16384)
+        self.assertEqual(detail['accepted_bytes'],len(self.content))
+        self.assertEqual(detail['previous_eof_bytes'],0)
+        self.assertEqual(detail['start'],0)
+        self.assertEqual(rows[0]['counters']['range_eof_retry_accepted_bytes'],len(self.content))
         self.assertNotIn('HIDDEN',json.dumps(rows))
         self.assertNotIn('range_eof_retry_details',json.dumps(self.event))
 

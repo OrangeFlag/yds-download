@@ -253,6 +253,8 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
             data.extend(result[1] or b'')
             failed_url = timing.pop('_request_url', None)
             details = timing['last_failure']
+            eof = (result[2] == 'Incomplete response' or details is not None
+                   and details['error_type'] in ('SSLEOFError', 'IncompleteRead', 'RemoteDisconnected'))
             if details:
                 key = f'{details["phase"]}:{details["category"]}:{details["errno"]}:{details["http_status"]}'
                 timing['request_errors'][key] = timing['request_errors'].get(key, 0) + 1
@@ -279,15 +281,15 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                     timing['retry_reasons']['link_expired'] = 1
                     continue
                 again = (not refresh_errors and len(data) < bounds[1] - bounds[0] and result[2] is not None
-                         and details is not None and retry.retry(details))
+                         and details is not None and not (eof and details['phase'] == 'body')
+                         and retry.retry(details))
             except InterruptedError:
                 result = bounds, data or None, 'Interrupted'
                 break
             if not again:
                 result = bounds, data or None, result[2]
                 break
-            after_eof = (result[2] == 'Incomplete response'
-                         or details['error_type'] in ('SSLEOFError', 'IncompleteRead', 'RemoteDisconnected'))
+            after_eof = eof
             previous_eof_bytes = len(result[1]) if result[1] else 0
             reason = details['category']
             timing['retry_reasons'][reason] = timing['retry_reasons'].get(reason, 0) + 1
@@ -383,6 +385,9 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                 return bounds, data or None, error or (None if len(data) == length else 'Incomplete response')
         except (OSError, http.client.HTTPException) as error:
             timing['last_failure'] = network.failure(error, phase)
+            if isinstance(error, http.client.IncompleteRead):
+                # The opener may read a redirect body before returning the Range response.
+                timing['last_failure']['phase'] = phase
             return bounds, None, 'HTTP ' + str(error.code) if hasattr(error, 'code') else type(error).__name__
         finally:
             timing['request_seconds'] += time.monotonic() - request_started
