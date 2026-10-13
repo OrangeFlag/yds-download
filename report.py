@@ -1,5 +1,6 @@
 """Update existing backup course cards from verified downloader events."""
 import fcntl
+from datetime import datetime
 import json
 from local_paths import local_path
 import os
@@ -42,11 +43,30 @@ def _update_report(destination, repo, mark, git_push=False, message=None):
     state = destination / '.download'
     source = json.loads((state / 'source.json').read_text(encoding='utf-8'))['source'].rstrip('/')
     events = {}
+    observations = {}
     for event in read_events(state / 'events.jsonl'):
-        events[normalized(event['path'])] = event
+        key = normalized(event['path'])
+        events[key] = event
+        if event.get('source_current'):
+            observations[key] = event
     expected = dict(events)
+    manifest_times = {}
     for manifest in sorted(state.glob('*-manifest.json'), key=lambda path: path.stat().st_mtime_ns):
-        expected.update({normalized(row['path']): row for row in json.loads(manifest.read_text())})
+        rows = {normalized(row['path']): row for row in json.loads(manifest.read_text())}
+        expected.update(rows)
+        manifest_times.update(dict.fromkeys(rows, manifest.stat().st_mtime))
+    # Deep observes current source identities while retaining the worker's older manifests.
+    for key, event in observations.items():
+        if datetime.fromisoformat(event['time']).timestamp() <= manifest_times.get(key, 0):
+            continue
+        expected[key] = event
+        if (event.get('status') != 'valid' or 'mtime_ns' not in event
+                or (events[key]['size'], events[key]['sha256']) == (event['size'], event['sha256'])):
+            continue
+        local = Path(event['local']) if event.get('local') else local_path(destination, event['path'])
+        if (local.exists() and local.stat().st_size == event['size']
+                and local.stat().st_mtime_ns == event['mtime_ns'] and not Path(str(local) + '.aria2').exists()):
+            events[key] = event
     def same_identity(row):
         identity = expected.get(normalized(row['path']))
         return identity is None or (identity['size'], identity['sha256']) == (row['size'], row['sha256'])

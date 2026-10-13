@@ -188,7 +188,7 @@ def inspect(root, item, course, path=None, stopping=None):
     return 'valid', 'SHA-256 verified'
 
 
-def record(state, item, course, attempt, status, detail, local=None, verified_stat=None):
+def record(state, item, course, attempt, status, detail, local=None, verified_stat=None, source_current=False):
     path = local if local is not None else local_path(state.parent, item['path'])
     stamp = None
     if status == 'valid':
@@ -202,6 +202,8 @@ def record(state, item, course, attempt, status, detail, local=None, verified_st
                  size=item['size'], sha256=item['sha256'])
     if local is not None:
         event['local'] = str(local)
+    if source_current:
+        event['source_current'] = True
     from progress import progress
     event.update(progress(path, item['size'], valid=status == 'valid', sha256=item['sha256']))
     if status == 'valid':
@@ -212,7 +214,7 @@ def record(state, item, course, attempt, status, detail, local=None, verified_st
     return event
 
 
-def inspect_copies(root, item, course, cached, source):
+def inspect_copies(root, item, course, cached, source, source_current=False):
     state = root / '.download'
     registry = state / 'local-copies.json'
     copies = json.loads(registry.read_text()) if registry.exists() else []
@@ -227,7 +229,8 @@ def inspect_copies(root, item, course, cached, source):
         stat = local.stat() if local.exists() else None
         verified_stat = [stat.st_ino, stat.st_size, stat.st_mtime_ns] if stat is not None else None
         status, detail = inspect(root, item, course, local)
-        event = record(state, item, course, 0, status, detail, local=local, verified_stat=verified_stat)
+        event = record(state, item, course, 0, status, detail, local=local, verified_stat=verified_stat,
+                       source_current=source_current)
         status = event['status']
         for copy in matching:
             if Path(copy['local']) == local:
@@ -413,7 +416,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                 if cached.get('local') and (deep or cached.get('status') == 'valid'):
                     local = Path(cached['local'])
                 if deep and not retry_check:
-                    event = inspect_copies(root, item, course, cached, source)
+                    event = inspect_copies(root, item, course, cached, source, source_current=True)
                     if event['status'] == 'valid':
                         verified += 1
                     else:
@@ -429,7 +432,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                     print('FILE SKIPPED: ' + item['path'] + '; previously SHA-256 verified', flush=True)
                 else:
                     if deep:
-                        event = inspect_copies(root, item, course, cached, source)
+                        event = inspect_copies(root, item, course, cached, source, source_current=True)
                         if event['status'] == 'valid':
                             verified += 1
                             continue

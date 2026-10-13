@@ -4,11 +4,52 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import download
 import report
 
 
 class RegistryReports(unittest.TestCase):
+    def test_fresh_deep_proof_overrides_old_manifest_until_new_source_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / '.download'
+            state.mkdir()
+            source = 'https://disk.yandex.ru/d/test'
+            data = dict(source=source, title='test')
+            item = dict(path='/Course/video.mp4', size=4,
+                        sha256=hashlib.sha256(b'NEW!').hexdigest(), file='https://example.test/file')
+            download.write_json(state / 'source.json', data)
+            download.write_json(state / 'courses.json', ['Course'])
+            manifest = state / '01-manifest.json'
+            old = dict(item, sha256=hashlib.sha256(b'OLD!').hexdigest())
+            download.write_json(manifest, [old])
+            manifest_before = manifest.read_bytes()
+            local = root / 'Course/video.mp4'
+            local.parent.mkdir()
+            local.write_bytes(b'NEW!')
+            repo = root / 'repo'
+            (repo / 'courses').mkdir(parents=True)
+            card = repo / 'courses/course.md'
+            card.write_text('- Год: 2026\n- Источник: [disk](' + source + ')\n- Путь: `Course`\n'
+                            '**Статус:** копия есть\n'
+                            '| Файл | Размер | Копия 1 | Копия 2 | Копия 3 |\n'
+                            '| --- | --- | --- | --- | --- |\n'
+                            '| `video.mp4` | 4 | Walterit | Other | |\n')
+            with patch.object(download, 'list_course', return_value=[item]):
+                self.assertEqual(download.download(data, ['Course'], root, retries=0, deep=True,
+                                                   report_repo=repo, mark='Walterit'), 0)
+            self.assertIn('Walterit', card.read_text())
+            self.assertEqual(manifest.read_bytes(), manifest_before)
+            download.record(state, old, 'Course', 1, 'invalid', 'Old pinned Range result')
+            report.update_report(root, repo, 'Walterit')
+            self.assertIn('Walterit', card.read_text())
+            download.write_json(manifest, [old])
+            report.update_report(root, repo, 'Walterit')
+            self.assertNotIn('Walterit', card.read_text())
+            self.assertIn('Other', card.read_text())
+
     def test_deleted_registered_copy_removes_only_its_owner_mark(self):
         for partial in (False, True):
             with self.subTest(partial=partial), tempfile.TemporaryDirectory() as directory:

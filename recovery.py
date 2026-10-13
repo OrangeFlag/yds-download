@@ -84,7 +84,7 @@ def _promote_partial(root, event):
             return True
     if destination.exists() and not old:
         raise FileExistsError('Unregistered partial copy: ' + str(destination))
-    copy_saved(path, destination)
+    copy_saved(path, destination, overwrite=bool(old))
     stat = destination.stat()
     copy = dict(event, source=source, recovered_path=str(destination.relative_to(root)),
                 local_size=stat.st_size, mtime_ns=stat.st_mtime_ns,

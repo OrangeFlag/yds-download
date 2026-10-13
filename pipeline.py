@@ -198,6 +198,10 @@ class Background:
         local = d.target(self.root, item, course)
         broken = r.body_path(self.root, event)
         broken.parent.mkdir(parents=True, exist_ok=True)
+        if (self.continuation(item).get('phase') == 'range' and local.exists() and broken.exists()
+                and r.saved_ranges(broken, item['size'], item['sha256']) == [[0, item['size']]]):
+            # Recovery may have copied the original before interruption; revalidate it in finish_recovery.
+            return
         for suffix in ('', '.aria2', '.ranges.json'):
             existing = Path(str(local) + suffix)
             if existing.exists():

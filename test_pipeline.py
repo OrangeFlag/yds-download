@@ -398,6 +398,43 @@ class PipelineChecks(unittest.TestCase):
     def test_restart_repairs_body_before_control_move(self):
         self.interrupted_archive(True)
 
+    def interrupted_recovery_copy(self, changed=False):
+        state = self.root / '.download'
+        state.mkdir()
+        item = self.items['First']
+        event = dict(item, course='First', attempt=1, status='partial', detail='Partial body',
+                     time='2026-01-01', corrupted_path='corrupted/old/First/video.mp4')
+        body = self.root / event['corrupted_path']
+        body.parent.mkdir(parents=True)
+        body.write_bytes(self.content)
+        download.write_json(Path(str(body) + '.ranges.json'),
+                            dict(size=item['size'], sha256=item['sha256'], ranges=[[0, item['size']]]))
+        download.write_json(self.root / 'corrupted/old/failed.json', [event])
+        download.write_json(state / 'course-history.json', {'First': dict(
+            source=self.data['source'], state='recovering', verified=0, failed=0)})
+        download.write_json(state / 'transfer-state.json', {item['path']: dict(
+            source=self.data['source'], size=item['size'], sha256=item['sha256'],
+            course='First', attempt=1, phase='range', event=event)})
+        with patch.object(download, 'record', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                recovery.finish_recovery(self.root, event, item, 0, background=True)
+        local = self.root / 'First/video.mp4'
+        if changed:
+            local.write_bytes(b'changed')
+        with patch.object(download, 'list_course', return_value=[item]), \
+                patch.object(download.OPENER, 'open', side_effect=AssertionError('Unexpected HTTP')), \
+                patch.object(pipeline, 'transfer_process', side_effect=AssertionError('Unexpected transfer')):
+            self.assertEqual(download.download(self.data, ['First'], self.root, retries=0), int(changed))
+        self.assertEqual(local.read_bytes(), b'changed' if changed else self.content)
+        self.assertEqual(body.read_bytes(), self.content)
+        self.assertEqual(json.loads((state / 'summary.json').read_text())['complete'], not changed)
+
+    def test_restart_reuses_copy_created_before_recovery_proof(self):
+        self.interrupted_recovery_copy()
+
+    def test_restart_preserves_changed_copy_created_before_recovery_proof(self):
+        self.interrupted_recovery_copy(changed=True)
+
     def test_sparse_resume_requires_space_for_unreceived_bytes(self):
         item = self.items['First']
         item['size'] = 5 * 1024 ** 3

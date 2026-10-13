@@ -94,3 +94,23 @@ class VerifiedStatTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 recovery.copy_saved(source, self.local, overwrite=False)
         self.assertEqual(self.local.read_bytes(), b'keep')
+
+    def test_partial_promotion_preserves_destination_created_during_copy(self):
+        download.write_json(self.state / 'source.json', dict(source='https://example.test/source'))
+        archive = self.root / 'corrupted/test/Course/video.mp4'
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b'goo')
+        download.write_json(Path(str(archive) + '.ranges.json'),
+                            dict(size=4, sha256=self.item['sha256'], ranges=[[0, 3]]))
+        event = dict(self.item, course='Course', status='partial',
+                     corrupted_path=str(archive.relative_to(self.root)))
+        destination = self.local.with_name('video' + recovery.SUFFIX + '.mp4')
+        original = recovery.subprocess.run
+        def create_destination(*args, **kwargs):
+            result = original(*args, **kwargs)
+            destination.write_bytes(b'keep')
+            return result
+        with patch.object(recovery.subprocess, 'run', side_effect=create_destination):
+            with self.assertRaises(FileExistsError):
+                recovery.promote_partial(self.root, event)
+        self.assertEqual(destination.read_bytes(), b'keep')
