@@ -15,6 +15,7 @@ import time
 
 import download as d
 import network
+import storage
 import recovery as r
 from settings import resolve
 
@@ -242,6 +243,7 @@ class Background:
             self.submit('range', item, course, attempt, self.archive(item, course, attempt, event), force=True)
 
     def poll(self):
+        storage.check(self.root)
         completed, failures = [], []
         for path, future in list(self.futures.items()):
             if len(completed) >= 64:
@@ -299,6 +301,7 @@ class Background:
             self.jobs.pop(path, None)
 
     def transfer(self, pending, course, previous_attempt=0):
+        storage.check(self.root)
         if previous_attempt:
             time.sleep(self.tuning['retry_delay'])
             fresh = {item['path']: item for item in d.list_course(self.source, course, self.retries, self.tuning['listing_retry_delay'])}
@@ -369,6 +372,7 @@ class Background:
 
 
 def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range=False, range_budget=None, range_files=16):
+    storage.check(root)
     tuning = resolve(tuning)
     if not all(shutil.which(name) for name in ('aria2c', 'cp')):
         raise RuntimeError('Install aria2c and coreutils first')

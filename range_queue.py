@@ -14,6 +14,7 @@ from threading import Event, Lock, Semaphore
 import time
 
 import download as d
+import storage
 from pipeline import Background, failure_manifests, now
 import recovery as r
 from settings import resolve
@@ -177,6 +178,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
             ThreadPoolExecutor(max_workers=files, thread_name_prefix='range-file') as pool:
         try:
             while not stopping.is_set():
+                for queue in queues:
+                    storage.check(queue)
                 # Poll applies every result under the archive's exclusive download lock.
                 for root, (background, lock, config) in list(roots.items()):
                     before = len(background.futures)
@@ -305,4 +308,10 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except OSError as error:
+        if not storage.disk_error(error):
+            raise
+        print('DISK OFFLINE: resume state retained', flush=True)
+        raise SystemExit(storage.TEMPFAIL)

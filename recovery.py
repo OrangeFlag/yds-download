@@ -16,6 +16,7 @@ from threading import Event, Lock
 import urllib.request
 import urllib.error
 import network
+import storage
 from progress import merge_ranges, saved_ranges, progress
 from settings import resolve
 
@@ -23,6 +24,7 @@ SUFFIX = ' (partially available)'
 
 
 def body_path(root, event):
+    storage.check(root)
     path = root / event['corrupted_path']
     if not path.resolve().is_relative_to(root / 'corrupted'):
         raise ValueError('Unsafe corrupted path')
@@ -542,7 +544,7 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
         except InterruptedError:
             raise
         except OSError as error:
-            if background and not isinstance(error, urllib.error.URLError):
+            if storage.disk_error(error) or background and not isinstance(error, urllib.error.URLError):
                 raise
             event['recovery_error'] = str(error)
             print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)
@@ -721,6 +723,8 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                     raise ValueError('File no longer listed in source')
             finish_recovery(root, event, item, retries, _redownload=not local_only, tuning=tuning)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            if storage.disk_error(error):
+                raise
             event['recovery_error'] = str(error)
             print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)
             if isinstance(error, OSError):

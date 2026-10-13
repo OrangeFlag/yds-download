@@ -18,6 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import network
+import storage
 from settings import OPTIONS, add_arguments, resolve
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -28,6 +29,7 @@ HASH_LOCK = Lock()
 
 
 def sha256_file(path, stopping=None):
+    storage.check(path)
     while not HASH_LOCK.acquire(timeout=0.25):
         if stopping is not None and stopping.is_set():
             raise InterruptedError('SHA interrupted')
@@ -39,6 +41,7 @@ def sha256_file(path, stopping=None):
                 if stopping is not None and stopping.is_set():
                     raise InterruptedError('SHA interrupted')
                 digest.update(chunk)
+            os.fsync(stream.fileno())
         after = path.stat()
         if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
             raise OSError('File changed during SHA verification')
@@ -138,10 +141,18 @@ def target(root, item, course):
 
 
 def write_json(path, data):
+    storage.check(path)
     with STATE_LOCK:
         temporary = path.with_name(path.name + '.tmp')
-        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        with temporary.open('w', encoding='utf-8') as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.flush(); os.fsync(stream.fileno())
         temporary.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def read_events(path, repair=False):
@@ -171,6 +182,7 @@ def read_events(path, repair=False):
 
 
 def inspect(root, item, course, path=None, stopping=None):
+    storage.check(root)
     path = path if path is not None else target(root, item, course)
     if not path.exists():
         return 'missing', 'No local file'
@@ -190,6 +202,7 @@ def inspect(root, item, course, path=None, stopping=None):
 
 
 def record(state, item, course, attempt, status, detail, local=None, verified_stat=None, source_current=False):
+    storage.check(state)
     path = local if local is not None else local_path(state.parent, item['path'])
     stamp = None
     if status == 'valid':
@@ -638,7 +651,7 @@ def main():
                 raise ValueError('Selected courses no longer exist in the source folder')
         return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep, args.retry_check, tuning, args.defer_range, args.range_budget, args.range_files)
     except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
-        parser.exit(2, f'Error: {error}\n')
+        parser.exit(storage.TEMPFAIL if storage.disk_error(error) else 2, f'Error: {error}\n')
 
 
 def cli(entrypoint):
@@ -658,6 +671,11 @@ def cli(entrypoint):
     except KeyboardInterrupt:
         print('STOPPED: interrupted; resume state retained', flush=True)
         return exit_code
+    except OSError as error:
+        if not storage.disk_error(error):
+            raise
+        print('DISK OFFLINE: resume state retained', flush=True)
+        return storage.TEMPFAIL
     finally:
         for number, handler in previous.items():
             signal.signal(number, handler)

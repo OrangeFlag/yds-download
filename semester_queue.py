@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import time
 from datetime import datetime
+import storage
 from download import cli, write_json
 from pipeline import transfer_process
 from metrics import Metrics
@@ -24,6 +25,7 @@ def main():
     args = parser.parse_args()
     if args.range_budget is not None and (not args.defer_range or args.range_files < 1):
         parser.error('--range-budget requires --defer-range and positive --range-files')
+    storage.check(args.queue)
     path = args.queue.resolve()
     with path.with_suffix('.lock').open('a') as lock, Metrics(path.with_suffix('.metrics.jsonl'),'semester-queue',
             interval=resolve(json.loads(path.read_text()).get('tuning',{}))['metrics_interval']) as metrics:
@@ -80,6 +82,8 @@ def main():
             code = transfer_process(command, env=os.environ.copy(), on_tick=lambda: metrics.gauge('archives',dict(Counter(a.get('state','pending') for a in data['archives']))), stop_timeout=80)
             if code in (130, -2, 143, -15):
                 raise KeyboardInterrupt
+            if code == storage.TEMPFAIL:
+                raise storage.StorageUnavailable(args.queue)
             job.update(exit_code=code, time=datetime.now().astimezone().isoformat())
             if code not in (0, 1):
                 job['state'] = 'blocked'
