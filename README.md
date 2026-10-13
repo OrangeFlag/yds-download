@@ -422,7 +422,7 @@ mkdir -p /absolute/path/backup/folder
 python3 range_queue.py --queue PERSONAL_QUEUE.json --queue SEMESTER_QUEUE.json
 ```
 
-По умолчанию: `--files 4 --requests-per-file 2 --requests 8 --rps 12`.
+По умолчанию: `--files 4 --requests-per-file 2 --requests 12 --rps 12`.
 Ограничения запросов общие для обеих очередей; при наличии работы для курсов
 им оставляется один слот. `--secondary-slots N` задаёт число слотов для
 последующих очередей, когда первая тоже занята; например, `--files 8

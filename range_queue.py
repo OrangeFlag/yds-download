@@ -21,7 +21,7 @@ from metrics import Metrics
 
 
 class RangeBudget:
-    def __init__(self, requests=8, rps=12):
+    def __init__(self, requests=12, rps=12):
         if requests < 1 or not math.isfinite(rps) or rps <= 0:
             raise ValueError('Range request limits must be positive')
         self.slots = Semaphore(requests)
@@ -158,7 +158,7 @@ def finish_courses(background, config, changed_courses=()):
                  failed=failed, pending_courses=pending, downloads_complete=True, complete=not failed and not pending))
 
 
-def run(queues, files=4, per_file=2, requests=8, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60):
+def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60):
     if files < 1 or per_file < 1:
         raise ValueError('Range file limits must be positive')
     if not 1 <= secondary_slots <= max(1, files - 1):
@@ -290,7 +290,7 @@ def main():
     parser.add_argument('--files', type=int, default=4)
     parser.add_argument('--secondary-slots', type=int, default=1, help='File slots reserved for later queues while the first queue has work')
     parser.add_argument('--requests-per-file', type=int, default=2)
-    parser.add_argument('--requests', type=int, default=8)
+    parser.add_argument('--requests', type=int, default=12)
     parser.add_argument('--rps', type=float, default=12)
     parser.add_argument('--metrics-interval',type=int,default=60,help='Service metrics interval, seconds')
     parser.add_argument('--budget', type=Path, help='Share the HTTP budget with overlapping ordinary downloaders')

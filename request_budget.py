@@ -8,7 +8,7 @@ import time
 
 
 class ProcessRangeBudget:
-    def __init__(self, directory, requests=8, rps=12):
+    def __init__(self, directory, requests=12, rps=12):
         if requests < 1 or not math.isfinite(rps) or rps <= 0:
             raise ValueError('Range request limits must be positive')
         self.directory = Path(directory)
