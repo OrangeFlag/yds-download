@@ -231,6 +231,9 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
         retry = network.RequestRetry(item['sha256'] + item['path'], stopping)
         auth_replayed = False
         while True:
+            if refresh_errors:
+                result = bounds, data or None, 'Interrupted'
+                break
             timing['last_failure'] = None
             result = fetch_limited((bounds[0] + len(data), bounds[1]), timing)
             data.extend(result[1] or b'')
@@ -242,10 +245,10 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
             try:
                 if details and details['http_status'] in (401, 403) and not auth_replayed:
                     while not refresh_lock.acquire(timeout=.25):
-                        if stopping.is_set():
+                        if stopping.is_set() or refresh_errors:
                             raise InterruptedError('Link refresh interrupted')
                     try:
-                        if stopping.is_set():
+                        if stopping.is_set() or refresh_errors:
                             raise InterruptedError('Link refresh interrupted')
                         if not pass_refreshed and item['file'] == failed_url:
                             item = refresh()
@@ -254,17 +257,15 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                         raise
                     except Exception as error:
                         refresh_errors.append(error)
-                        stopping.set()
                         raise InterruptedError('Link metadata unavailable') from error
                     finally:
                         refresh_lock.release()
                     auth_replayed = True
                     timing['retry_reasons']['link_expired'] = 1
                     continue
-                again = (len(data) < bounds[1] - bounds[0] and result[2] is not None
+                again = (not refresh_errors and len(data) < bounds[1] - bounds[0] and result[2] is not None
                          and details is not None and retry.retry(details))
             except InterruptedError:
-                stopping.set()
                 result = bounds, data or None, 'Interrupted'
                 break
             if not again:
@@ -296,13 +297,13 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
         with rate_lock:
             delay = max(0, next_request - time.monotonic())
             while delay > 0:
-                if stopping.is_set():
+                if stopping.is_set() or refresh_errors:
                     return bounds, None, 'Interrupted'
                 pause = min(delay, 0.25)
                 time.sleep(pause)
                 delay -= pause
             next_request = time.monotonic() + 1 / tuning['range_rps']
-        if stopping.is_set():
+        if stopping.is_set() or refresh_errors:
             return bounds, None, 'Interrupted'
         timing['_request_url'] = item['file']
         request = urllib.request.Request(timing['_request_url'], headers={'Range': f'bytes={start}-{end - 1}', 'Accept-Encoding': 'identity'})
@@ -336,7 +337,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                 error = None
                 phase = 'body'
                 try:
-                    while len(data) < length and not stopping.is_set():
+                    while len(data) < length and not stopping.is_set() and not refresh_errors:
                         chunk = response.read1(min(64 * 1024, length - len(data)))
                         if not chunk:
                             break
@@ -444,6 +445,8 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
             try:
                 pending = iter(batch)
                 for _ in range(workers):
+                    if refresh_errors:
+                        break
                     bounds = next(pending, None)
                     if bounds is not None:
                         futures.add(pool.submit(fetch, bounds))
@@ -458,7 +461,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                                   and len(rows) > tuning['range_failure_limit']
                                   and not any(row['saved_bytes'] for row in rows))
                         bounds = None if cutoff else next(pending, None)
-                        if bounds is not None and not stopping.is_set():
+                        if bounds is not None and not stopping.is_set() and not refresh_errors:
                             futures.add(pool.submit(fetch, bounds))
                             submitted += 1
             except KeyboardInterrupt:
@@ -472,9 +475,9 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                 pool.shutdown(wait=True, cancel_futures=True)
                 for row in outcomes[first_outcome:]:
                     row['mode'] = mode
+            if refresh_errors:
+                raise refresh_errors[0]
             if stopping.is_set():
-                if refresh_errors:
-                    raise refresh_errors[0]
                 raise InterruptedError('Range interrupted')
             return len(batch) - submitted
 

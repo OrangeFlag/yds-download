@@ -181,6 +181,18 @@ class AdaptiveRangeTest(unittest.TestCase):
         self.assertEqual(ranges,[[0,len(self.content)]])
         self.assertEqual(api.call_count,2)
 
+    def test_link_refresh_failure_does_not_cancel_unrelated_files(self):
+        import network
+        stop=Event()
+        failure=urllib.error.HTTPError('hidden',503,'Metadata unavailable',{},None)
+        self.tuning.update(range_block_size_kib=128,range_max_passes=1)
+        with patch.object(download,'api',side_effect=[self.item,failure]), \
+                patch.object(download.OPENER,'open',side_effect=urllib.error.HTTPError('hidden',403,'Expired',{},None)):
+            with self.assertRaises(urllib.error.HTTPError):
+                recovery.retry_ranges(self.root,self.event,self.item,2,self.tuning,stopping=stop)
+        self.assertFalse(stop.is_set())
+        self.assertEqual(network.retry_request(lambda:'healthy',stop,target='unrelated'),'healthy')
+
     def test_request_measurements_distinguish_wait_network_and_save(self):
         def serve(request, timeout):
             start, end = map(int, request.get_header('Range')[6:].split('-'))
