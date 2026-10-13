@@ -106,7 +106,7 @@ class NetworkGuard:
             if error is None or error['category'] == 'http':
                 self.last_success = now
                 self.failures.pop(target, None)
-            elif error['category'] == 'routing' or (error['category'] == 'ambiguous' and error['phase'] != 'body'):
+            elif error['category'] == 'routing' or (error['category'] == 'ambiguous' and error['phase'] not in ('body', 'headers', 'response_headers')):
                 self.failures[target] = now
                 if len(self.failures) > 256:
                     del self.failures[min(self.failures, key=self.failures.get)]
@@ -137,7 +137,7 @@ class RequestRetry:
             raise InterruptedError('Request retry interrupted')
         correlated = GUARD.observe(self.target, error)
         category = error['category']
-        confirmed = category == 'routing' or category == 'ambiguous' and error['phase'] != 'body' and correlated
+        confirmed = category == 'routing' or category == 'ambiguous' and error['phase'] not in ('body', 'headers', 'response_headers') and correlated
         limited = category == 'ambiguous' or category == 'http' and error['http_status'] in (429, 503)
         if not confirmed:
             if not limited or self.confirmations >= self.confirmation_retries:

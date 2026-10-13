@@ -51,10 +51,12 @@ def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
         target = str(log)
         message = []
         error_target, error_position = target, 0
+        phases = {}
+        target_phase = error_phase = 'unknown'
         final_error = True
         def finish_error():
             if message:
-                failures[error_target] = error_position, network.failure(''.join(message))
+                failures[error_target] = error_position, network.failure(''.join(message), error_phase)
                 message.clear()
         with log.open() as stream:
             stream.seek(offset)
@@ -62,9 +64,18 @@ def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
                 level = re.match(r'^\d{4}-\d{2}-\d{2} \S+ \[(\w+)\]',line)
                 if level:
                     final_error = level[1] == 'ERROR'
+                cuid = re.search(r'\bCUID#(\d+)\b', line)
+                if level and cuid:
+                    if ' - Connecting to ' in line:
+                        phases[cuid[1]] = 'connect'
+                    elif ' - Requesting:' in line:
+                        phases[cuid[1]] = 'response_headers'
+                    elif ' - Response received:' in line:
+                        phases[cuid[1]] = 'body'
                 if line.startswith('Exception:') and final_error:
                     finish_error()
                     error_target, error_position = target, position
+                    error_phase = target_phase
                     message.append(line)
                 elif message and line.lstrip().startswith('->'):
                     message.append(line)
@@ -72,6 +83,7 @@ def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
                     finish_error()
                     if 'Download aborted. URI=' in line:
                         target = aria_resource(line.partition('URI=')[2].strip())
+                        target_phase = phases.get(cuid[1], 'unknown') if cuid else 'unknown'
                     elif 'Download complete:' in line:
                         local = line.partition('Download complete:')[2].strip()
                         completed[local] = position

@@ -259,3 +259,38 @@ Exception: errorCode=22 HTTP Error 500
         error = subprocess.CalledProcessError(128, ['git', 'push'], stderr='connect: No route to host')
         self.assertEqual(network.failure(error)['category'], 'routing')
         self.assertEqual(network.failure(subprocess.CalledProcessError(128, ['git', 'push'], stderr='non-fast-forward'))['category'], 'other')
+
+    def test_header_timeouts_remain_bounded_during_correlated_connection_errors(self):
+        with patch.object(network.time, 'monotonic', return_value=100):
+            for target in ('a', 'b', 'c'):
+                self.guard.observe(target, network.failure(TimeoutError(), 'connect'))
+            retry = network.RequestRetry('slow-response', self.stop)
+            for expected in (True, True, False):
+                self.assertEqual(retry.retry(network.failure(TimeoutError(), 'response_headers')), expected)
+
+    def test_aria_distinguishes_response_wait_from_connection_outage(self):
+        import pipeline
+        for cause, request_sent, expected_code, expected_calls in (
+                ('Timeout.', True, 1, 3),
+                ('Timeout.', False, 0, 4),
+                ('No route to host', True, 0, 4)):
+            with self.subTest(cause=cause, request_sent=request_sent), tempfile.TemporaryDirectory() as directory:
+                with patch.object(network, 'GUARD', network.NetworkGuard()):
+                    log = Path(directory) / 'aria.log'
+                    calls = []
+                    def run(*args, **kwargs):
+                        calls.append(1)
+                        if len(calls) == 4:
+                            return 0
+                        with log.open('a') as stream:
+                            for cuid, name in enumerate(('a', 'b', 'c'), 1):
+                                stream.write(f'2026-10-14 00:00:00.000000 [INFO] CUID#{cuid} - Connecting to 192.0.2.1:443\n')
+                                if request_sent:
+                                    stream.write(f'2026-10-14 00:00:00.050000 [INFO] CUID#{cuid} - Requesting:\nGET /{name} HTTP/1.1\n')
+                                stream.write(f'2026-10-14 00:01:00.000000 [ERROR] CUID#{cuid} - Download aborted. URI=https://example.invalid/{name}\nException: errorCode=2 {cause}\n')
+                        return 1
+                    with patch.object(pipeline, '_transfer_process_once', side_effect=run):
+                        code = pipeline.transfer_process(['aria2c', '--log='+str(log)], env={},
+                                                         on_tick=lambda: None, stopping=self.stop)
+                    self.assertEqual(code, expected_code)
+                    self.assertEqual(len(calls), expected_calls)
