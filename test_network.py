@@ -143,6 +143,58 @@ class NetworkChecks(unittest.TestCase):
                 self.assertEqual(pipeline.transfer_process(['aria2c', '--log='+str(log)], env={}, on_tick=lambda: None, stopping=self.stop), 1)
             self.assertEqual(transfer.call_count, 3)
 
+    def test_mixed_address_failures_preserve_nonrouting_cause(self):
+        errors = ExceptionGroup('addresses', [TimeoutError(errno.ETIMEDOUT, 'IPv4 timeout'),
+                                              OSError(errno.ENETUNREACH, 'IPv6 unavailable')])
+        with patch.object(socket, 'create_connection', side_effect=errors) as connect:
+            with self.assertRaises(TimeoutError):
+                network.connect(('example.invalid', 443), timeout=1)
+        self.assertTrue(connect.call_args.kwargs['all_errors'])
+
+    def test_all_addresses_unreachable_remain_confirmed_routing(self):
+        errors = ExceptionGroup('addresses', [OSError(errno.EHOSTUNREACH, 'IPv4 unavailable'),
+                                              OSError(errno.ENETUNREACH, 'IPv6 unavailable')])
+        with patch.object(socket, 'create_connection', side_effect=errors):
+            with self.assertRaises(OSError) as caught:
+                network.connect(('example.invalid', 443), timeout=1)
+        self.assertEqual(network.failure(caught.exception)['category'], 'routing')
+
+    def test_https_connection_keeps_standard_tls_context(self):
+        import ssl
+        context = ssl.create_default_context()
+        conn = network.connection(http.client.HTTPSConnection, 'example.invalid', context=context)
+        self.assertIs(conn._context, context)
+        self.assertIs(conn._create_connection, network.connect)
+
+    def test_three_persistent_body_eofs_remain_bounded(self):
+        retry = network.RequestRetry('c', self.stop)
+        for target in ('a', 'b'):
+            self.guard.observe(target, network.failure('Got EOF from the server'))
+        for expected in (True, True, False):
+            self.assertEqual(retry.retry(network.failure('Got EOF from the server')), expected)
+
+    def test_completed_aria_file_does_not_retry_other_http_failure(self):
+        import pipeline
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            log = directory / 'aria.log'
+            queue = directory / 'queue.txt'
+            queue.write_text('https://download.invalid/a?filename=a\n dir='+str(directory)+'\n out=a\n'
+                             'https://download.invalid/b?filename=b\n dir='+str(directory)+'\n out=b\n')
+            self.stop.wait.side_effect = [False, False, True]
+            def run(*args, **kwargs):
+                with log.open('a') as stream:
+                    stream.write('Download aborted. URI=https://storage.invalid/a?filename=a\n'
+                                 'Exception: errorCode=1 cause: No route to host\n'
+                                 'Download complete: '+str(directory/'a')+'\n'
+                                 'Download aborted. URI=https://storage.invalid/b?filename=b\n'
+                                 'Exception: errorCode=22 status=500\n')
+                return 1
+            with patch.object(pipeline, '_transfer_process_once', side_effect=run) as transfer:
+                self.assertEqual(pipeline.transfer_process(['aria2c','--log='+str(log),'--input-file='+str(queue)],
+                                 env={},on_tick=lambda:None,stopping=self.stop),1)
+            transfer.assert_called_once()
+
     def test_subprocess_failure_uses_cause_not_exit_status(self):
         error = subprocess.CalledProcessError(128, ['git', 'push'], stderr='connect: No route to host')
         self.assertEqual(network.failure(error)['category'], 'routing')

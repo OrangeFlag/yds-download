@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 import download
 import pipeline
+import network
 import recovery
 import storage
 
@@ -23,27 +24,26 @@ class OutageIntegrationChecks(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.state = self.root / '.download'; self.state.mkdir()
+        guard = patch.object(network, 'GUARD', network.NetworkGuard())
+        guard.start(); self.addCleanup(guard.stop)
         self.item = dict(path='/Course/video.mp4', size=7, sha256=hashlib.sha256(b'lecture').hexdigest(),
                          file='https://example.invalid/video')
 
     def test_api_waits_without_spending_metadata_attempt(self):
         with patch.object(download.OPENER, 'open', side_effect=[urllib_error(), io.BytesIO(b'{"name":"course"}')]) as call, \
-                patch('network.RequestRetry.retry', return_value=True) as wait, \
-                patch.object(download.time, 'sleep'):
+                patch.object(download.time, 'sleep') as delay:
             self.assertEqual(download.api('public-source'), {'name': 'course'})
         self.assertEqual(call.call_count, 2)
-        wait.assert_called_once()
-
-    def test_api_incomplete_body_waits_without_spending_attempt(self):
-        import http.client
-        with patch.object(download.OPENER, 'open', side_effect=[http.client.IncompleteRead(b'{'), io.BytesIO(b'{"name":"course"}')]), \
-                patch('network.RequestRetry.retry', return_value=True) as wait, \
-                patch.object(download.time, 'sleep') as delay:
-            self.assertEqual(download.api('source'), {'name': 'course'})
-        wait.assert_called_once()
         delay.assert_not_called()
 
-    def test_api_truncated_close_delimited_json_waits_without_spending_attempt(self):
+    def test_api_incomplete_body_uses_bounded_metadata_retry(self):
+        import http.client
+        with patch.object(download.OPENER, 'open', side_effect=[http.client.IncompleteRead(b'{'), io.BytesIO(b'{"name":"course"}')]), \
+                patch.object(download.time, 'sleep') as delay:
+            self.assertEqual(download.api('source'), {'name': 'course'})
+        delay.assert_called_once_with(2)
+
+    def test_api_truncated_close_delimited_json_uses_bounded_metadata_retry(self):
         for body in (b'{"name":', b'{"name":"\xd0'):
             with self.subTest(body=body):
                 socket = Mock()
@@ -51,15 +51,13 @@ class OutageIntegrationChecks(unittest.TestCase):
                     b'HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n' + body)
                 response = http.client.HTTPResponse(socket); response.begin()
                 with patch.object(download.OPENER, 'open', side_effect=[response, io.BytesIO(b'{"name":"course"}')]), \
-                        patch('network.RequestRetry.retry', return_value=True) as wait, \
                         patch.object(download.time, 'sleep') as delay:
                     self.assertEqual(download.api('source'), {'name': 'course'})
-                wait.assert_called_once()
-                delay.assert_not_called()
+                delay.assert_called_once_with(2)
 
     def test_api_invalid_json_online_has_bounded_server_retries(self):
         with patch.object(download.OPENER, 'open', side_effect=lambda *args, **kwargs: io.BytesIO(b'{')) as request, \
-                patch('network.RequestRetry.retry', return_value=False), patch.object(download.time, 'sleep'):
+                patch.object(download.time, 'sleep'):
             with self.assertRaises(json.JSONDecodeError):
                 download.api('source')
         self.assertEqual(request.call_count, 5)
@@ -67,7 +65,7 @@ class OutageIntegrationChecks(unittest.TestCase):
     def test_api_wait_is_interruptible(self):
         from threading import Event
         with patch.object(download.OPENER, 'open', side_effect=urllib_error()), \
-                patch('network.RequestRetry.retry', side_effect=InterruptedError), patch.object(download.time, 'sleep'):
+                patch.object(network.Event, 'wait', return_value=True), patch.object(download.time, 'sleep'):
             with self.assertRaises(InterruptedError):
                 download.api('public-source', stopping=Event())
 

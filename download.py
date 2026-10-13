@@ -23,7 +23,7 @@ import network
 import storage
 from settings import OPTIONS, add_arguments, resolve
 
-OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), network.HTTPHandler(), network.HTTPSHandler())
 ENV = {k: v for k, v in os.environ.items()
        if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy')}
 STATE_LOCK = RLock()

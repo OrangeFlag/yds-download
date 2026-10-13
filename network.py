@@ -1,6 +1,7 @@
 """Retry real requests using their causes and recent request outcomes."""
 import errno
 from email.utils import parsedate_to_datetime
+from functools import partial
 import http.client
 import json
 import re
@@ -9,6 +10,7 @@ import subprocess
 import time
 from threading import Event, Lock
 import urllib.error
+import urllib.request
 
 
 def retry_after(headers):
@@ -23,6 +25,8 @@ def retry_after(headers):
 
 def failure(error, phase='unknown'):
     phase = getattr(error, 'network_phase', phase)
+    if isinstance(error, (http.client.IncompleteRead, json.JSONDecodeError, UnicodeDecodeError)):
+        phase = 'body'
     if isinstance(error, urllib.error.HTTPError):
         return dict(category='http', phase='headers', error_type='HTTPError', errno=None,
                     http_status=error.code, retry_after=retry_after(error.headers))
@@ -40,6 +44,8 @@ def failure(error, phase='unknown'):
         text = error if isinstance(error, str) else (error.stderr or error.output or '')
         if isinstance(text, bytes):
             text = text.decode('utf8', errors='replace')
+        if re.search(r'\beof\b|incomplete response', text, re.I):
+            phase = 'body'
         status = re.search(r'(?:status=|HTTP(?: Error)?[ :]+)([45][0-9]{2})\b', text)
         if status:
             return dict(category='http', phase='headers', error_type='HTTPError', errno=None,
@@ -58,6 +64,33 @@ def failure(error, phase='unknown'):
                 http_status=None)
 
 
+def connect(*args, **kwargs):
+    try:
+        return socket.create_connection(*args, **kwargs, all_errors=True)
+    except ExceptionGroup as errors:
+        # An unrouted IPv6 address must not hide an IPv4 timeout or refusal.
+        for error in errors.exceptions:
+            if failure(error)['category'] != 'routing':
+                raise error
+        raise errors.exceptions[0]
+
+
+def connection(factory, *args, **kwargs):
+    result = factory(*args, **kwargs)
+    result._create_connection = connect
+    return result
+
+
+class HTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, request):
+        return self.do_open(partial(connection, http.client.HTTPConnection), request)
+
+
+class HTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, request):
+        return self.do_open(partial(connection, http.client.HTTPSConnection), request, context=self._context)
+
+
 class NetworkGuard:
     def __init__(self):
         self.lock = Lock()
@@ -71,7 +104,7 @@ class NetworkGuard:
             if error is None or error['category'] == 'http':
                 self.last_success = now
                 self.failures.pop(target, None)
-            elif error['category'] in ('routing', 'ambiguous'):
+            elif error['category'] == 'routing' or (error['category'] == 'ambiguous' and error['phase'] != 'body'):
                 self.failures[target] = now
                 if len(self.failures) > 256:
                     del self.failures[min(self.failures, key=self.failures.get)]
@@ -95,7 +128,7 @@ class RequestRetry:
             raise InterruptedError('Request retry interrupted')
         correlated = GUARD.observe(self.target, error)
         category = error['category']
-        confirmed = category == 'routing' or category == 'ambiguous' and correlated
+        confirmed = category == 'routing' or category == 'ambiguous' and error['phase'] != 'body' and correlated
         limited = category == 'ambiguous' or category == 'http' and error['http_status'] in (429, 503)
         if not confirmed:
             if not limited or self.confirmations >= self.confirmation_retries:

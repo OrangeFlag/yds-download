@@ -226,6 +226,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
         data = bytearray()
         retry = network.RequestRetry(item['sha256'] + item['path'], stopping)
         while True:
+            timing['last_failure'] = None
             result = fetch_limited((bounds[0] + len(data), bounds[1]), timing)
             data.extend(result[1] or b'')
             details = timing['last_failure']

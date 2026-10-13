@@ -13,6 +13,7 @@ import signal
 import subprocess
 from threading import Event
 import time
+import urllib.parse
 
 import download as d
 import network
@@ -25,8 +26,26 @@ def now():
     return datetime.now().astimezone().isoformat()
 
 
+def aria_resource(url):
+    parsed = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    name = query.get('filename', [urllib.parse.unquote(parsed.path)])[0]
+    return name, query.get('hid', [''])[0], query.get('fsize', [''])[0]
+
+
 def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
     log = next((Path(arg[6:]) for arg in command if arg.startswith('--log=')), None)
+    inputs = next((Path(arg[13:]) for arg in command if arg.startswith('--input-file=')), None)
+    destinations = {}
+    if inputs is not None:
+        resource, directory = None, None
+        for line in inputs.read_text().splitlines():
+            if line.startswith(('http://', 'https://')):
+                resource, directory = aria_resource(line), None
+            elif line.startswith(' dir='):
+                directory = Path(line[5:])
+            elif line.startswith(' out=') and resource is not None and directory is not None:
+                destinations.setdefault(resource, set()).add(str(directory / line[5:]))
     retry = network.RequestRetry(str(log), stopping)
     while True:
         offset = log.stat().st_size if log is not None and log.exists() else 0
@@ -34,22 +53,27 @@ def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
         if (command[0] != 'aria2c' or code in (0, 9, 130, -2, 143, -15)
                 or stopping is not None and stopping.is_set() or log is None):
             return code
-        error = None
-        error_target = target = str(log)
+        failures, completed = {}, set()
+        target = str(log)
         with log.open() as stream:
             stream.seek(offset)
             for line in stream:
                 if 'Download aborted. URI=' in line:
-                    target = line.partition('URI=')[2].strip()
+                    target = aria_resource(line.partition('URI=')[2].strip())
                 elif line.startswith('Exception:'):
-                    current = network.failure(line, 'transfer')
-                    network.GUARD.observe(target, current)
-                    priority = {'other': 0, 'http': 1, 'ambiguous': 2, 'routing': 3}
-                    if error is None or priority[current['category']] > priority[error['category']]:
-                        error, error_target = current, target
+                    failures[target] = network.failure(line)
                 elif 'Download complete:' in line:
-                    network.GUARD.observe(line.partition('Download complete:')[2].strip())
-        retry.target = error_target
+                    local = line.partition('Download complete:')[2].strip()
+                    completed.add(local)
+                    network.GUARD.observe(local)
+        error = None
+        priority = {'other': 0, 'http': 1, 'ambiguous': 2, 'routing': 3}
+        for target, current in failures.items():
+            if destinations.get(target) and destinations[target] <= completed:
+                continue
+            network.GUARD.observe(target, current)
+            if error is None or priority[current['category']] > priority[error['category']]:
+                error, retry.target = current, target
         if error is None or not retry.retry(error):
             return code
 

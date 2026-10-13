@@ -93,6 +93,29 @@ class AdaptiveRangeTest(unittest.TestCase):
         self.assertEqual(row['request_errors']['connect:routing:113:None'], 1)
         self.assertEqual(len(requests), 2)
 
+    def test_stop_before_budget_admission_does_not_duplicate_route_failure(self):
+        import errno, network
+        stopping = Event()
+        rows = []
+        class Budget:
+            calls = 0
+            @contextmanager
+            def request(self, stop):
+                self.calls += 1
+                if self.calls == 2:
+                    stop.set()
+                    raise InterruptedError('Budget wait stopped')
+                yield
+        metrics = type('Metrics', (), {'range_request': lambda _, row: rows.append(row)})()
+        with patch.object(network.RequestRetry, 'retry', new=self.actual_retry), \
+                patch.object(download, 'api', return_value=self.item), \
+                patch.object(download.OPENER, 'open', side_effect=urllib.error.URLError(OSError(errno.EHOSTUNREACH, 'Filtered'))):
+            with self.assertRaises(InterruptedError):
+                recovery.retry_ranges(self.root, self.event, self.item, 2, self.tuning,
+                                      stopping=stopping, request_budget=Budget(), metrics=metrics)
+        self.assertEqual(rows[0]['request_attempts'], 1)
+        self.assertEqual(rows[0]['request_errors'], {'connect:routing:113:None': 1})
+
     def test_request_measurements_distinguish_wait_network_and_save(self):
         def serve(request, timeout):
             start, end = map(int, request.get_header('Range')[6:].split('-'))
