@@ -95,7 +95,8 @@ def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
             if destinations.get(target) and destinations[target] <= completed.keys():
                 continue
             observations.append((position, target, current))
-            if error is None or priority[current['category']] > priority[error['category']]:
+            rank = (priority[current['category']], current['phase'] not in ('body', 'headers', 'response_headers'))
+            if error is None or rank > (priority[error['category']], error['phase'] not in ('body', 'headers', 'response_headers')):
                 error, retry.target = current, target
         for _, target, current in sorted(observations, key=lambda row: row[0]):
             network.GUARD.observe(target, current)

@@ -270,11 +270,12 @@ Exception: errorCode=22 HTTP Error 500
 
     def test_aria_distinguishes_response_wait_from_connection_outage(self):
         import pipeline
-        for cause, request_sent, expected_code, expected_calls in (
-                ('Timeout.', True, 1, 3),
-                ('Timeout.', False, 0, 4),
-                ('No route to host', True, 0, 4)):
-            with self.subTest(cause=cause, request_sent=request_sent), tempfile.TemporaryDirectory() as directory:
+        for cause, requests_sent, expected_code, expected_calls in (
+                ('Timeout.', (True, True, True), 1, 3),
+                ('Timeout.', (False, False, False), 0, 4),
+                ('No route to host', (True, True, True), 0, 4),
+                ('Timeout.', (True, False, False, False), 0, 4)):
+            with self.subTest(cause=cause, requests_sent=requests_sent), tempfile.TemporaryDirectory() as directory:
                 with patch.object(network, 'GUARD', network.NetworkGuard()):
                     log = Path(directory) / 'aria.log'
                     calls = []
@@ -283,7 +284,8 @@ Exception: errorCode=22 HTTP Error 500
                         if len(calls) == 4:
                             return 0
                         with log.open('a') as stream:
-                            for cuid, name in enumerate(('a', 'b', 'c'), 1):
+                            for cuid, request_sent in enumerate(requests_sent, 1):
+                                name = str(cuid)
                                 stream.write(f'2026-10-14 00:00:00.000000 [INFO] CUID#{cuid} - Connecting to 192.0.2.1:443\n')
                                 if request_sent:
                                     stream.write(f'2026-10-14 00:00:00.050000 [INFO] CUID#{cuid} - Requesting:\nGET /{name} HTTP/1.1\n')

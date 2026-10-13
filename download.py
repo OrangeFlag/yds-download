@@ -520,7 +520,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                     f"--auto-save-interval={tuning['auto_save_interval']}", '--max-tries=1',
                     f"--connect-timeout={tuning['connect_timeout']}", f"--timeout={tuning['timeout']}",
                     f"--summary-interval={tuning['summary_interval']}", '--enable-color=false',
-                    '--console-log-level=warn', '--log=' + str(state / 'aria2.log'), '--log-level=notice',
+                    '--console-log-level=warn', '--log=' + str(state / 'aria2.log'), '--log-level=info',
                 ], env=ENV, on_tick=lambda: None)
                 if code == 9:
                     raise OSError(errno.ENOSPC, 'aria2 reports insufficient disk space')
