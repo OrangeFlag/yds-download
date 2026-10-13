@@ -2,6 +2,7 @@
 from concurrent.futures import CancelledError, ThreadPoolExecutor
 from datetime import datetime
 import fcntl
+import errno
 import hashlib
 import json
 from local_paths import local_path
@@ -244,7 +245,7 @@ class Background:
 
     def poll(self):
         storage.check(self.root)
-        completed, failures = [], []
+        completed, failures, events = [], [], []
         for path, future in list(self.futures.items()):
             if len(completed) >= 64:
                 break
@@ -283,14 +284,15 @@ class Background:
                     self.submit('range', item, course, attempt, event, force=True)
                     continue
                 if not event.get('range_recovered_complete'):
-                    with (self.state / 'events.jsonl').open('a') as log:
-                        log.write(json.dumps(event, ensure_ascii=False) + '\n')
+                    events.append(event)
                 failures.append(event)
                 self.checkpoint(item, course, attempt, 'finished', event, persist=False)
             completed.append((path, job))
         if not completed:
             return
-        # Done tasks remain replayable until both aggregate journals are durable.
+        # Done tasks remain replayable until proofs and aggregate journals are durable.
+        if events:
+            d.append_events(self.state / 'events.jsonl', events)
         failure_manifests_batch(self.root, failures)
         d.write_json(self.ledger_path, self.ledger)
         for path, job in completed:
@@ -314,7 +316,7 @@ class Background:
         needed = sum(max(0,item['size']-(progress[item['path']] or 0)) for item in pending)
         self.aria_metrics.begin({str(d.target(self.root,item,course)):(item['size'],progress[item['path']]) for item in pending})
         if shutil.disk_usage(self.root).free < needed + self.tuning['free_space_mib'] * 1024 ** 2:
-            raise RuntimeError('Insufficient free space for the course')
+            raise OSError(errno.ENOSPC, 'Insufficient free space for the course')
         lines = []
         for item in pending:
             local = d.target(self.root, item, course)
@@ -342,7 +344,7 @@ class Background:
             self.download_active.clear()
             self.transferring = None
         if code == 9:
-            raise RuntimeError('aria2 reports insufficient disk space')
+            raise OSError(errno.ENOSPC, 'aria2 reports insufficient disk space')
         if code in (130, -2) or self.stopping.is_set():
             raise InterruptedError('Download interrupted')
         attempt = previous_attempt + 1
@@ -435,6 +437,9 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                     and job['kind'] == 'sha' and job['state'] == 'done'
                     and background.continuation(job['item']).get('phase') == 'verifying'):
                 background.submit('sha', job['item'], job['course'], job['attempt'])
+        if report_repo:
+            from report import retry_reports
+            retry_reports(root)
         active = {}
         event_stamp = None
         proofs = {}
@@ -464,6 +469,10 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                 status = dict(course=course, source=source, state=('recovering' if any(job['kind'] == 'range' for job in jobs) else 'verifying') if waiting else 'finished',
                               complete=not waiting and valid == len(entries), total=len(entries), verified=valid,
                               failed=0 if waiting else len(entries) - valid, pending=len(entries) - valid if waiting else 0, time=now())
+                if not waiting and report_repo:
+                    from report import queue_report
+                    queue_report(root, report_repo, mark, git_push,
+                                 f"Update {mark} copies: {data['title']} / {course}")
                 if {key: value for key, value in history.get(course, {}).items() if key != 'time'} != {key: value for key, value in status.items() if key != 'time'}:
                     history[course] = status
                     d.write_json(state / f'{index:02d}-status.json', status)
@@ -471,12 +480,6 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                 if not waiting:
                     del active[course]
                     print(('COURSE VERIFIED COMPLETE: ' if status['complete'] else 'COURSE FINISHED WITH ERRORS: ') + course, flush=True)
-                    if report_repo:
-                        try:
-                            from report import update_report
-                            update_report(root, report_repo, mark, git_push, f"Update {mark} copies: {data['title']} / {course}")
-                        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
-                            print(f'REPORT ERROR: {error}', flush=True)
             summary = dict(verified=sum(history.get(course, {}).get('verified', 0) for course in courses),
                          failed=sum(history.get(course, {}).get('failed', 0) for course in courses),
                          pending_courses=list(active), complete=False)
@@ -554,8 +557,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                                                 or not ledger and archived.get('range_attempts')):
                             if not ledger:
                                 r.recovery_state(root, archived, 'finished')
-                            with (state / 'events.jsonl').open('a') as log:
-                                log.write(json.dumps(archived, ensure_ascii=False) + '\n')
+                            d.append_events(state / 'events.jsonl', [archived])
                         else:
                             background.repair_archive(item, course, archived)
                             background.submit('range', item, course, archived['attempt'], archived, force=retry_check)

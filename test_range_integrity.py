@@ -16,6 +16,9 @@ from test_regressions import Response
 
 class RangeIntegrityTest(unittest.TestCase):
     def setUp(self):
+        connectivity = patch('network.NetworkGuard.online', return_value=True)
+        connectivity.start()
+        self.addCleanup(connectivity.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)

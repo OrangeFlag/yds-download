@@ -15,6 +15,7 @@ import time
 
 import download as d
 import storage
+from report import queue_report, retry_reports
 from pipeline import Background, failure_manifests, now
 import recovery as r
 from settings import resolve
@@ -141,17 +142,13 @@ def finish_courses(background, config, changed_courses=()):
         status = dict(course=course, source=background.source, state='recovering' if pending else 'finished',
                       complete=not pending and valid == len(entries), total=len(entries), verified=valid,
                       failed=0 if pending else len(entries) - valid, pending=len(entries) - valid if pending else 0, time=now())
+        if not pending and config.get('report_repo'):
+            queue_report(root, Path(config['report_repo']), config['mark'], config.get('git_push', False),
+                         f"Update {config['mark']} copies: {root.name} / {course}")
         history[course] = status
         d.write_json(state / f'{index:02d}-status.json', status)
         if not pending:
             print(('COURSE VERIFIED COMPLETE: ' if status['complete'] else 'COURSE FINISHED WITH ERRORS: ') + str(root) + ' / ' + course, flush=True)
-            if config.get('report_repo'):
-                try:
-                    from report import update_report
-                    update_report(root, Path(config['report_repo']), config['mark'], config.get('git_push', False),
-                                  f"Update {config['mark']} copies: {root.name} / {course}")
-                except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
-                    print(f'REPORT ERROR: {error}', flush=True)
     d.write_json(history_path, history)
     pending = [course for course in courses if history[course]['state'] != 'finished']
     failed = sum(history[course]['failed'] for course in courses)
@@ -194,6 +191,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         if not archive.get('enabled', True):
                             continue
                         root = Path(archive['destination']).resolve()
+                        retry_reports(root, stopping)
                         state = root / '.download'
                         summary = cache.read(state / 'summary.json', {})
                         if not summary.get('downloads_complete') and archive.get('state') != 'finished':

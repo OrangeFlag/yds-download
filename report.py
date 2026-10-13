@@ -1,4 +1,5 @@
 """Update existing backup course cards from verified downloader events."""
+import atexit
 import fcntl
 from datetime import datetime
 import json
@@ -7,39 +8,149 @@ import os
 import subprocess
 from pathlib import Path
 import re
+from threading import Event, Lock, Thread
+import time
 import unicodedata
+import uuid
+
+import network
+import storage
 
 BEGIN = '<!-- yds-download:begin -->'
 END = '<!-- yds-download:end -->'
 BLOCK = re.compile(re.escape(BEGIN) + r'.*?' + re.escape(END) + r'\n?', re.S)
+PUBLISHERS = {}
+PUBLISH_LOCK = Lock()
+
+
+def stop_reports():
+    with PUBLISH_LOCK:
+        workers = list(PUBLISHERS.values())
+    for worker, stopping in workers:
+        stopping.set()
+    for worker, _ in workers:
+        worker.join()
+
+
+atexit.register(stop_reports)
+
+
+def queue_report(destination, repo, mark, git_push=False, message=None):
+    from download import write_json
+    destination = Path(destination)
+    storage.check(destination)
+    directory = destination / '.download/report-pending'
+    directory.mkdir(exist_ok=True)
+    descriptor = os.open(directory.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    path = directory / f'{time.time_ns()}-{uuid.uuid4().hex}.json'
+    write_json(path, dict(repo=str(repo), mark=mark, git_push=git_push, message=message,
+                         attempts=0, next_attempt=0))
+    retry_reports(destination)
+
+
+def _publish_reports(destination, stopping):
+    from download import write_json
+    directory = destination / '.download/report-pending'
+    try:
+        with (directory / 'publish.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            for path in sorted(directory.glob('*.json')):
+                job = json.loads(path.read_text())
+                if stopping.is_set() or job['next_attempt'] > time.time():
+                    return
+                while not stopping.is_set():
+                    try:
+                        update_report(destination, Path(job['repo']), job['mark'], job['git_push'], job['message'], stopping=stopping)
+                    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+                        if storage.disk_error(error):
+                            raise
+                        print(f'REPORT PENDING: {error}', flush=True)
+                        if job['git_push'] and network.wait_if_offline(stopping):
+                            continue
+                        job['attempts'] += 1
+                        job['next_attempt'] = time.time() + min(300, 30 * 2 ** min(job['attempts'] - 1, 4))
+                        write_json(path, job)
+                        return
+                    path.unlink()
+                    descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    break
+    except OSError as error:
+        print(f'REPORT PENDING: {error}', flush=True)
+
+
+def retry_reports(destination, stopping=None):
+    destination = Path(destination)
+    storage.check(destination)
+    if not (destination / '.download/report-pending').exists():
+        return
+    with PUBLISH_LOCK:
+        saved = PUBLISHERS.get(destination)
+        if saved is None or not saved[0].is_alive():
+            stopping = stopping if stopping is not None else Event()
+            worker = Thread(target=_publish_reports, args=(destination, stopping), daemon=True)
+            PUBLISHERS[destination] = worker, stopping
+            worker.start()
+
+
+def wait_reports(destinations):
+    while True:
+        pending = False
+        for destination in destinations:
+            retry_reports(destination)
+            pending |= any((Path(destination) / '.download/report-pending').glob('*.json'))
+        if not pending:
+            return
+        time.sleep(1)
 
 
 def normalized(value):
     return unicodedata.normalize('NFC', value)
 
 
-def update_report(destination, repo, mark, git_push=False, message=None):
+def update_report(destination, repo, mark, git_push=False, message=None, stopping=None):
     repo = repo.resolve()
     if (repo / ".git").exists():
-        common = Path(subprocess.check_output(["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True).strip())
+        common = Path(subprocess.check_output(["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True, timeout=15 if stopping is not None else 120).strip())
         with (common / "yds-report.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            return _update_report(destination, repo, mark, git_push, message)
-    return _update_report(destination, repo, mark, git_push, message)
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if stopping is not None and stopping.wait(.25):
+                        raise InterruptedError('Report publishing interrupted')
+                    if stopping is None:
+                        time.sleep(.25)
+            if stopping is not None and stopping.is_set():
+                raise InterruptedError('Report publishing interrupted')
+            return _update_report(destination, repo, mark, git_push, message, stopping)
+    return _update_report(destination, repo, mark, git_push, message, stopping)
 
 
-def _update_report(destination, repo, mark, git_push=False, message=None):
+def _update_report(destination, repo, mark, git_push=False, message=None, stopping=None):
     from download import read_events
     if not mark or any(c in mark for c in '|\n\r'):
         raise ValueError('Mark must be nonempty and contain no pipes or line breaks')
     repo = repo.resolve()
     dirty = set()
+    git_timeout = 15 if stopping is not None else 120
     if git_push:
-        staged = subprocess.run(['git', '-C', str(repo), 'diff', '--cached', '--quiet'])
+        staged = subprocess.run(['git', '-C', str(repo), 'diff', '--cached', '--quiet'], timeout=git_timeout)
         if staged.returncode != 0:
             raise RuntimeError('Report publish requires an empty Git index')
-        subprocess.run(['git', '-C', str(repo), 'symbolic-ref', '--quiet', 'HEAD'], check=True, stdout=subprocess.DEVNULL)
-        dirty = set(subprocess.check_output(['git', '-C', str(repo), 'diff', '--name-only', '-z']).decode().split('\0'))
+        subprocess.run(['git', '-C', str(repo), 'symbolic-ref', '--quiet', 'HEAD'], check=True, stdout=subprocess.DEVNULL, timeout=git_timeout)
+        dirty = set(subprocess.check_output(['git', '-C', str(repo), 'diff', '--name-only', '-z'], timeout=git_timeout).decode().split('\0'))
     state = destination / '.download'
     source = json.loads((state / 'source.json').read_text(encoding='utf-8'))['source'].rstrip('/')
     events = {}
@@ -256,13 +367,16 @@ def _update_report(destination, repo, mark, git_push=False, message=None):
     print(f'REPORT: {len(changes)} files updated; mark={mark}', flush=True)
     if git_push:
         git_env = os.environ.copy()
-        git_env.setdefault('GIT_SSH_COMMAND', 'ssh -o BatchMode=yes -o ConnectTimeout=15')
+        git_env.setdefault('GIT_SSH_COMMAND', 'ssh -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=2')
         def git(*args):
-            subprocess.run(['git', '-C', str(repo), *args], check=True, timeout=120, env=git_env)
+            subprocess.run(['git', '-C', str(repo), *args], check=True,
+                           timeout=git_timeout if args[0] == 'push' else 120, env=git_env)
         if paths:
             git('add', '--', *paths)
             git('commit', '-m', message or f'Update {mark} verified download report')
         # Also retry pushing an earlier local commit when this report is unchanged.
+        if stopping is not None and stopping.is_set():
+            raise InterruptedError('Report publishing interrupted')
         git('push', 'origin', 'HEAD')
         print('REPORT PUSHED', flush=True)
     return len(changes)

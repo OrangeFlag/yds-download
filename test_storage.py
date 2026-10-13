@@ -3,8 +3,14 @@ import io
 import logging
 import json
 import os
+import signal
+import stat
+import subprocess
+import sys
+from itertools import chain, repeat
 from pathlib import Path
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch, Mock
@@ -58,6 +64,60 @@ class StorageChecks(unittest.TestCase):
         self.assertEqual(data['local'], str(new / 'YandexDisk/video.mp4'))
         self.assertEqual(data['other'], '/home/user/file')
 
+    def test_interrupted_scan_does_not_commit_mount(self):
+        old = self.root / 'old'; new = self.root / 'new'; state = self.root / 'state'
+        path = new / 'YandexDisk/Course/.download/queue.json'; path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({'destination': str(old / 'YandexDisk/Course')}))
+        failure = OSError(errno.EIO, 'Disk disconnected during scan')
+        import glob
+        with patch('os.scandir', side_effect=failure), \
+                patch.object(glob._StringGlobber, 'scandir', side_effect=failure):
+            with self.assertRaises(OSError):
+                storage.migrate(old, new, 'uuid', state)
+        self.assertFalse((state / 'uuid.json').exists())
+        storage.migrate(old, new, 'uuid', state)
+        self.assertEqual(json.loads(path.read_text())['destination'], str(new / 'YandexDisk/Course'))
+
+    def test_restart_at_original_mount_rewrites_previous_mount(self):
+        old = self.root / 'old'; new = self.root / 'new'; state = self.root / 'state'
+        path = new / 'YandexDisk/Course/.download/queue.json'; path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({'destination': str(old / 'YandexDisk/Course')}))
+        storage.migrate(old, new, 'uuid', state)
+        new.rename(old)
+        storage.migrate(old, old, 'uuid', state)
+        path = old / 'YandexDisk/Course/.download/queue.json'
+        self.assertEqual(json.loads(path.read_text())['destination'], str(old / 'YandexDisk/Course'))
+        self.assertEqual(json.loads((state / 'uuid.json').read_text())['mount'], str(old))
+
+    def test_migration_syncs_metadata_directory_before_mount_marker(self):
+        old = self.root / 'old'; new = self.root / 'new'; state = self.root / 'state'
+        path = new / 'YandexDisk/Course/.download/queue.json'; path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({'destination': str(old / 'YandexDisk/Course')}))
+        synced = []; original = os.fsync
+        def sync(fd):
+            synced.append((Path(os.readlink(f'/proc/self/fd/{fd}')), stat.S_ISDIR(os.fstat(fd).st_mode)))
+            original(fd)
+        with patch('storage.os.fsync', side_effect=sync):
+            storage.migrate(old, new, 'uuid', state)
+        self.assertIn((path.parent, True), synced)
+        self.assertIn((state / 'uuid.tmp', False), synced)
+        self.assertIn((state, True), synced)
+        self.assertLess(synced.index((path.parent, True)), synced.index((state / 'uuid.tmp', False)))
+
+    def test_retry_syncs_directory_replaced_before_previous_interruption(self):
+        old = self.root / 'old'; new = self.root / 'new'; state = self.root / 'state'
+        path = new / 'YandexDisk/Course/.download/queue.json'; path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({'destination': str(old / 'YandexDisk/Course')}))
+        with patch('storage.sync_directory', side_effect=OSError(errno.EIO, 'Directory sync interrupted')):
+            with self.assertRaises(OSError):
+                storage.migrate(old, new, 'uuid', state)
+        self.assertFalse((state / 'uuid.json').exists())
+        self.assertEqual(json.loads(path.read_text())['destination'], str(new / 'YandexDisk/Course'))
+        original = storage.sync_directory
+        with patch('storage.sync_directory', side_effect=original) as synced:
+            storage.migrate(old, new, 'uuid', state)
+        self.assertTrue(any(Path(call.args[0]) == path.parent for call in synced.call_args_list))
+
     def test_cli_disk_error_has_retryable_exit_code(self):
         with patch('sys.argv', ['download.py', 'download', '--catalog', '/missing', '--destination', '/missing']), \
                 patch.object(Path, 'read_text', side_effect=OSError(errno.EIO, 'Disk disconnected')):
@@ -70,6 +130,90 @@ class StorageChecks(unittest.TestCase):
 
 
 class SupervisorChecks(unittest.TestCase):
+    def test_mount_fallback_after_probe_does_not_launch_on_system_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            device = [123]
+            probes = [0]
+            def probe(path):
+                probes[0] += 1
+                device[0] = 456 if probes[0] == 1 else 123
+                return True
+            process = Mock(returncode=0); process.poll.return_value = 0; process.stdout = io.BytesIO()
+            stop = Mock(); stop.is_set.return_value = False
+            def retry(delay):
+                device[0] = 123
+                return False
+            stop.wait.side_effect = retry
+            with patch('storage.select_mount', return_value=root), \
+                    patch.object(Path, 'stat', side_effect=lambda: SimpleNamespace(st_dev=device[0])), \
+                    patch('storage.mounted_ok', side_effect=lambda path, expected: device[0] == expected), \
+                    patch('storage.probe', side_effect=probe), patch('storage.migrate') as migrate, \
+                    patch('storage.subprocess.Popen', return_value=process) as launch, patch('storage.terminate'):
+                self.assertEqual(storage.supervise('uuid', root, ['python3'], root / 'state', Mock(), stop), 0)
+            self.assertEqual(probes[0], 2)
+            self.assertEqual(migrate.call_count, 1)
+            self.assertEqual(launch.call_count, 1)
+            self.assertEqual(launch.call_args.kwargs['env']['YDS_DISK_DEVICE'], '123')
+
+    def test_startup_storage_errors_retry_and_command_errors_escape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            process = Mock(returncode=0); process.poll.return_value = 0; process.stdout = io.BytesIO()
+            stop = Mock(); stop.is_set.return_value = False; stop.wait.return_value = False
+            for stage in ('select_mount', 'migrate', 'stat', 'Popen'):
+                process.stdout = io.BytesIO()
+                with self.subTest(stage=stage), \
+                        patch('storage.select_mount', return_value=root) as discover, \
+                        patch('storage.probe', return_value=True), patch('storage.migrate') as migrate, \
+                        patch.object(Path, 'stat', return_value=SimpleNamespace(st_dev=123)) as stat_root, \
+                        patch('storage.mounted_ok', return_value=True), \
+                        patch('storage.subprocess.Popen', return_value=process) as launch, patch('storage.terminate'):
+                    operation = dict(select_mount=discover, migrate=migrate, stat=stat_root, Popen=launch)[stage]
+                    operation.side_effect = chain([OSError(errno.EIO, 'Disk disconnected')], repeat(operation.return_value))
+                    self.assertEqual(storage.supervise('uuid', root, ['python3'], root / 'state', Mock(), stop), 0)
+                    self.assertEqual(operation.call_count, 3 if stage == 'select_mount' else 2)
+            with patch('storage.select_mount', return_value=root), patch('storage.probe', return_value=True), \
+                    patch('storage.migrate'), patch('storage.subprocess.Popen', side_effect=FileNotFoundError(errno.ENOENT, 'Missing executable')):
+                with self.assertRaises(FileNotFoundError):
+                    storage.supervise('uuid', root, ['missing-program'], root / 'state', Mock(), stop)
+
+    def test_missing_mount_after_probe_is_retryable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            process = Mock(returncode=0); process.poll.return_value = 0; process.stdout = io.BytesIO()
+            stop = Mock(); stop.is_set.return_value = False; stop.wait.return_value = False
+            with patch('storage.select_mount', side_effect=[root / 'removed', root, root]), \
+                    patch('storage.probe', return_value=True), patch('storage.migrate'), \
+                    patch('storage.subprocess.Popen', return_value=process), patch('storage.terminate'):
+                self.assertEqual(storage.supervise('uuid', root, ['python3'], root / 'state', Mock(), stop), 0)
+
+    def test_stop_cleans_descendants_even_if_leader_exits_first(self):
+        child = 'import os,signal,time; signal.signal(signal.SIGINT,signal.SIG_IGN); print(os.getpid(),flush=True); time.sleep(30)'
+        leader = 'import signal,subprocess,sys,time; signal.signal(signal.SIGINT,lambda *_:sys.exit(130)); subprocess.Popen([sys.executable,"-c",sys.argv[1]]); time.sleep(30)'
+        for exited in (False, True):
+            with self.subTest(leader_already_exited=exited):
+                process = subprocess.Popen([sys.executable, '-c', leader, child], start_new_session=True,
+                                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                try:
+                    pid = int(process.stdout.readline())
+                    if exited:
+                        process.send_signal(signal.SIGINT); process.wait(timeout=2)
+                    storage.terminate(process, 0.2)
+                    status = Path(f'/proc/{pid}/stat')
+                    deadline = time.monotonic() + 1
+                    while status.exists() and status.read_text().split(') ', 1)[1].split()[0] != 'Z' and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    if status.exists():
+                        self.assertEqual(status.read_text().split(') ', 1)[1].split()[0], 'Z')
+                finally:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=2)
+                    process.stdout.close()
+
     def test_retryable_disk_exit_restarts_same_transfer(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -77,7 +221,8 @@ class SupervisorChecks(unittest.TestCase):
             second = Mock(returncode=0); second.poll.return_value = 0; second.stdout = io.BytesIO()
             stop = Mock(); stop.is_set.return_value = False; stop.wait.return_value = False
             with patch('storage.select_mount', return_value=root), \
-                    patch('storage.subprocess.Popen', side_effect=[first, second]) as launch:
+                    patch('storage.subprocess.Popen', side_effect=[first, second]) as launch, \
+                    patch('storage.terminate'):
                 code = storage.supervise('uuid', root, ['python3', str(root / 'queue.json')],
                                          root / 'state', Mock(), stop)
             self.assertEqual(code, 0)
@@ -90,17 +235,18 @@ class SupervisorChecks(unittest.TestCase):
             offline = [True]
             first = Mock(returncode=None); first.stdout = io.BytesIO()
             first.poll.side_effect = lambda: first.returncode
-            def stop_child(*args):
-                first.returncode = 130; offline[0] = False
-            first.send_signal.side_effect = stop_child
+            def stop_child(process, timeout):
+                if process is first:
+                    first.returncode = 130; offline[0] = False
             second = Mock(returncode=0);second.poll.return_value = 0;second.stdout = io.BytesIO()
             stop = Mock();stop.is_set.return_value = False;stop.wait.return_value = False
-            with patch('storage.select_mount', side_effect=[old, new]), \
-                    patch('storage.mounted_ok', side_effect=lambda *args: not offline[0]), \
-                    patch('storage.subprocess.Popen', side_effect=[first, second]) as launch:
+            with patch('storage.select_mount', side_effect=[old, old, new, new]), \
+                    patch('storage.mounted_ok', side_effect=lambda *args: launch.call_count == 0 or not offline[0]), \
+                    patch('storage.subprocess.Popen', side_effect=[first, second]) as launch, \
+                    patch('storage.terminate', side_effect=stop_child) as terminate:
                 self.assertEqual(storage.supervise('uuid', old, ['python3', str(old / 'YandexDisk/queue.json')],
                                                     root / 'state', Mock(), stop), 0)
-            first.send_signal.assert_called_once()
+            terminate.assert_any_call(first, 90)
             self.assertEqual(launch.call_args.args[0][1], str(new / 'YandexDisk/queue.json'))
 
     def test_rotating_logs_are_bounded(self):

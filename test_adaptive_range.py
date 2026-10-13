@@ -18,6 +18,9 @@ from test_regressions import Response
 
 class AdaptiveRangeTest(unittest.TestCase):
     def setUp(self):
+        connectivity = patch('network.NetworkGuard.online', return_value=True)
+        connectivity.start()
+        self.addCleanup(connectivity.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
@@ -196,7 +199,7 @@ class AdaptiveRangeTest(unittest.TestCase):
                 patch.object(download, 'files', side_effect=AssertionError('Directory was enumerated')), \
                 patch.object(download.OPENER, 'open', side_effect=unavailable):
             recovery.retry_ranges(self.root, self.event, self.item, 2, self.tuning)
-        metadata.assert_called_once_with('https://disk.yandex.ru/d/test', self.item['path'])
+        metadata.assert_called_once_with('https://disk.yandex.ru/d/test', self.item['path'], stopping=unittest.mock.ANY)
 
     def test_expired_download_link_refreshes_only_this_file(self):
         fresh = dict(self.item, file='https://example.invalid/fresh')

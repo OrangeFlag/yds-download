@@ -9,10 +9,12 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 from threading import Event, Thread
+import time
 import urllib.error
 import uuid as uuid_module
 
@@ -60,28 +62,49 @@ def probe(root):
         with tempfile.NamedTemporaryFile(dir=root, prefix='.yds-storage-') as stream:
             stream.write(b'1'); stream.flush(); os.fsync(stream.fileno())
         return True
-    except OSError:
+    except OSError as error:
+        if not disk_error(error) and error.errno != errno.ENOENT:
+            raise
         return False
+
+
+def sync_directory(path):
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def migrate(old, new, uuid, state):
     old, new, state = Path(old), Path(new), Path(state)
-    if old == new:
-        return
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (state / (uuid + '.lock')).open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         record = state / (uuid + '.json')
-        saved = json.loads(record.read_text()) if record.exists() else {}
-        if saved.get('mount') == str(new):
+        try:
+            saved = json.loads(record.read_text())
+        except FileNotFoundError:
+            saved = {}
+        if saved.get('mount') == str(new) or old == new and not saved:
+            sync_directory(state)
             return
         prefixes = set(saved.get('previous', [])) | {str(old)}
-        for directory in (new / 'YandexDisk').rglob('.download'):
-            for path in directory.rglob('*'):
-                if path.is_symlink() or not path.is_file() or path.suffix not in ('.json', '.jsonl'):
+        if saved.get('mount'):
+            prefixes.add(saved['mount'])
+        def scan_error(error):
+            raise error
+        for directory, _, names in os.walk(new, onerror=scan_error):
+            if '.download' not in Path(directory).relative_to(new).parts:
+                continue
+            metadata = False
+            for name in names:
+                path = Path(directory) / name
+                if path.suffix not in ('.json', '.jsonl') or not stat.S_ISREG(path.lstat().st_mode):
                     continue
+                metadata = True
                 text = path.read_text(); updated = text
-                for prefix in prefixes:
+                for prefix in sorted(prefixes, key=len, reverse=True):
                     if prefix != str(new):
                         updated = updated.replace(prefix + '/', str(new) + '/')
                 if updated != text:
@@ -90,9 +113,15 @@ def migrate(old, new, uuid, state):
                         stream.write(updated); stream.flush(); os.fsync(stream.fileno())
                     temporary.chmod(path.stat().st_mode & 0o777)
                     temporary.replace(path)
+            if metadata:
+                # A prior attempt may have replaced files before its directory sync failed.
+                sync_directory(directory)
         temporary = record.with_suffix('.tmp')
-        temporary.write_text(json.dumps(dict(mount=str(new), previous=sorted(prefixes))))
+        with temporary.open('w') as stream:
+            json.dump(dict(mount=str(new), previous=sorted(prefixes)), stream)
+            stream.flush(); os.fsync(stream.fileno())
         temporary.replace(record)
+        sync_directory(state)
 
 
 class BoundedLog(RotatingFileHandler):
@@ -112,35 +141,65 @@ def drain(pipe, logger):
 
 
 def terminate(process, timeout):
-    if process.poll() is None:
-        process.send_signal(signal.SIGINT)
+    deadline = time.monotonic() + timeout
+    try:
+        os.killpg(process.pid, signal.SIGINT)
+    except ProcessLookupError:
+        process.wait()
+        return
+    while True:
+        process.poll()
         try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            break
+        time.sleep(min(remaining, 0.1))
+    process.wait()
 
 
 def supervise(uuid, root, command, state, logger, stopping, poll=5, stop_timeout=90):
     root = Path(root)
     while not stopping.is_set():
-        candidate = select_mount(uuid, root)
-        if candidate is None or not probe(candidate):
-            logger.warning('DISK OFFLINE: waiting for writable disk UUID %s', uuid)
-            stopping.wait(poll)
-            continue
+        candidate = None
         try:
+            candidate = select_mount(uuid, root)
+            if candidate is None:
+                logger.warning('DISK OFFLINE: waiting for writable disk UUID %s', uuid)
+                stopping.wait(poll)
+                continue
+            device = candidate.stat().st_dev
+            if select_mount(uuid, candidate) != candidate or not mounted_ok(candidate, device):
+                raise StorageUnavailable(candidate)
+            if not probe(candidate):
+                logger.warning('DISK OFFLINE: waiting for writable disk UUID %s', uuid)
+                stopping.wait(poll)
+                continue
+            if not mounted_ok(candidate, device):
+                raise StorageUnavailable(candidate)
             migrate(root, candidate, uuid, state)
-        except OSError:
-            logger.warning('DISK OFFLINE: metadata migration interrupted; retrying')
+            if not mounted_ok(candidate, device):
+                raise StorageUnavailable(candidate)
+            current_command = [arg.replace(str(root) + '/', str(candidate) + '/') for arg in command]
+            env = dict(os.environ, YDS_DISK_ROOT=str(candidate), YDS_DISK_DEVICE=str(device))
+            if stopping.is_set():
+                return 130
+            logger.info('DISK ONLINE: %s; starting child with saved progress', candidate)
+            process = subprocess.Popen(current_command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       start_new_session=True)
+        except OSError as error:
+            if not disk_error(error) and not (error.errno == errno.ENOENT and candidate is not None and not candidate.exists()):
+                raise
+            logger.warning('DISK OFFLINE: startup interrupted; retrying')
             stopping.wait(poll)
             continue
-        command = [arg.replace(str(root) + '/', str(candidate) + '/') for arg in command]
-        root = candidate; device = root.stat().st_dev
-        env = dict(os.environ, YDS_DISK_ROOT=str(root), YDS_DISK_DEVICE=str(device))
-        logger.info('DISK ONLINE: %s; starting child with saved progress', root)
-        process = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
+        root = candidate; command = current_command
         reader = Thread(target=drain, args=(process.stdout, logger), daemon=True)
         reader.start()
         try:

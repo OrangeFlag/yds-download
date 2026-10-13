@@ -6,6 +6,15 @@ import network
 
 
 class NetworkChecks(unittest.TestCase):
+    def test_recent_online_probe_does_not_hide_new_outage(self):
+        guard = network.NetworkGuard()
+        stop = Mock(); stop.is_set.return_value = False; stop.wait.return_value = False
+        with patch.object(guard, 'online', side_effect=[True, False, True]) as probe:
+            self.assertFalse(guard.wait_if_offline(stop))
+            self.assertTrue(guard.wait_if_offline(stop, force=False))
+        self.assertEqual(probe.call_count, 3)
+        stop.wait.assert_called_once_with(5)
+
     def test_waits_until_connection_returns(self):
         guard = network.NetworkGuard()
         stop = Mock(); stop.is_set.return_value = False; stop.wait.return_value = False

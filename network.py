@@ -1,7 +1,6 @@
 """Wait through a local connection outage without spending file retries."""
 import errno
 import socket
-import time
 from threading import Event, Lock
 import urllib.error
 
@@ -10,7 +9,6 @@ class NetworkGuard:
     def __init__(self):
         self.lock = Lock()
         self.generation = 0
-        self.last_online = float("-inf")
 
     @staticmethod
     def online():
@@ -31,10 +29,7 @@ class NetworkGuard:
         try:
             if stopping.is_set():
                 raise InterruptedError('Network wait interrupted')
-            if not force and time.monotonic() - self.last_online < .5:
-                return generation != self.generation
             if self.online():
-                self.last_online = time.monotonic()
                 return generation != self.generation
             self.generation += 1
             print('NETWORK OFFLINE: waiting; file retries retained', flush=True)
@@ -42,7 +37,6 @@ class NetworkGuard:
                 if stopping.wait(5):
                     raise InterruptedError('Network wait interrupted')
                 if self.online():
-                    self.last_online = time.monotonic()
                     print('NETWORK ONLINE: resuming interrupted requests', flush=True)
                     return True
         finally:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Download public Yandex Disk courses, one course at a time."""
 import argparse
+import errno
 from datetime import datetime
 import fcntl
 import hashlib
@@ -50,18 +51,28 @@ def sha256_file(path, stopping=None):
         HASH_LOCK.release()
 
 
-def api(source, path='/', offset=0):
+def api(source, path='/', offset=0, stopping=None):
     url = 'https://cloud-api.yandex.net/v1/disk/public/resources?' + urllib.parse.urlencode(
         dict(public_key=source, path=path, limit=1000, offset=offset))
+    def request():
+        if stopping is not None and stopping.is_set():
+            raise InterruptedError('Metadata request interrupted')
+        with OPENER.open(url, timeout=40) as response:
+            return json.load(response)
     for attempt in range(5):
         try:
-            with OPENER.open(url, timeout=40) as response:
-                return json.load(response)
+            return network.retry_while_offline(request, stopping)
+        except InterruptedError:
+            raise
         except Exception as error:
             if (isinstance(error, urllib.error.HTTPError)
                     and 400 <= error.code < 500 and error.code not in (408, 429)) or attempt == 4:
                 raise
-            time.sleep(min(2 ** (attempt + 1), 30))
+            delay = min(2 ** (attempt + 1), 30)
+            if stopping is None:
+                time.sleep(delay)
+            elif stopping.wait(delay):
+                raise InterruptedError('Metadata retry interrupted')
 
 
 def children(source, path='/'):
@@ -155,6 +166,16 @@ def write_json(path, data):
             os.close(directory)
 
 
+def append_events(path, rows):
+    storage.check(path)
+    with STATE_LOCK:
+        with path.open('a', encoding='utf-8') as stream:
+            for row in rows:
+                stream.write(json.dumps(row, ensure_ascii=False) + '\n')
+            stream.flush(); os.fsync(stream.fileno())
+        storage.sync_directory(path.parent)
+
+
 def read_events(path, repair=False):
     if not path.exists():
         return []
@@ -222,8 +243,7 @@ def record(state, item, course, attempt, status, detail, local=None, verified_st
     event.update(progress(path, item['size'], valid=status == 'valid', sha256=item['sha256']))
     if status == 'valid':
         event['mtime_ns'] = stamp[2]
-    with (state / 'events.jsonl').open('a', encoding='utf-8') as log:
-        log.write(json.dumps(event, ensure_ascii=False) + '\n')
+    append_events(state / 'events.jsonl', [event])
     print(f"{status.upper()}: {item['path']} (attempt {attempt}) {detail}", flush=True)
     return event
 
@@ -255,8 +275,7 @@ def inspect_copies(root, item, course, cached, source, source_current=False):
         write_json(registry, copies)
     # The final proof must win over a missing alternative in the event log.
     if result is not event:
-        with (state / 'events.jsonl').open('a') as log:
-            log.write(json.dumps(result, ensure_ascii=False) + '\n')
+        append_events(state / 'events.jsonl', [result])
     return result
 
 
@@ -328,6 +347,9 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
         if identity.exists() and json.loads(identity.read_text(encoding='utf-8'))['source'] != source:
             raise ValueError('Use a separate destination for a different public folder/year')
         write_json(identity, dict(source=source, title=data['title']))
+        if report_repo:
+            from report import retry_reports
+            retry_reports(root)
         preserve_queue = deep and not retry_check and (state / 'courses.json').exists()
         queue_courses = json.loads((state / 'courses.json').read_text()) if preserve_queue else courses
         if not preserve_queue or not (state / 'settings.json').exists():
@@ -454,7 +476,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
             needed = sum(max(0, item['size'] - (target(root, item, course).stat().st_size
                          if target(root, item, course).exists() else 0)) for item in pending)
             if pending and shutil.disk_usage(root).free < needed + tuning['free_space_mib'] * 1024 ** 2:
-                raise RuntimeError('Insufficient free space for the course')
+                raise OSError(errno.ENOSPC, 'Insufficient free space for the course')
             for attempt in range(1, retries + 2):
                 if not pending:
                     break
@@ -491,7 +513,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                     '--console-log-level=warn', '--log=' + str(state / 'aria2.log'), '--log-level=notice',
                 ], env=ENV, on_tick=lambda: None)
                 if code == 9:
-                    raise RuntimeError('aria2 reports insufficient disk space')
+                    raise OSError(errno.ENOSPC, 'aria2 reports insufficient disk space')
                 if code in (130, -2, 143, -15):
                     raise KeyboardInterrupt
                 remaining = []
@@ -525,6 +547,8 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                             from recovery import finish_recovery
                             finish_recovery(root, event, item, retries, tuning=tuning)
                         except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+                            if storage.disk_error(error):
+                                raise
                             event['recovery_error'] = str(error)
                             print('RECOVERY ERROR: ' + item['path'] + '; ' + type(error).__name__, flush=True)
                         if event.get('range_recovered_complete'):
@@ -534,8 +558,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                             write_json(root / 'corrupted' / 'failed.json', failed)
                             write_json(broken_root / 'failed.json', failed)
                             continue
-                        with (state / 'events.jsonl').open('a') as log:
-                            log.write(json.dumps(event, ensure_ascii=False) + '\n')
+                        append_events(state / 'events.jsonl', [event])
                         write_json(root / 'corrupted' / 'failed.json', failed)
                         write_json(broken_root / 'failed.json', failed)
                 pending = remaining
@@ -544,17 +567,14 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                                  state=previous.get('state', 'pending') if deep and not retry_check else 'finished',
                                  total=len(entries), verified=len(entries) - len(course_failed),
                                  failed=len(course_failed), time=datetime.now().astimezone().isoformat())
+            if report_repo:
+                from report import queue_report
+                queue_report(root, report_repo, mark, git_push,
+                             f"Update {mark} copies: {data['title']} / {course}")
             if status_path is not None:
                 write_json(status_path, course_status)
             history[course] = course_status
             write_json(history_path, history)
-            if report_repo:
-                try:
-                    from report import update_report
-                    update_report(root, report_repo, mark, git_push,
-                                  f"Update {mark} copies: {data['title']} / {course}")
-                except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
-                    print(f'REPORT ERROR: {error}', flush=True)
             print(('COURSE VERIFIED COMPLETE: ' if complete else 'COURSE FINISHED WITH ERRORS: ') + course, flush=True)
             write_json(state / 'summary.json', dict(handoff,
                        verified=sum(history.get(name, {}).get('verified', 0) for name in queue_courses) if preserve_queue else verified,

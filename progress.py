@@ -3,6 +3,7 @@ import json
 from local_paths import local_path
 from pathlib import Path
 import struct
+import storage
 
 
 def received_ranges(control, expected):
@@ -112,6 +113,8 @@ def progress(path, expected, valid=False, sha256=None):
                           downloaded_percent=round(100 * received / expected, 4) if expected else 100.0,
                           progress_source='range-journal' if Path(str(path) + '.ranges.json').exists() else 'aria2-control')
         except (OSError, ValueError, KeyError, TypeError, struct.error) as error:
+            if storage.disk_error(error):
+                raise
             result['progress_error'] = str(error)
     return result
 

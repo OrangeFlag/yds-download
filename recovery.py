@@ -1,6 +1,7 @@
 """Retry independent ranges and retain partial videos by confirmed byte coverage."""
 from datetime import datetime
 import hashlib
+import errno
 import http.client
 import json
 from local_paths import local_path
@@ -37,12 +38,25 @@ def copy_saved(source, destination, overwrite=True):
     with tempfile.NamedTemporaryFile(dir=destination.parent, prefix='.partial-', delete=False) as temporary:
         name = Path(temporary.name)
     try:
-        subprocess.run(['cp', '--reflink=auto', '--sparse=always', '--', str(source), str(name)], check=True)
+        try:
+            subprocess.run(['cp', '--reflink=auto', '--sparse=always', '--', str(source), str(name)],
+                           check=True, stderr=subprocess.PIPE, env=dict(os.environ, LC_ALL='C'))
+        except subprocess.CalledProcessError as error:
+            message = (error.stderr or b'').decode('utf-8', errors='replace')
+            for text, code in [('Input/output error', errno.EIO), ('Read-only file system', errno.EROFS),
+                               ('No space left on device', errno.ENOSPC), ('Stale file handle', errno.ESTALE),
+                               ('No such device', errno.ENODEV)]:
+                if text in message:
+                    raise OSError(code, message.strip(), str(source)) from error
+            raise
+        with name.open('rb') as stream:
+            os.fsync(stream.fileno())
         stat = name.stat()
         if overwrite:
             name.replace(destination)
         else:
             os.link(name, destination)
+        storage.sync_directory(destination.parent)
         return [stat.st_ino, stat.st_size, stat.st_mtime_ns]
     finally:
         name.unlink(missing_ok=True)
@@ -184,7 +198,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     if not missing_bytes:
         return ranges
     if shutil.disk_usage(root).free < missing_bytes + tuning['free_space_mib'] * 1024 ** 2:
-        raise RuntimeError('Insufficient disk space for range recovery')
+        raise OSError(errno.ENOSPC, 'Insufficient disk space for range recovery')
     rate_lock = Lock()
     stopping = stopping if stopping is not None else Event()
     foreground_limit = Lock()
@@ -200,7 +214,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                                       'ConnectionAbortedError', 'OSError', 'Incomplete response')
             try:
                 retry = (len(data) < bounds[1] - bounds[0] and connection
-                         and network.wait_if_offline(stopping, force=result[2] != 'Incomplete response' or fine))
+                         and network.wait_if_offline(stopping))
             except InterruptedError:
                 result = bounds, data or None, 'Interrupted'
                 break
@@ -295,11 +309,11 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     def refresh():
         nonlocal metadata_path
         try:
-            fresh = network.retry_while_offline(lambda: api(source, metadata_path), stopping)
+            fresh = api(source, metadata_path, stopping=stopping)
         except urllib.error.HTTPError as error:
             if error.code != 404 or event['course'] != '.':
                 raise
-            fresh = network.retry_while_offline(lambda: api(source), stopping)
+            fresh = api(source, stopping=stopping)
             if fresh.get('type') != 'file' or '/' + fresh.get('name', '') != event['path']:
                 raise ValueError('Source file disappeared; refuse to combine ranges')
             metadata_path = '/'
@@ -713,7 +727,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
             elif retry:
                 course = event['course']
                 if course not in metadata:
-                    metadata[course] = {row['path']: row for row in files(source, '/' + course)}
+                    metadata[course] = {row['path']: row for row in network.retry_while_offline(lambda: files(source, '/' + course))}
                 item = metadata[course].get(event['path'])
                 if item is None:
                     event['recovery_error'] = 'File no longer listed in source'
@@ -733,13 +747,15 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                     if retry:
                         recovery_state(root, event, 'finished')
                 except (OSError, ValueError, KeyError, subprocess.SubprocessError) as local_error:
+                    if storage.disk_error(local_error):
+                        raise
                     event['local_recovery_error'] = str(local_error)
         if retry and not event.get('range_recovered_complete'):
             event.update(time=datetime.now().astimezone().isoformat(),
                          status='partial' if (event.get('downloaded_bytes') or 0) > 0 else 'missing',
                          detail='Independent HTTP Range recovery; incomplete original')
-            with (root / '.download/events.jsonl').open('a') as log:
-                log.write(json.dumps(event, ensure_ascii=False) + '\n')
+            from download import append_events
+            append_events(root / '.download/events.jsonl', [event])
         results.append(event)
         write_json(root / '.download/range-retry.json', results)
     by_path = {row['corrupted_path']: row for row in results if row.get('corrupted_path')}
@@ -755,6 +771,6 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
         if changed:
             write_json(manifest, rows)
     if report_repo:
-        from report import update_report
-        update_report(root, report_repo, mark, git_push, f'Update {mark} partially available copies and range recovery')
+        from report import queue_report
+        queue_report(root, report_repo, mark, git_push, f'Update {mark} partially available copies and range recovery')
     return results

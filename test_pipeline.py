@@ -19,6 +19,9 @@ import pipeline
 
 class PipelineChecks(unittest.TestCase):
     def setUp(self):
+        connectivity = patch('network.NetworkGuard.online', return_value=True)
+        connectivity.start()
+        self.addCleanup(connectivity.stop)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -512,7 +515,7 @@ class PipelineChecks(unittest.TestCase):
         download.write_json(state / '01-manifest.json', [item])
         usage = namedtuple('Usage', 'total used free')(10 * 1024 ** 3, 8 * 1024 ** 3, 2 * 1024 ** 3)
         with patch.object(download.shutil, 'disk_usage', return_value=usage):
-            with self.assertRaisesRegex(RuntimeError, 'Insufficient free space'):
+            with self.assertRaisesRegex(OSError, 'Insufficient free space'):
                 self.run_download(tuning=dict(free_space_mib=0))
         self.assertEqual(self.calls, [])
 

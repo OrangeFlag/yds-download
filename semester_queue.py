@@ -9,6 +9,7 @@ import subprocess
 import time
 from datetime import datetime
 import storage
+from report import retry_reports, wait_reports
 from download import cli, write_json
 from pipeline import transfer_process
 from metrics import Metrics
@@ -49,6 +50,8 @@ def main():
         for job in data['archives']:
             metrics.gauge('archives',dict(Counter(a.get('state','pending') for a in data['archives'])))
             metrics.gauge('current_archive',job['title'])
+            if job.get('enabled', True):
+                retry_reports(Path(job['destination']))
             if not job.get('enabled', True) or ((job.get('state') == 'finished' or (args.defer_range and job.get('downloads_complete'))) and not (data.get('deep', False) or data.get('retry_check', False))):
                 continue
             if args.defer_range and not (data.get('deep') or data.get('retry_check')):
@@ -111,6 +114,7 @@ def main():
                 if changed:
                     write_json(path, data)
                 time.sleep(10)
+        wait_reports([Path(job['destination']) for job in data['archives'] if job.get('enabled', True)])
         print('ALL ARCHIVES PROCESSED', flush=True)
 
 if __name__ == '__main__':

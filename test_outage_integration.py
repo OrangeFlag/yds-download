@@ -1,0 +1,108 @@
+import errno
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import download
+import pipeline
+import recovery
+import storage
+
+
+class OutageIntegrationChecks(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.state = self.root / '.download'; self.state.mkdir()
+        self.item = dict(path='/Course/video.mp4', size=7, sha256=hashlib.sha256(b'lecture').hexdigest(),
+                         file='https://example.invalid/video')
+
+    def test_api_waits_without_spending_metadata_attempt(self):
+        with patch.object(download.OPENER, 'open', side_effect=[urllib_error(), io.BytesIO(b'{"name":"course"}')]) as call, \
+                patch('network.wait_if_offline', return_value=True) as wait, \
+                patch.object(download.time, 'sleep'):
+            self.assertEqual(download.api('public-source'), {'name': 'course'})
+        self.assertEqual(call.call_count, 2)
+        wait.assert_called_once()
+
+    def test_api_wait_is_interruptible(self):
+        from threading import Event
+        with patch.object(download.OPENER, 'open', side_effect=urllib_error()), \
+                patch('network.wait_if_offline', side_effect=InterruptedError), patch.object(download.time, 'sleep'):
+            with self.assertRaises(InterruptedError):
+                download.api('public-source', stopping=Event())
+
+    def test_api_server_backoff_stops_before_another_request(self):
+        from threading import Event
+        from urllib.error import HTTPError
+        stop = Event()
+        error = HTTPError('hidden', 503, 'Unavailable', {}, None)
+        def interrupt(_):
+            stop.set()
+            return True
+        with patch.object(download.OPENER, 'open', side_effect=error) as request, \
+                patch.object(stop, 'wait', side_effect=interrupt), \
+                patch.object(download.time, 'sleep', side_effect=interrupt):
+            with self.assertRaises(InterruptedError):
+                download.api('source', stopping=stop)
+        self.assertEqual(request.call_count, 1)
+
+    def test_aria_disk_full_remains_retryable(self):
+        background = pipeline.Background(self.root, 'source', 2, pipeline.resolve())
+        self.addCleanup(background.close)
+        with patch.object(pipeline, 'transfer_process', return_value=9) as transfer:
+            with self.assertRaises(OSError) as error:
+                background.transfer([self.item], 'Course')
+        self.assertTrue(storage.disk_error(error.exception))
+        transfer.assert_called_once()
+        self.assertEqual(background.continuation(self.item)['phase'], 'downloading')
+
+    def test_event_proof_is_synced_before_record_returns(self):
+        local = self.root / 'Course/video.mp4';local.parent.mkdir();local.write_bytes(b'lecture')
+        stamp = [local.stat().st_ino, local.stat().st_size, local.stat().st_mtime_ns]
+        with patch('download.os.fsync') as sync:
+            result = download.record(self.state, self.item, 'Course', 1, 'valid', 'Verified', verified_stat=stamp)
+        self.assertEqual(result['status'], 'valid')
+        self.assertGreater(sync.call_count, 0)
+
+    def test_copy_body_and_directory_synced_before_proof(self):
+        source = self.root / 'archive.mp4';source.write_bytes(b'lecture');target = self.root / 'Course/video.mp4'
+        order = []
+        original = os.fsync
+        def sync(fd):
+            directory = stat.S_ISDIR(os.fstat(fd).st_mode)
+            order.append('directory' if directory else 'body')
+            self.assertEqual(target.exists(), directory)
+            original(fd)
+        with patch('recovery.os.fsync', side_effect=sync):
+            recovery.copy_saved(source, target, overwrite=False)
+        self.assertEqual(order, ['body', 'directory'])
+
+    def test_failed_copy_sync_does_not_publish_destination(self):
+        source = self.root / 'archive.mp4';source.write_bytes(b'lecture');target = self.root / 'Course/video.mp4'
+        with patch('recovery.os.fsync', side_effect=OSError(errno.EIO, 'Disk disconnected')):
+            with self.assertRaises(OSError):
+                recovery.copy_saved(source, target, overwrite=False)
+        self.assertFalse(target.exists())
+
+    def test_copy_io_error_is_retryable_disk_error(self):
+        source = self.root / 'archive.mp4';source.write_bytes(b'lecture');target = self.root / 'Course/video.mp4'
+        failure = subprocess.CalledProcessError(1, ['cp'], stderr=b'cp: error reading archive: Input/output error')
+        with patch.object(recovery.subprocess, 'run', side_effect=failure):
+            with self.assertRaises(OSError) as error:
+                recovery.copy_saved(source, target)
+        self.assertTrue(storage.disk_error(error.exception))
+        self.assertFalse(target.exists())
+
+
+def urllib_error():
+    import urllib.error
+    return urllib.error.URLError(OSError(errno.ENETUNREACH, 'Network unavailable'))
