@@ -98,6 +98,7 @@ def _promote_partial(root, event):
         stat = destination.stat() if destination.exists() else None
         stamp = [stat.st_ino, stat.st_size, stat.st_mtime_ns] if stat else None
         if stamp == old['pending_stat']:
+            storage.sync_directory(destination.parent)
             old = dict(old)
             old.pop('pending_stat'); old.pop('previous', None)
             copies = [row for row in copies if not (row['source'] == source and row['path'] == event['path'])] + [old]

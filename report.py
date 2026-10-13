@@ -409,8 +409,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
             subprocess.run(['git', '-C', str(repo), *args], check=True,
                            timeout=git_timeout if args[0] == 'push' else 120, env=git_env)
         if paths:
-            git('add', '--', *paths)
-            git('commit', '-m', message or f'Update {mark} verified download report')
+            git('commit', '--only', '-m', message or f'Update {mark} verified download report', '--', *paths)
             if transaction is not None:
                 transaction.unlink()
                 storage.sync_directory(transaction.parent)

@@ -1,5 +1,6 @@
 import errno
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -8,7 +9,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import download
 import pipeline
@@ -41,6 +42,27 @@ class OutageIntegrationChecks(unittest.TestCase):
             self.assertEqual(download.api('source'), {'name': 'course'})
         wait.assert_called_once()
         delay.assert_not_called()
+
+    def test_api_truncated_close_delimited_json_waits_without_spending_attempt(self):
+        for body in (b'{"name":', b'{"name":"\xd0'):
+            with self.subTest(body=body):
+                socket = Mock()
+                socket.makefile.return_value = io.BytesIO(
+                    b'HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n' + body)
+                response = http.client.HTTPResponse(socket); response.begin()
+                with patch.object(download.OPENER, 'open', side_effect=[response, io.BytesIO(b'{"name":"course"}')]), \
+                        patch('network.wait_if_offline', return_value=True) as wait, \
+                        patch.object(download.time, 'sleep') as delay:
+                    self.assertEqual(download.api('source'), {'name': 'course'})
+                wait.assert_called_once()
+                delay.assert_not_called()
+
+    def test_api_invalid_json_online_has_bounded_server_retries(self):
+        with patch.object(download.OPENER, 'open', side_effect=lambda *args, **kwargs: io.BytesIO(b'{')) as request, \
+                patch('network.wait_if_offline', return_value=False), patch.object(download.time, 'sleep'):
+            with self.assertRaises(json.JSONDecodeError):
+                download.api('source')
+        self.assertEqual(request.call_count, 5)
 
     def test_api_wait_is_interruptible(self):
         from threading import Event

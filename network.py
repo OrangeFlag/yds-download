@@ -1,6 +1,7 @@
 """Wait through a local connection outage without spending file retries."""
 import errno
 import http.client
+import json
 import socket
 from threading import Event, Lock
 import urllib.error
@@ -55,9 +56,10 @@ def retry_while_offline(operation, stopping=None):
     while True:
         try:
             return operation()
-        except (OSError, http.client.HTTPException) as error:
+        except (OSError, http.client.HTTPException, json.JSONDecodeError, UnicodeDecodeError) as error:
             connection = (not isinstance(error, urllib.error.HTTPError)
-                          and (isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, socket.gaierror, http.client.HTTPException))
+                          and (isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, socket.gaierror,
+                                                  http.client.HTTPException, json.JSONDecodeError, UnicodeDecodeError))
                                or getattr(error, 'errno', None) in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN)))
             if not connection or not wait_if_offline(stopping):
                 raise

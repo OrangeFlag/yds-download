@@ -77,6 +77,26 @@ class OutageProgressChecks(unittest.TestCase):
         self.assertEqual(copy['downloaded_bytes'], 600)
         self.assertNotIn('pending_stat', copy)
 
+    def test_partial_replay_syncs_publication_directory_before_clearing_pending(self):
+        destination = self.root / 'Course/video (partially available).mp4'
+        registry = self.root / '.download/partial-copies.json'
+        original = recovery.storage.sync_directory
+        def sync(path):
+            if Path(path) == destination.parent:
+                raise OSError(errno.EIO, 'Publication directory sync interrupted')
+            return original(path)
+        with patch.object(recovery.storage, 'sync_directory', side_effect=sync):
+            with self.assertRaises(OSError):
+                recovery.promote_partial(self.root, self.event)
+            self.assertTrue(destination.exists())
+            with self.assertRaises(OSError):
+                recovery.promote_partial(self.root, self.event)
+        self.assertIn('pending_stat', json.loads(registry.read_text())[0])
+        with patch.object(recovery.storage, 'sync_directory', wraps=original) as synced:
+            self.assertTrue(recovery.promote_partial(self.root, self.event))
+        synced.assert_called_once_with(destination.parent)
+        self.assertNotIn('pending_stat', json.loads(registry.read_text())[0])
+
     def test_partial_refresh_replays_both_sides_of_publication(self):
         self.assertTrue(recovery.promote_partial(self.root, self.event))
         destination = self.root / 'Course/video (partially available).mp4'

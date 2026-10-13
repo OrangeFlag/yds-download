@@ -160,6 +160,21 @@ class PendingReportChecks(unittest.TestCase):
         self.assertEqual(subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD']), head)
         self.assertFalse((repo / '.git/yds-report-transaction.json').exists())
 
+    def test_publication_commit_excludes_concurrently_staged_other_file(self):
+        repo, _ = self.publication_repo()
+        write_json = d.write_json
+        def staged(path, data):
+            write_json(path, data)
+            if path.name == 'yds-report-transaction.json':
+                (repo / 'other.txt').write_text('User edit')
+                subprocess.run(['git', '-C', str(repo), 'add', '--', 'other.txt'], check=True)
+        with patch.object(d, 'write_json', side_effect=staged):
+            report.update_report(self.root, repo, 'Walterit', True)
+        files = subprocess.check_output(['git', '-C', str(repo), 'diff-tree', '--no-commit-id', '--name-only', '-r', 'HEAD'], text=True)
+        self.assertEqual(files.strip(), 'courses/course.md')
+        index = subprocess.check_output(['git', '-C', str(repo), 'diff', '--cached', '--name-only'], text=True)
+        self.assertEqual(index.strip(), 'other.txt')
+
     def test_stop_interrupts_shared_git_lock(self):
         repo = self.root / 'repo'; common = repo / '.git'; common.mkdir(parents=True)
         stopping = Event(); stopping.set()
@@ -189,7 +204,7 @@ class PendingReportChecks(unittest.TestCase):
                 patch.object(report.subprocess, 'check_output', return_value=b''), \
                 patch('network.wait_if_offline', return_value=False):
             report._publish_reports(self.root, Event())
-        self.assertEqual(calls[-3:], [('add', 120), ('commit', 120), ('push', 15)])
+        self.assertEqual(calls[-2:], [('commit', 120), ('push', 15)])
         self.assertTrue(paths[0].exists())
 
     def test_finished_archive_retries_failed_final_course_without_redownload(self):
