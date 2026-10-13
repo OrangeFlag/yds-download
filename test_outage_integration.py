@@ -104,6 +104,15 @@ class OutageIntegrationChecks(unittest.TestCase):
         self.assertEqual(result['status'], 'valid')
         self.assertGreater(sync.call_count, 0)
 
+    def test_valid_original_directory_sync_failure_does_not_record_proof(self):
+        local = self.root / 'Course/video.mp4'; local.parent.mkdir(); local.write_bytes(b'lecture')
+        stamp = [local.stat().st_ino, local.stat().st_size, local.stat().st_mtime_ns]
+        with patch.object(storage, 'sync_directory', side_effect=OSError(errno.EIO, 'Directory unavailable')) as sync:
+            with self.assertRaises(OSError):
+                download.record(self.state, self.item, 'Course', 1, 'valid', 'Verified', verified_stat=stamp)
+        sync.assert_called_once_with(local.parent)
+        self.assertEqual(download.read_events(self.state / 'events.jsonl'), [])
+
     def test_copy_body_and_directory_synced_before_proof(self):
         source = self.root / 'archive.mp4';source.write_bytes(b'lecture');target = self.root / 'Course/video.mp4'
         order = []
@@ -123,6 +132,34 @@ class OutageIntegrationChecks(unittest.TestCase):
             with self.assertRaises(OSError):
                 recovery.copy_saved(source, target, overwrite=False)
         self.assertFalse(target.exists())
+
+    def test_full_original_replay_syncs_directory_before_valid_proof(self):
+        event = dict(self.item, course='Course', corrupted_path='corrupted/old/Course/video.mp4')
+        body = self.root / event['corrupted_path']; body.parent.mkdir(parents=True)
+        body.write_bytes(b'lecture')
+        download.write_json(Path(str(body) + '.ranges.json'),
+                            dict(size=7, sha256=self.item['sha256'], ranges=[[0, 7]]))
+        target = self.root / 'Course/video.mp4'
+        original = storage.sync_directory
+        def sync(path):
+            if Path(path) == target.parent:
+                raise OSError(errno.EIO, 'Publication directory sync interrupted')
+            return original(path)
+        with patch.object(recovery, 'retry_ranges', return_value=[[0, 7]]):
+            with patch.object(storage, 'sync_directory', side_effect=sync):
+                with self.assertRaises(OSError):
+                    recovery.finish_recovery(self.root, event, self.item, background=True)
+                self.assertTrue(target.exists())
+                with self.assertRaises(OSError):
+                    recovery.finish_recovery(self.root, event, self.item, background=True)
+            ledger = self.state / 'recovery-state.json'
+            self.assertEqual(json.loads(ledger.read_text())[self.item['path']]['state'], 'running')
+            self.assertEqual(download.read_events(self.state / 'events.jsonl'), [])
+            with patch.object(storage, 'sync_directory', wraps=original) as synced:
+                self.assertTrue(recovery.finish_recovery(self.root, event, self.item, background=True))
+            self.assertIn(unittest.mock.call(target.parent), synced.call_args_list)
+        self.assertEqual(json.loads(ledger.read_text())[self.item['path']]['state'], 'finished')
+        self.assertEqual(download.read_events(self.state / 'events.jsonl')[-1]['status'], 'valid')
 
     def test_copy_io_error_is_retryable_disk_error(self):
         source = self.root / 'archive.mp4';source.write_bytes(b'lecture');target = self.root / 'Course/video.mp4'

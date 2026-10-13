@@ -242,6 +242,7 @@ def record(state, item, course, attempt, status, detail, local=None, verified_st
     from progress import progress
     event.update(progress(path, item['size'], valid=status == 'valid', sha256=item['sha256']))
     if status == 'valid':
+        storage.sync_directory(path.parent)
         event['mtime_ns'] = stamp[2]
     append_events(state / 'events.jsonl', [event])
     print(f"{status.upper()}: {item['path']} (attempt {attempt}) {detail}", flush=True)
