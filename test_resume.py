@@ -39,7 +39,7 @@ class ResumeChecks(unittest.TestCase):
         self.requests = []
         self.real_api = download.api
         for target, kwargs in (
-                ('network.NetworkGuard.online', dict(return_value=True)),
+                ('network.RequestRetry.retry', dict(return_value=False)),
                 ('download.api', dict(return_value=self.item)),
                 ('download.files', dict(return_value=[self.item])),
                 ('download.time.sleep', {}),

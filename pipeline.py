@@ -26,11 +26,31 @@ def now():
 
 
 def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
+    log = next((Path(arg[6:]) for arg in command if arg.startswith('--log=')), None)
+    retry = network.RequestRetry(str(log), stopping)
     while True:
+        offset = log.stat().st_size if log is not None and log.exists() else 0
         code = _transfer_process_once(command, env=env, on_tick=on_tick, stop_timeout=stop_timeout)
         if (command[0] != 'aria2c' or code in (0, 9, 130, -2, 143, -15)
-                or stopping is not None and stopping.is_set()
-                or not network.wait_if_offline(stopping)):
+                or stopping is not None and stopping.is_set() or log is None):
+            return code
+        error = None
+        error_target = target = str(log)
+        with log.open() as stream:
+            stream.seek(offset)
+            for line in stream:
+                if 'Download aborted. URI=' in line:
+                    target = line.partition('URI=')[2].strip()
+                elif line.startswith('Exception:'):
+                    current = network.failure(line, 'transfer')
+                    network.GUARD.observe(target, current)
+                    priority = {'other': 0, 'http': 1, 'ambiguous': 2, 'routing': 3}
+                    if error is None or priority[current['category']] > priority[error['category']]:
+                        error, error_target = current, target
+                elif 'Download complete:' in line:
+                    network.GUARD.observe(line.partition('Download complete:')[2].strip())
+        retry.target = error_target
+        if error is None or not retry.retry(error):
             return code
 
 

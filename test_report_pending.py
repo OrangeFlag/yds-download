@@ -37,7 +37,7 @@ class PendingReportChecks(unittest.TestCase):
         jobs = list((self.root / '.download/report-pending').glob('*.json'))
         self.assertTrue(any(json.loads(path.read_text())['message'].endswith('/ Course') for path in jobs))
         with patch.object(report, 'update_report', side_effect=RuntimeError('push failed')), \
-                patch('network.wait_if_offline', return_value=False):
+                patch('network.RequestRetry.retry', return_value=False):
             report._publish_reports(self.root, Event())
         with patch.object(report, 'retry_reports'), \
                 patch.object(d, 'list_course', side_effect=AssertionError('finished course reprocessed')):
@@ -54,7 +54,7 @@ class PendingReportChecks(unittest.TestCase):
     def test_failed_publish_keeps_intent_and_backoff_until_success(self):
         paths = self.enqueue()
         with patch.object(report, 'update_report', side_effect=subprocess.CalledProcessError(1, 'git push')), \
-                patch('network.wait_if_offline', return_value=False):
+                patch('network.RequestRetry.retry', return_value=False):
             report._publish_reports(self.root, Event())
         saved = json.loads(paths[0].read_text())
         self.assertEqual(saved['mark'], 'Walterit')
@@ -80,7 +80,7 @@ class PendingReportChecks(unittest.TestCase):
     def test_local_network_outage_retries_without_spending_backoff_attempt(self):
         paths = self.enqueue()
         with patch.object(report, 'update_report', side_effect=[subprocess.CalledProcessError(1, 'git push'), None]) as publish, \
-                patch('network.wait_if_offline', return_value=True) as wait:
+                patch('network.RequestRetry.retry', return_value=True) as wait:
             report._publish_reports(self.root, Event())
         self.assertEqual(publish.call_count, 2)
         wait.assert_called_once()
@@ -202,7 +202,7 @@ class PendingReportChecks(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0)
         with patch.object(report.subprocess, 'run', side_effect=git), \
                 patch.object(report.subprocess, 'check_output', return_value=b''), \
-                patch('network.wait_if_offline', return_value=False):
+                patch('network.RequestRetry.retry', return_value=False):
             report._publish_reports(self.root, Event())
         self.assertEqual(calls[-2:], [('commit', 120), ('push', 15)])
         self.assertTrue(paths[0].exists())
@@ -210,7 +210,7 @@ class PendingReportChecks(unittest.TestCase):
     def test_finished_archive_retries_failed_final_course_without_redownload(self):
         paths = self.enqueue()
         with patch.object(report, 'update_report', side_effect=RuntimeError('push failed')), \
-                patch('network.wait_if_offline', return_value=False):
+                patch('network.RequestRetry.retry', return_value=False):
             report._publish_reports(self.root, Event())
         queue = self.root / 'queue.json'
         d.write_json(queue, {'archives': [{'title': 'Done', 'destination': str(self.root),

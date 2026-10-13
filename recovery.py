@@ -221,22 +221,28 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     next_request = 0.0
     def fetch(bounds):
         started = time.monotonic()
-        timing = dict(request_seconds=0.0, first_byte_seconds=None)
+        timing = dict(request_seconds=0.0, first_byte_seconds=None, request_attempts=0,
+                      retry_reasons={}, request_errors={}, last_failure=None)
         data = bytearray()
+        retry = network.RequestRetry(item['sha256'] + item['path'], stopping)
         while True:
             result = fetch_limited((bounds[0] + len(data), bounds[1]), timing)
             data.extend(result[1] or b'')
-            connection = result[2] in ('URLError', 'TimeoutError', 'ConnectionError', 'ConnectionResetError',
-                                      'ConnectionAbortedError', 'OSError', 'Incomplete response')
+            details = timing['last_failure']
+            if details:
+                key = f'{details["phase"]}:{details["category"]}:{details["errno"]}:{details["http_status"]}'
+                timing['request_errors'][key] = timing['request_errors'].get(key, 0) + 1
             try:
-                retry = (len(data) < bounds[1] - bounds[0] and connection
-                         and network.wait_if_offline(stopping))
+                again = (len(data) < bounds[1] - bounds[0] and result[2] is not None
+                         and details is not None and retry.retry(details))
             except InterruptedError:
                 result = bounds, data or None, 'Interrupted'
                 break
-            if not retry:
+            if not again:
                 result = bounds, data or None, result[2]
                 break
+            reason = details['category']
+            timing['retry_reasons'][reason] = timing['retry_reasons'].get(reason, 0) + 1
         timing['seconds'] = time.monotonic() - started
         return (*result, timing)
     def fetch_limited(bounds, timing):
@@ -271,8 +277,13 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
             return bounds, None, 'Interrupted'
         request = urllib.request.Request(item['file'], headers={'Range': f'bytes={start}-{end - 1}', 'Accept-Encoding': 'identity'})
         request_started = time.monotonic()
+        timing['request_attempts'] += 1
+        timing['last_failure'] = None
+        phase = 'connect'
         try:
             with OPENER.open(request, timeout=tuning['range_timeout']) as response:
+                phase = 'headers'
+                network.GUARD.observe(item['sha256'] + item['path'])
                 served = re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)', response.headers.get('Content-Range', ''))
                 if (response.status != 206 or not served or int(served[1]) != start
                         or not start <= int(served[2]) < end or int(served[3]) != total
@@ -293,6 +304,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                     return bounds, None, 'Invalid Range Content-Length'
                 data = bytearray()
                 error = None
+                phase = 'body'
                 try:
                     while len(data) < length and not stopping.is_set():
                         chunk = response.read1(min(64 * 1024, length - len(data)))
@@ -309,12 +321,19 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                         timing['first_byte_seconds'] = time.monotonic() - request_started
                     data.extend(failure.partial)
                     error = 'Incomplete response'
+                    timing['last_failure'] = network.failure(failure, phase)
                 except (OSError, http.client.HTTPException) as failure:
                     error = type(failure).__name__
+                    timing['last_failure'] = network.failure(failure, phase)
                 if len(data) > length:
                     return bounds, None, 'Oversized response'
+                if len(data) < length and timing['last_failure'] is None:
+                    timing['last_failure'] = network.failure('Incomplete response', phase)
+                if data:
+                    network.GUARD.observe(item['sha256'] + item['path'])
                 return bounds, data or None, error or (None if len(data) == length else 'Incomplete response')
         except (OSError, http.client.HTTPException) as error:
+            timing['last_failure'] = network.failure(error, phase)
             return bounds, None, 'HTTP ' + str(error.code) if hasattr(error, 'code') else type(error).__name__
         finally:
             timing['request_seconds'] += time.monotonic() - request_started
@@ -743,7 +762,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
             elif retry:
                 course = event['course']
                 if course not in metadata:
-                    metadata[course] = {row['path']: row for row in network.retry_while_offline(lambda: files(source, '/' + course))}
+                    metadata[course] = {row['path']: row for row in files(source, '/' + course)}
                 item = metadata[course].get(event['path'])
                 if item is None:
                     event['recovery_error'] = 'File no longer listed in source'

@@ -28,7 +28,7 @@ class OutageIntegrationChecks(unittest.TestCase):
 
     def test_api_waits_without_spending_metadata_attempt(self):
         with patch.object(download.OPENER, 'open', side_effect=[urllib_error(), io.BytesIO(b'{"name":"course"}')]) as call, \
-                patch('network.wait_if_offline', return_value=True) as wait, \
+                patch('network.RequestRetry.retry', return_value=True) as wait, \
                 patch.object(download.time, 'sleep'):
             self.assertEqual(download.api('public-source'), {'name': 'course'})
         self.assertEqual(call.call_count, 2)
@@ -37,7 +37,7 @@ class OutageIntegrationChecks(unittest.TestCase):
     def test_api_incomplete_body_waits_without_spending_attempt(self):
         import http.client
         with patch.object(download.OPENER, 'open', side_effect=[http.client.IncompleteRead(b'{'), io.BytesIO(b'{"name":"course"}')]), \
-                patch('network.wait_if_offline', return_value=True) as wait, \
+                patch('network.RequestRetry.retry', return_value=True) as wait, \
                 patch.object(download.time, 'sleep') as delay:
             self.assertEqual(download.api('source'), {'name': 'course'})
         wait.assert_called_once()
@@ -51,7 +51,7 @@ class OutageIntegrationChecks(unittest.TestCase):
                     b'HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n' + body)
                 response = http.client.HTTPResponse(socket); response.begin()
                 with patch.object(download.OPENER, 'open', side_effect=[response, io.BytesIO(b'{"name":"course"}')]), \
-                        patch('network.wait_if_offline', return_value=True) as wait, \
+                        patch('network.RequestRetry.retry', return_value=True) as wait, \
                         patch.object(download.time, 'sleep') as delay:
                     self.assertEqual(download.api('source'), {'name': 'course'})
                 wait.assert_called_once()
@@ -59,7 +59,7 @@ class OutageIntegrationChecks(unittest.TestCase):
 
     def test_api_invalid_json_online_has_bounded_server_retries(self):
         with patch.object(download.OPENER, 'open', side_effect=lambda *args, **kwargs: io.BytesIO(b'{')) as request, \
-                patch('network.wait_if_offline', return_value=False), patch.object(download.time, 'sleep'):
+                patch('network.RequestRetry.retry', return_value=False), patch.object(download.time, 'sleep'):
             with self.assertRaises(json.JSONDecodeError):
                 download.api('source')
         self.assertEqual(request.call_count, 5)
@@ -67,7 +67,7 @@ class OutageIntegrationChecks(unittest.TestCase):
     def test_api_wait_is_interruptible(self):
         from threading import Event
         with patch.object(download.OPENER, 'open', side_effect=urllib_error()), \
-                patch('network.wait_if_offline', side_effect=InterruptedError), patch.object(download.time, 'sleep'):
+                patch('network.RequestRetry.retry', side_effect=InterruptedError), patch.object(download.time, 'sleep'):
             with self.assertRaises(InterruptedError):
                 download.api('public-source', stopping=Event())
 

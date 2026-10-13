@@ -65,6 +65,7 @@ def _publish_reports(destination, stopping):
                 job = json.loads(path.read_text())
                 if stopping.is_set() or job['next_attempt'] > time.time():
                     return
+                retry = network.RequestRetry('git-push', stopping)
                 while not stopping.is_set():
                     try:
                         update_report(destination, Path(job['repo']), job['mark'], job['git_push'], job['message'], stopping=stopping)
@@ -72,7 +73,7 @@ def _publish_reports(destination, stopping):
                         if storage.disk_error(error):
                             raise
                         print(f'REPORT PENDING: {error}', flush=True)
-                        if job['git_push'] and network.wait_if_offline(stopping):
+                        if job['git_push'] and retry.retry(network.failure(error, 'publish')):
                             continue
                         job['attempts'] += 1
                         job['next_attempt'] = time.time() + min(300, 30 * 2 ** min(job['attempts'] - 1, 4))
@@ -407,7 +408,8 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
         git_env.setdefault('GIT_SSH_COMMAND', 'ssh -4 -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=5 -o ServerAliveCountMax=2')
         def git(*args):
             subprocess.run(['git', '-C', str(repo), *args], check=True,
-                           timeout=git_timeout if args[0] == 'push' else 120, env=git_env)
+                           timeout=git_timeout if args[0] == 'push' else 120, env=git_env,
+                           capture_output=args[0] == 'push')
         if paths:
             git('commit', '--only', '-m', message or f'Update {mark} verified download report', '--', *paths)
             if transaction is not None:

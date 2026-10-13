@@ -5,6 +5,7 @@ import errno
 from datetime import datetime
 import fcntl
 import hashlib
+import http.client
 import json
 from local_paths import local_path
 import os
@@ -57,18 +58,26 @@ def api(source, path='/', offset=0, stopping=None):
     def request():
         if stopping is not None and stopping.is_set():
             raise InterruptedError('Metadata request interrupted')
-        with OPENER.open(url, timeout=40) as response:
-            return json.load(response)
+        phase = 'connect'
+        try:
+            with OPENER.open(url, timeout=40) as response:
+                phase = 'body'
+                network.GUARD.observe(url)
+                return json.load(response)
+        except (OSError, http.client.HTTPException, json.JSONDecodeError, UnicodeDecodeError) as error:
+            error.network_phase = phase
+            raise
     for attempt in range(5):
         try:
-            return network.retry_while_offline(request, stopping)
+            return network.retry_request(request, stopping, target=url, confirmation_retries=0)
         except InterruptedError:
             raise
         except Exception as error:
             if (isinstance(error, urllib.error.HTTPError)
                     and 400 <= error.code < 500 and error.code not in (408, 429)) or attempt == 4:
                 raise
-            delay = min(2 ** (attempt + 1), 30)
+            delay = max(min(2 ** (attempt + 1), 30),
+                        network.retry_after(error.headers) if isinstance(error, urllib.error.HTTPError) else 0)
             if stopping is None:
                 time.sleep(delay)
             elif stopping.wait(delay):
@@ -315,7 +324,7 @@ def bind_resume(root, entries, previous, events, deep_only):
 def list_course(source, course, retries=2, retry_delay=60):
     for attempt in range(retries + 1):
         try:
-            return sorted(network.retry_while_offline(lambda: files(source, '/' + course)), key=lambda item: item['size'])
+            return sorted(files(source, '/' + course), key=lambda item: item['size'])
         except (OSError, RuntimeError) as error:
             if (isinstance(error, urllib.error.HTTPError)
                     and 400 <= error.code < 500 and error.code not in (408, 429)) or attempt == retries:

@@ -11,6 +11,8 @@ from threading import Event, RLock, Thread
 import time
 import uuid
 
+import network
+
 try:
     REVISION = subprocess.check_output(['git','-C',str(Path(__file__).parent),'rev-parse','--short','HEAD'],
                                        stderr=subprocess.DEVNULL,text=True).strip()
@@ -66,6 +68,10 @@ class Metrics:
             self.add(range_requests=1, range_received_bytes=row['saved_bytes'],
                      range_request_seconds=row['request_seconds'], range_io_seconds=row['save_seconds'],
                      range_wait_seconds=max(0,row['seconds']-row['request_seconds']))
+            self.add(range_http_attempts=row.get('request_attempts', 1))
+            for reason, count in row.get('retry_reasons', {}).items():
+                self.add(**{'range_retries_' + reason: count})
+            self.errors.setdefault('range_causes', Counter()).update(row.get('request_errors', {}))
             if row['error']:
                 self.errors.setdefault('range',Counter()).update([row['error']])
             if row['first_byte_seconds'] is not None:
@@ -198,6 +204,7 @@ class AriaMetrics:
             self.metrics.add(aria_initial_unmeasured_bytes=amount)
             entry['seen'] = amount
         elif amount > entry['seen']:
+            network.GUARD.observe(str(id(entry)))
             self.metrics.add(aria_received_bytes=amount-entry['seen'])
             entry['seen'] = amount
 

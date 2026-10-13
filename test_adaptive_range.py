@@ -18,7 +18,9 @@ from test_regressions import Response
 
 class AdaptiveRangeTest(unittest.TestCase):
     def setUp(self):
-        connectivity = patch('network.NetworkGuard.online', return_value=True)
+        import network
+        self.actual_retry = network.RequestRetry.retry
+        connectivity = patch('network.RequestRetry.retry', return_value=False)
         connectivity.start()
         self.addCleanup(connectivity.stop)
         self.tmp = tempfile.TemporaryDirectory()
@@ -49,7 +51,7 @@ class AdaptiveRangeTest(unittest.TestCase):
                 return Response(0, len(self.content), len(self.content), self.content[:16384], timeout=True)
             return Response(16384, len(self.content), len(self.content), self.content[16384:])
         self.tuning['range_block_size_kib'] = 128
-        with patch('network.wait_if_offline', return_value=True):
+        with patch('network.RequestRetry.retry', return_value=True):
             ranges = self.run_ranges(serve)
         self.assertEqual(requests, ['bytes=0-131071', 'bytes=16384-131071'])
         self.assertEqual(ranges, [[0, len(self.content)]])
@@ -63,11 +65,33 @@ class AdaptiveRangeTest(unittest.TestCase):
                 raise urllib.error.URLError('No route to host')
             return Response(0, len(self.content), len(self.content), self.content)
         self.tuning['range_block_size_kib'] = 128
-        with patch('network.wait_if_offline', return_value=True):
+        with patch('network.RequestRetry.retry', return_value=True):
             ranges = self.run_ranges(serve)
         self.assertEqual(requests, ['bytes=0-131071', 'bytes=0-131071'])
         self.assertEqual(ranges, [[0, len(self.content)]])
         self.assertEqual(len(self.event['range_attempts']), 1)
+
+    def test_route_cause_is_preserved_and_success_is_not_retried(self):
+        import errno
+        requests = []
+        def serve(request, **kwargs):
+            requests.append(request.get_header('Range'))
+            if len(requests) == 1:
+                raise urllib.error.URLError(OSError(errno.EHOSTUNREACH, 'No route to host'))
+            return Response(0, len(self.content), len(self.content), self.content)
+        self.tuning['range_block_size_kib'] = 128
+        self.tuning['range_max_passes'] = 1
+        # The suite disables retries for framing tests; exercise the real policy here.
+        import network
+        with patch.object(network.RequestRetry, 'retry', new=self.actual_retry), \
+                patch('network.GUARD', new=network.NetworkGuard()), \
+                patch.object(network.socket, 'create_connection', side_effect=AssertionError('No probes')):
+            self.assertEqual(self.run_ranges(serve), [[0, len(self.content)]])
+        row = self.event['range_attempts'][0]['ranges'][0]
+        self.assertEqual(row['request_attempts'], 2)
+        self.assertEqual(row['retry_reasons'], {'routing': 1})
+        self.assertEqual(row['request_errors']['connect:routing:113:None'], 1)
+        self.assertEqual(len(requests), 2)
 
     def test_request_measurements_distinguish_wait_network_and_save(self):
         def serve(request, timeout):

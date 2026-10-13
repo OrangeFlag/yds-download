@@ -43,7 +43,7 @@ class Response:
 
 class ReviewRegression(unittest.TestCase):
     def setUp(self):
-        connectivity = patch('network.NetworkGuard.online', return_value=True)
+        connectivity = patch('network.RequestRetry.retry', return_value=False)
         connectivity.start()
         self.addCleanup(connectivity.stop)
         self.temp = tempfile.TemporaryDirectory()
