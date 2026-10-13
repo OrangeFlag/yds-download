@@ -487,7 +487,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             if not defer_range or range_files < 1:
                 raise ValueError('Overlapping Range requires --defer-range and positive --range-files')
             from request_budget import ProcessRangeBudget
-            budget = ProcessRangeBudget(range_budget)
+            budget = ProcessRangeBudget(range_budget, rps=tuning['range_rps'])
         background = Background(root, source, retries, tuning, defer_range=defer_range and budget is None,
                                 budget=budget, range_files=range_files if budget else 1)
         for path in background.directory.glob('*.json'):

@@ -52,6 +52,14 @@ class PipelineChecks(unittest.TestCase):
                 patch('pipeline.transfer_process', side_effect=self.transfer):
             return download.download(self.data, ['First', 'Second'], self.root, retries=0, **kwargs)
 
+    def test_foreground_shared_budget_uses_configured_rps(self):
+        from request_budget import ProcessRangeBudget
+        budget = self.root / 'http-budget'
+        ProcessRangeBudget(budget, rps=4)
+        self.assertEqual(self.run_download(defer_range=True, range_budget=budget,
+                                          tuning={'range_rps': 4}), 0)
+        self.assertEqual(json.loads((budget / 'config.json').read_text())['rps'], 4)
+
     def ready_range_jobs(self, count):
         from concurrent.futures import Future
         (self.root / '.download').mkdir()
