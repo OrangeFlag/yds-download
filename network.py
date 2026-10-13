@@ -11,6 +11,7 @@ import subprocess
 import time
 from threading import Event, Lock
 import urllib.error
+import urllib.parse
 import urllib.request
 
 
@@ -114,6 +115,13 @@ class NetworkGuard:
 
 
 GUARD = NetworkGuard()
+
+
+def aria_resource(url):
+    parsed = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    name = query.get('filename', [urllib.parse.unquote(parsed.path)])[0]
+    return name, query.get('hid', [''])[0], query.get('fsize', [''])[0]
 
 
 class RequestRetry:

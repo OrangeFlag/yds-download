@@ -10,6 +10,115 @@ from metrics import Metrics, AriaMetrics
 
 
 class MetricsChecks(unittest.TestCase):
+    def test_aria_times_interleaved_connections_and_late_headers_without_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);log=root/'aria2.log';log.touch()
+            m=Metrics(root/'metrics.jsonl','test',start=False);aria=AriaMetrics(log,m)
+            aria.begin({str(root/'a.mp4'):(100,None),str(root/'b.mp4'):(100,None)})
+            log.write_text('''2026-10-13 12:00:00.000000 [INFO] CUID#7 - Connecting to 127.0.0.1:80
+2026-10-13 12:00:00.500000 [INFO] CUID#8 - Connecting to 127.0.0.1:80
+2026-10-13 12:00:01.000000 [INFO] CUID#7 - Requesting:
+GET /file?filename=a.mp4&token=HIDDEN HTTP/1.1
+2026-10-13 12:00:02.000000 [INFO] CUID#8 - Requesting:
+GET /file?filename=b.mp4&token=HIDDEN HTTP/1.1
+2026-10-13 12:00:16.900000 [INFO] CUID#8 - Restarting the download. URI=https://secret.invalid/?filename=b.mp4&token=HIDDEN
+Exception: errorCode=2 Timeout.
+2026-10-13 12:00:17.000000 [INFO] CUID#8 - 1 times attempted, but no success. Download aborted.
+2026-10-13 12:00:17.000000 [ERROR] CUID#8 - Download aborted. URI=https://secret.invalid/?filename=b.mp4&token=HIDDEN
+Exception: errorCode=2 Timeout.
+2026-10-13 12:01:05.000000 [INFO] CUID#7 - Response received:
+HTTP/1.1 200 OK
+2026-10-13 12:01:08.000000 [INFO] CUID#7 - The download for one segment completed successfully.
+'''+f'2026-10-13 12:01:08.100000 [NOTICE] Download complete: {root}/a.mp4\n')
+            aria.sample();aria.sample();m.snapshot()
+            row=json.loads(m.path.read_text().splitlines()[-1]);records=row.get('aria_attempt_details',[])
+            self.assertEqual(len(records),2)
+            by_path={r['path']:r for r in records}
+            success=by_path[str(root/'a.mp4')];timeout=by_path[str(root/'b.mp4')]
+            self.assertEqual(success['connect_ready_seconds'],1)
+            self.assertEqual(success['response_headers_seconds'],64)
+            self.assertAlmostEqual(success['body_phase_seconds'],3.1,places=5)
+            self.assertFalse(success['censored'])
+            self.assertEqual(timeout['phase'],'response_headers')
+            self.assertEqual(timeout['stage_seconds'],15)
+            self.assertIsNone(timeout['response_headers_seconds'])
+            self.assertTrue(timeout['censored'])
+            self.assertEqual(row['counters']['aria_timeout_connections'],1)
+            self.assertEqual(row['counters']['aria_aborted_files'],1)
+            self.assertEqual(row['errors']['aria_error_messages']['2'],1)
+            self.assertNotIn('HIDDEN',json.dumps(row));m.close()
+
+    def test_aria_body_timeout_after_segment_keeps_response_timing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);log=root/'aria2.log';log.touch()
+            m=Metrics(root/'metrics.jsonl','test',start=False);aria=AriaMetrics(log,m);m.sample=aria.sample
+            aria.begin({str(root/'a.mp4'):(100,None)})
+            log.write_text('''2026-10-13 12:00:00.000000 [INFO] CUID#7 - Connecting to 127.0.0.1:80
+2026-10-13 12:00:01.000000 [INFO] CUID#7 - Requesting:
+GET /file?filename=a.mp4 HTTP/1.1
+2026-10-13 12:00:02.000000 [INFO] CUID#7 - Response received:
+HTTP/1.1 200 OK
+2026-10-13 12:00:03.000000 [INFO] CUID#7 - The download for one segment completed successfully.
+2026-10-13 12:00:04.000000 [INFO] CUID#7 - The download for one segment completed successfully.
+2026-10-13 12:01:04.000000 [ERROR] CUID#7 - Download aborted. URI=https://example.invalid/?filename=a.mp4
+Exception: errorCode=2 Timeout.
+''')
+            m.close();row=json.loads(m.path.read_text().splitlines()[-1]);records=row['aria_attempt_details']
+            self.assertEqual(len(records),1)
+            self.assertEqual(records[0]['phase'],'body')
+            self.assertEqual(records[0]['body_phase_seconds'],62)
+            self.assertEqual(records[0]['segments_completed'],2)
+            self.assertEqual(records[0]['seconds_since_last_segment'],60)
+            self.assertEqual(row['counters']['aria_connect_ready_samples'],1)
+            self.assertEqual(row['counters']['aria_response_headers_samples'],1)
+            self.assertEqual(row['counters']['aria_timeout_connections'],1)
+
+    def test_aria_error_chain_split_across_reads_is_recorded_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);log=root/'aria2.log';log.touch()
+            m=Metrics(root/'metrics.jsonl','test',start=False);aria=AriaMetrics(log,m)
+            aria.begin({str(root/'a.mp4'):(100,None)})
+            log.write_text('''2026-10-13 12:00:00.000000 [INFO] CUID#7 - Connecting to 127.0.0.1:80
+2026-10-13 12:00:01.000000 [INFO] CUID#7 - Requesting:
+GET /file?filename=a.mp4 HTTP/1.1
+2026-10-13 12:00:02.000000 [INFO] CUID#7 - Response received:
+HTTP/1.1 206 Partial Content
+2026-10-13 12:00:20.000000 [ERROR] CUID#7 - Download aborted. URI=https://secret.invalid/?filename=a.mp4
+Exception: errorCode=''')
+            aria.sample();m.snapshot()
+            self.assertFalse(json.loads(m.path.read_text().splitlines()[-1]).get('aria_attempt_details'))
+            with log.open('a') as stream:stream.write('2 Timeout.\n2026-10-13 12:00:20.100000 [NOTICE] Done\n')
+            aria.sample();aria.sample();m.snapshot()
+            row=json.loads(m.path.read_text().splitlines()[-1]);records=row.get('aria_attempt_details',[])
+            self.assertEqual(len(records),1)
+            self.assertEqual(records[0]['phase'],'body')
+            self.assertEqual(records[0]['body_phase_seconds'],18)
+            self.assertEqual(records[0]['outcome'],'timeout')
+            self.assertEqual(row['counters']['aria_timeout_connections'],1);m.close()
+
+    def test_aria_log_reset_reused_cuid_and_shutdown_keep_separate_observations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);log=root/'aria2.log';log.touch()
+            m=Metrics(root/'metrics.jsonl','test',start=False);aria=AriaMetrics(log,m);m.sample=aria.sample
+            aria.begin({str(root/'short.mp4'):(100,None)},
+                       {str(root/'short.mp4'):'https://example.invalid/?filename=original.mp4&hid=h&fsize=100'})
+            first='''2026-10-13 12:00:00.000000 [INFO] CUID#7 - Connecting to 127.0.0.1:80
+2026-10-13 12:00:01.000000 [INFO] CUID#7 - Requesting:
+GET /?filename=original.mp4&hid=h&fsize=100 HTTP/1.1
+'''
+            log.write_text(first+'x'*1000+'\n');aria.sample()
+            log.write_text('''2026-10-13 12:01:00.000000 [INFO] CUID#7 - Connecting to 127.0.0.1:80
+2026-10-13 12:01:02.000000 [ERROR] CUID#7 - Download aborted. URI=https://example.invalid/?filename=original.mp4&hid=h&fsize=100
+Exception: errorCode=2 Timeout.
+''');aria.sample();m.close()
+            rows=[json.loads(line) for line in m.path.read_text().splitlines()]
+            details=[d for row in rows for d in row['aria_attempt_details']]
+            self.assertEqual([d['outcome'] for d in details],['log_reset','timeout'])
+            self.assertTrue(all(d['path']==str(root/'short.mp4') for d in details))
+            self.assertEqual(details[-1]['phase'],'connect')
+            self.assertEqual(details[-1]['stage_seconds'],2)
+            self.assertEqual(m.counters['aria_timeout_connections'],1)
+
     def test_slow_latest_metrics_write_does_not_block_download_state_writes(self):
         from download import write_json
         with tempfile.TemporaryDirectory() as directory:
@@ -54,6 +163,8 @@ class MetricsChecks(unittest.TestCase):
                 return original(path, data, *args, **kwargs)
             def update():
                 m.add(range_requests=1)
+                m.aria_attempt(dict(path='/v',cuid='7',outcome='timeout',phase='body',
+                                    connect_ready_seconds=1,response_headers_seconds=2,body_phase_seconds=3))
                 m.eof_retry(dict(path='/v',sha256='a'*64,attempt=2,start=0,end=7,
                                  accepted_bytes=7,request_seconds=.5,previous_eof_bytes=0,error=None))
                 m.gauge('archives', {'finished': 1})
@@ -78,6 +189,7 @@ class MetricsChecks(unittest.TestCase):
             latest = json.loads(m.path.with_name('metrics-latest.json').read_text())
             self.assertEqual(latest['interval_counters']['range_requests'], 2)
             self.assertEqual(len(latest['range_eof_retry_details']), 1)
+            self.assertEqual(len(latest['aria_attempt_details']), 1)
             m.close()
 
     def test_range_pass_counts_bytes_errors_and_wait_separately(self):
@@ -124,6 +236,20 @@ class MetricsChecks(unittest.TestCase):
             self.assertEqual(row['counters']['range_eof_retry_attempts'],2)
             self.assertEqual([v['sequence'] for v in row['range_eof_retry_details']],[1,2])
             m.close()
+
+    def test_aria_detail_buffer_is_bounded_and_survives_failed_metrics_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            m=Metrics(Path(directory)/'metrics.jsonl','test',start=False)
+            for index in range(1030):
+                m.aria_attempt(dict(path='/v',cuid=str(index),outcome='timeout',phase='response_headers',
+                                    connect_ready_seconds=1,response_headers_seconds=None,body_phase_seconds=None))
+            with patch.object(Path,'write_text',side_effect=OSError('Disk unavailable')):m.snapshot()
+            self.assertEqual(len(m.aria_attempts),1024)
+            m.snapshot();row=json.loads(m.path.with_name('metrics-latest.json').read_text())
+            self.assertEqual(row['counters']['aria_timeout_connections'],1030)
+            self.assertEqual(row['counters']['aria_attempt_buffer_overwrites'],6)
+            self.assertEqual(len(row['aria_attempt_details']),1024)
+            self.assertFalse(m.aria_attempts);m.close()
 
     def test_aria_reads_each_line_once_and_counts_resumed_bytes_correctly(self):
         with tempfile.TemporaryDirectory() as directory:

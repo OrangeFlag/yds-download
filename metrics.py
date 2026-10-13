@@ -34,6 +34,8 @@ class Metrics:
         self.first_bytes = deque(maxlen=1024)
         self.eof_retries = deque(maxlen=1024)
         self.eof_sequence = 0
+        self.aria_attempts = deque(maxlen=1024)
+        self.aria_sequence = 0
         self.sample = lambda: None
         self.previous_time = time.monotonic()
         self.disk_name = self.disk_device()
@@ -104,6 +106,20 @@ class Metrics:
         timing.pop('stopped_at', None)
         timing.pop('queued_since', None)
         return queued
+
+    def aria_attempt(self, detail):
+        with self.lock:
+            self.aria_sequence += 1
+            if len(self.aria_attempts) == self.aria_attempts.maxlen:
+                self.counters['aria_attempt_buffer_overwrites'] += 1
+            self.aria_attempts.append(dict(detail, sequence=self.aria_sequence))
+            self.add(aria_observed_connections=1)
+            if detail['outcome'] == 'timeout':
+                self.add(aria_timeout_connections=1)
+                self.errors.setdefault('aria_timeout_phases', Counter()).update([detail['phase']])
+            for key in ('connect_ready_seconds', 'response_headers_seconds', 'body_phase_seconds'):
+                if detail[key] is not None:
+                    self.add(**{'aria_'+key:detail[key], 'aria_'+key.replace('_seconds','_samples'):1})
 
     def finish_file(self, job, seconds, queued, timestamp, outcome):
         timing = job['timing']
@@ -205,7 +221,8 @@ class Metrics:
                                interval_counters={k:v-self.previous.get(k,0) for k,v in self.counters.items()},
                                errors=deepcopy(self.errors), gauges=deepcopy(self.gauges), tasks=queue, oldest_pending_seconds=oldest,
                                first_byte_p95_last_1024=first[min(len(first)-1,int(len(first)*.95))] if first else None,
-                               host_rates=rates, range_eof_retry_details=list(self.eof_retries))
+                               host_rates=rates, range_eof_retry_details=list(self.eof_retries),
+                               aria_attempt_details=list(self.aria_attempts))
                 self.path.parent.mkdir(parents=True,exist_ok=True)
                 with self.path.open('a',encoding='utf-8') as stream:
                     stream.write(json.dumps(row,ensure_ascii=False)+'\n')
@@ -214,9 +231,11 @@ class Metrics:
                 temporary.write_text(json.dumps(row,ensure_ascii=False,indent=2),encoding='utf-8')
                 temporary.replace(latest)
                 with self.lock:
-                    cutoff = row['range_eof_retry_details'][-1]['sequence'] if row['range_eof_retry_details'] else 0
-                    while self.eof_retries and self.eof_retries[0]['sequence'] <= cutoff:
-                        self.eof_retries.popleft()
+                    for buffer, key in ((self.eof_retries, 'range_eof_retry_details'),
+                                        (self.aria_attempts, 'aria_attempt_details')):
+                        cutoff = row[key][-1]['sequence'] if row[key] else 0
+                        while buffer and buffer[0]['sequence'] <= cutoff:
+                            buffer.popleft()
                 self.previous = row['counters']; self.previous_time = now; self.host_previous = host
         except (OSError, ValueError, KeyError, TypeError) as error:
             self.warning(error)
@@ -245,12 +264,138 @@ class AriaMetrics:
             self.offset, self.inode = 0, None
         self.buffer = b''
         self.files = {}
+        self.resources = {}
+        self.file_names = {}
+        self.connections = {}
+        self.request_cuid = self.response_cuid = self.error_cuid = None
+        self.log_error = True
         self.lock = RLock()
 
-    def begin(self, files):
+    def begin(self, files, urls=None):
         with self.lock:
             self.sample()
+            self.finish_connections('new_batch')
             self.files = {path:dict(size=size, seen=received, complete=False) for path,(size,received) in files.items()}
+            self.resources = {}
+            for path,url in (urls or {}).items():
+                resource = network.aria_resource(url)
+                self.resources[resource] = None if resource in self.resources else path
+            self.file_names = {}
+            for path in self.files:
+                self.file_names.setdefault(Path(path).name, []).append(path)
+
+    @staticmethod
+    def elapsed(end, start):
+        return end-start if end is not None and start is not None and end >= start else None
+
+    def bind_path(self, context, uri):
+        try:
+            resource = network.aria_resource(uri)
+        except ValueError:
+            return
+        if resource in self.resources:
+            path = self.resources[resource]
+        else:
+            candidates = self.file_names.get(resource[0], [])
+            path = candidates[0] if len(candidates) == 1 else None
+        if path is not None:
+            context['path'] = path
+
+    def finish_connection(self, cuid, ended, outcome):
+        context = self.connections.pop(cuid, None)
+        if context is None:
+            return
+        if self.error_cuid == cuid:
+            self.error_cuid = None
+        if 'started' not in context and 'requested' not in context and outcome != 'aborted':
+            return
+        start, requested, response = (context.get(k) for k in ('started','requested','response'))
+        status = context.get('http_status')
+        body = response is not None and status is not None and 200 <= status < 300
+        phase = ('body' if body else 'http_error' if response is not None and status is not None and status >= 400
+                 else 'response_headers' if requested is not None else 'connect' if start is not None else 'unknown')
+        codes = context.get('error_codes', [])
+        if outcome == 'aborted' and codes and codes[-1] == '2':
+            outcome = 'timeout'
+        self.metrics.aria_attempt(dict(cuid=cuid, path=context.get('path'),
+            started_at=start, ended_at=ended, outcome=outcome, phase=phase,
+            censored=outcome != 'file_complete', error_codes=codes, http_status=status,
+            elapsed_seconds=self.elapsed(ended,start), request_seconds=self.elapsed(ended,requested),
+            connect_ready_seconds=self.elapsed(requested,start),
+            response_headers_seconds=self.elapsed(response,requested),
+            body_phase_seconds=self.elapsed(ended,response) if body else None,
+            stage_seconds=self.elapsed(ended,response if body else requested if requested is not None else start),
+            segments_completed=context.get('segments_completed',0),
+            seconds_since_last_segment=self.elapsed(ended,context.get('last_segment'))))
+
+    def finish_connections(self, outcome):
+        for cuid, context in list(self.connections.items()):
+            self.finish_connection(cuid,context.get('last_time'),
+                                   'aborted' if cuid == self.error_cuid else outcome)
+        self.request_cuid = self.response_cuid = self.error_cuid = None
+
+    def timing_line(self, line):
+        prefix = re.match(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+) \[(\w+)\]',line)
+        if prefix:
+            self.log_error = prefix[2] == 'ERROR'
+            try:
+                stamp = datetime.fromisoformat(prefix[1]).timestamp()
+            except (ValueError, OverflowError):
+                return
+            if self.error_cuid is not None:
+                context = self.connections[self.error_cuid]
+                self.finish_connection(self.error_cuid,context['last_time'],'aborted')
+            self.request_cuid = self.response_cuid = None
+            match = re.search(r'CUID#(\d+)',line)
+            if not match:
+                if 'Download complete: ' in line:
+                    path = line.partition('Download complete: ')[2].strip()
+                    for cuid, context in list(self.connections.items()):
+                        if context.get('path') == path:
+                            self.finish_connection(cuid,stamp,'file_complete')
+                return
+            cuid = match[1]
+            relevant = any(word in line for word in ('Connecting to ', 'Requesting:', 'Response received:',
+                            'Redirecting to ', 'Download aborted. URI=', 'segment completed successfully.'))
+            if not relevant:
+                return
+            if cuid not in self.connections and len(self.connections) >= 1024:
+                oldest = next(iter(self.connections))
+                self.finish_connection(oldest,self.connections[oldest].get('last_time'),'tracking_limit')
+            context = self.connections.setdefault(cuid,{})
+            context['last_time'] = stamp
+            if 'Connecting to ' in line or 'Requesting:' in line and 'requested' in context:
+                path = context.get('path')
+                self.finish_connection(cuid,stamp,'next_request')
+                context = self.connections[cuid] = dict(path=path,last_time=stamp)
+            if 'Connecting to ' in line:
+                context['started'] = stamp
+            elif 'Requesting:' in line:
+                context['requested'] = stamp
+                self.request_cuid = cuid
+            elif 'Response received:' in line:
+                context['response'] = stamp
+                self.response_cuid = cuid
+            elif 'Redirecting to ' in line:
+                path = context.get('path')
+                self.finish_connection(cuid,stamp,'redirect')
+                self.connections[cuid] = dict(path=path,last_time=stamp)
+            elif 'Download aborted. URI=' in line:
+                self.bind_path(context,line.partition('URI=')[2].strip())
+                self.error_cuid = cuid
+            elif 'segment completed successfully.' in line:
+                context['segments_completed'] = context.get('segments_completed',0) + 1
+                context['last_segment'] = stamp
+        elif self.request_cuid is not None:
+            request = re.match(r'(?:GET|HEAD) (\S+) HTTP/',line)
+            if request:
+                self.bind_path(self.connections[self.request_cuid],request[1])
+        elif self.response_cuid is not None:
+            status = re.match(r'HTTP/[\d.]+ (\d{3})',line)
+            if status:
+                self.connections[self.response_cuid]['http_status'] = int(status[1])
+        elif self.error_cuid is not None and line.lstrip().startswith(('Exception:','->')):
+            self.connections[self.error_cuid].setdefault('error_codes', []).extend(re.findall(r'errorCode=(\d+)',line))
 
     def received(self, entry, amount):
         if entry['seen'] is None:
@@ -264,29 +409,34 @@ class AriaMetrics:
     def sample(self):
         with self.lock:
             self._sample()
+            if self.metrics.closed:
+                self.finish_connections('unfinished_at_shutdown')
 
     def _sample(self):
         from progress import received_bytes
         try:
             stat = self.path.stat()
             if stat.st_ino != self.inode or stat.st_size < self.offset:
+                self.finish_connections('log_reset')
                 self.offset = 0; self.buffer = b''
+                self.log_error = True
             self.inode = stat.st_ino
             with self.path.open('rb') as stream:
                 stream.seek(self.offset); data=stream.read(); self.offset=stream.tell()
             lines = (self.buffer+data).split(b'\n'); self.buffer=lines.pop()
             for raw in lines:
                 line = raw.decode('utf-8',errors='replace')
+                self.timing_line(line)
                 if 'Download complete: ' in line:
                     path = line.partition('Download complete: ')[2].strip()
                     entry = self.files.get(path)
                     if entry and not entry['complete']:
                         self.received(entry,entry['size']); entry['complete']=True
                         self.metrics.add(aria_completed_files=1,aria_completed_bytes=entry['size'])
-                if 'Download aborted.' in line:
+                if 'Download aborted. URI=' in line:
                     self.metrics.add(aria_aborted_files=1)
                 codes = re.findall(r'errorCode=(\d+)',line)
-                if codes:
+                if codes and self.log_error:
                     with self.metrics.lock:
                         self.metrics.errors.setdefault('aria_error_messages',Counter()).update(codes)
             self.metrics.gauge('aria_log_backlog_bytes',max(0,stat.st_size-self.offset))

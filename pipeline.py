@@ -5,6 +5,7 @@ import fcntl
 import errno
 import hashlib
 import json
+import re
 from local_paths import local_path
 from metrics import Metrics, AriaMetrics
 from pathlib import Path
@@ -13,10 +14,10 @@ import signal
 import subprocess
 from threading import Event
 import time
-import urllib.parse
 
 import download as d
 import network
+from network import aria_resource
 import storage
 import recovery as r
 from settings import resolve
@@ -24,13 +25,6 @@ from settings import resolve
 
 def now():
     return datetime.now().astimezone().isoformat()
-
-
-def aria_resource(url):
-    parsed = urllib.parse.urlsplit(url)
-    query = urllib.parse.parse_qs(parsed.query)
-    name = query.get('filename', [urllib.parse.unquote(parsed.path)])[0]
-    return name, query.get('hid', [''])[0], query.get('fsize', [''])[0]
 
 
 def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
@@ -57,6 +51,7 @@ def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
         target = str(log)
         message = []
         error_target, error_position = target, 0
+        final_error = True
         def finish_error():
             if message:
                 failures[error_target] = error_position, network.failure(''.join(message))
@@ -64,7 +59,10 @@ def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
         with log.open() as stream:
             stream.seek(offset)
             for position, line in enumerate(stream):
-                if line.startswith('Exception:'):
+                level = re.match(r'^\d{4}-\d{2}-\d{2} \S+ \[(\w+)\]',line)
+                if level:
+                    final_error = level[1] == 'ERROR'
+                if line.startswith('Exception:') and final_error:
                     finish_error()
                     error_target, error_position = target, position
                     message.append(line)
@@ -418,7 +416,8 @@ class Background:
                 item['file'] = current['file']
         progress = {item['path']: r.progress(d.target(self.root,item,course),item['size'],sha256=item['sha256']).get('downloaded_bytes') for item in pending}
         needed = sum(max(0,item['size']-(progress[item['path']] or 0)) for item in pending)
-        self.aria_metrics.begin({str(d.target(self.root,item,course)):(item['size'],progress[item['path']]) for item in pending})
+        self.aria_metrics.begin({str(d.target(self.root,item,course)):(item['size'],progress[item['path']]) for item in pending},
+                                {str(d.target(self.root,item,course)):item['file'] for item in pending})
         if shutil.disk_usage(self.root).free < needed + self.tuning['free_space_mib'] * 1024 ** 2:
             raise OSError(errno.ENOSPC, 'Insufficient free space for the course')
         lines = []
@@ -439,7 +438,7 @@ class Background:
                    f"--max-overall-download-limit={t['bandwidth_limit']}", f"--auto-save-interval={t['auto_save_interval']}",
                    '--max-tries=1', f"--connect-timeout={t['connect_timeout']}", f"--timeout={t['timeout']}",
                    f"--summary-interval={t['summary_interval']}", '--enable-color=false', '--console-log-level=warn',
-                   '--log=' + str(self.state / 'aria2.log'), '--log-level=notice']
+                   '--log=' + str(self.state / 'aria2.log'), '--log-level=info']
         self.download_active.set()
         self.transferring = course
         try:

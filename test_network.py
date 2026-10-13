@@ -159,6 +159,27 @@ class NetworkChecks(unittest.TestCase):
                 network.connect(('example.invalid', 443), timeout=1)
         self.assertEqual(network.failure(caught.exception)['category'], 'routing')
 
+    def test_info_exception_for_another_file_does_not_hide_route_failure(self):
+        import pipeline
+        with tempfile.TemporaryDirectory() as directory:
+            log=Path(directory)/'aria2.log';attempts=[]
+            def run(*args,**kwargs):
+                attempts.append(1)
+                if len(attempts)==4:return 0
+                with log.open('a') as stream:
+                    stream.write('''2026-10-13 12:00:00.000000 [ERROR] CUID#7 - Download aborted. URI=https://example.invalid/?filename=a
+Exception: errorCode=1 Failed to establish connection, cause: No route to host
+2026-10-13 12:00:00.100000 [INFO] CUID#8 - Restarting the download. URI=https://example.invalid/?filename=b
+Exception: errorCode=2 Timeout.
+2026-10-13 12:00:00.200000 [ERROR] CUID#8 - Download aborted. URI=https://example.invalid/?filename=b
+Exception: errorCode=22 HTTP Error 500
+''')
+                return 1
+            with patch.object(pipeline,'_transfer_process_once',side_effect=run):
+                result=pipeline.transfer_process(['aria2c','--log='+str(log)],env={},on_tick=lambda:None,stopping=self.stop)
+            self.assertEqual(result,0)
+            self.assertEqual(len(attempts),4)
+
     def test_https_connection_keeps_standard_tls_context(self):
         import ssl
         context = ssl.create_default_context()
