@@ -172,15 +172,24 @@ class Index:
                 and normalized(re.sub(r'^\d{3,} - ','',PurePosixPath(row['path']).name))==PurePosixPath(relative).name]
 
 
+def saved_remote_files(state, link, source=None, saved=None):
+    if not link:
+        return {}
+    if saved is None:
+        path = state/'nextcloud-existing.json'
+        if not path.exists():
+            return {}
+        saved = json.loads(path.read_text())
+    if source is None:
+        source = json.loads((state/'source.json').read_text())['source']
+    if saved.get('source')!=source or saved.get('share')!=Share(link).url():
+        return {}
+    return saved.get('files', {})
+
+
 def remote_saved(state, item, link):
-    path = state/'nextcloud-existing.json'
-    if not link or not path.exists():
-        return False
-    saved = json.loads(path.read_text())
-    row = saved.get('files',{}).get(item['path'],{})
-    source=json.loads((state/'source.json').read_text())['source']
-    return (saved.get('source')==source and saved.get('share')==Share(link).url()
-            and (row.get('size'),row.get('sha256'))==(item['size'],item['sha256']))
+    row = saved_remote_files(state, link).get(item['path'], {})
+    return (row.get('size'), row.get('sha256')) == (item['size'], item['sha256'])
 
 
 class Body:

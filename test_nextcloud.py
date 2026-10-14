@@ -352,6 +352,46 @@ class NextcloudChecks(unittest.TestCase):
                 patch.object(nextcloud.Share,'listing',return_value=[]),patch('pipeline.transfer_process',failed_transfer):
             download.download(self.data,['Course'],self.root,retries=0,defer_range=True,nextcloud_existing=self.read)
 
+    def test_remote_snapshot_can_be_validated_without_rereading_state(self):
+        remote = nextcloud.Share(self.read).url()
+        saved = dict(source=self.data['source'], share=remote,
+                     files={self.item['path']: dict(size=self.item['size'], sha256=self.item['sha256'])})
+        with patch.object(Path, 'read_text', side_effect=AssertionError('Unexpected disk reread')):
+            self.assertEqual(nextcloud.saved_remote_files(self.state, self.read,
+                              source=self.data['source'], saved=saved), saved['files'])
+            self.assertEqual(nextcloud.saved_remote_files(self.state, self.read,
+                              source='different', saved=saved), {})
+            self.assertEqual(nextcloud.saved_remote_files(self.state, self.upload,
+                              source=self.data['source'], saved=saved), {})
+
+    def test_range_summary_reads_remote_index_once_for_many_files(self):
+        import range_queue
+        self.local.unlink()
+        entries = [dict(self.item, path=f'/Course/lesson-{i}.mp4') for i in range(12)]
+        download.write_json(self.state/'courses.json', ['Course'])
+        download.write_json(self.state/'course-history.json', {'Course': dict(state='recovering')})
+        download.write_json(self.state/'settings.json', dict(nextcloud_existing=self.read))
+        download.write_json(self.state/'01-manifest.json',
+                            [{k: item[k] for k in ('path', 'size', 'sha256')} for item in entries])
+        download.write_json(self.state/'nextcloud-existing.json', dict(
+            source=self.data['source'], share=nextcloud.Share(self.read).url(),
+            files={item['path']: dict(size=item['size'], sha256=item['sha256']) for item in entries}))
+        (self.state/'tasks').mkdir()
+        bg = SimpleNamespace(root=self.root, state=self.state, source=self.data['source'],
+                             directory=self.state/'tasks')
+        originals = Path.read_text
+        reads = []
+        def track(path, *args, **kwargs):
+            if path.name in ('nextcloud-existing.json', 'source.json'):
+                reads.append(path.name)
+            return originals(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', track):
+            range_queue.finish_courses(bg, {})
+        self.assertLessEqual(reads.count('nextcloud-existing.json'), 1)
+        self.assertLessEqual(reads.count('source.json'), 1)
+        row = json.loads((self.state/'course-history.json').read_text())['Course']
+        self.assertEqual((row['verified'], row['remote_available'], row['failed']), (0, 12, 0))
+
     def test_range_summary_counts_remote_even_if_old_local_proof_is_stale(self):
         import range_queue
         self.local.unlink()
