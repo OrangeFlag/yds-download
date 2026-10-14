@@ -76,6 +76,47 @@ class SharedRangeChecks(unittest.TestCase):
             d.write_json(path, changed)
             self.assertEqual(next(job for name, job in cache.tasks(directory) if name == path)['state'], 'done')
 
+    def test_event_index_streams_latest_proofs_without_holding_range_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'events.jsonl'
+            row = dict(path='/Course/video.mp4', status='invalid', source='test',
+                       size=4, sha256='a'*64, range_attempts=['x'*4096]*50)
+            d.append_events(path, [row])
+            index = q.EventIndex(path)
+            with patch.object(d, 'read_events', side_effect=AssertionError('Bulk JSONL read')), \
+                    patch.object(Path, 'read_bytes', side_effect=AssertionError('Whole journal loaded')):
+                self.assertEqual(index.refresh()['/Course/video.mp4']['status'], 'invalid')
+            self.assertNotIn('range_attempts', str(index.events))
+            before = index.offset
+            d.append_events(path, [dict(row, status='valid', mtime_ns=10)])
+            self.assertEqual(index.refresh()['/Course/video.mp4']['status'], 'valid')
+            self.assertGreater(index.offset, before)
+            self.assertEqual(index.refresh()['/Course/video.mp4']['mtime_ns'], 10)
+
+    def test_finishing_course_uses_worker_event_index_not_full_jsonl_history(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            state = root / '.download'
+            (state / 'tasks').mkdir(parents=True)
+            local = root / 'video.mp4'
+            local.write_bytes(b'data')
+            item = dict(path='/Course/video.mp4', size=4, sha256=hashlib.sha256(b'data').hexdigest())
+            row = dict(item, source='test', status='valid', local=str(local),
+                       mtime_ns=local.stat().st_mtime_ns)
+            d.append_events(state / 'events.jsonl', [row])
+            d.write_json(state / 'courses.json', ['Course'])
+            d.write_json(state / 'course-history.json', {'Course': dict(state='recovering')})
+            d.write_json(state / '01-manifest.json', [item])
+            d.write_json(state / 'settings.json', {})
+            bg = SimpleNamespace(root=root, state=state, source='test',
+                                 directory=state/'tasks', event_index=q.EventIndex(state/'events.jsonl'),
+                                 task_cache=q.JsonCache())
+            with patch.object(d, 'read_events', side_effect=AssertionError('Whole history reread')):
+                q.finish_courses(bg, {})
+            status = json.loads((state / 'course-history.json').read_text())['Course']
+            self.assertEqual((status['verified'], status['failed']), (1, 0))
+
     def test_semester_queue_advances_without_waiting_for_range(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
