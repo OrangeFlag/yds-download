@@ -41,6 +41,12 @@ class SharedRangeChecks(unittest.TestCase):
                        'superseded_by_local_copy'):
             with self.subTest(reason=reason):
                 self.assertFalse(q.recheck_due(dict(task, **{reason: True}), 86400))
+                with tempfile.TemporaryDirectory() as folder:
+                    directory = Path(folder)
+                    d.write_json(directory/'task.json', dict(task, course='Course', source='test', attempt=3,
+                        item=dict(path='/Course/video.mp4', size=7, sha256='a'*64), **{reason: True}))
+                    _, cached = q.JsonCache().tasks(directory)[0]
+                    self.assertFalse(q.recheck_due(cached, 86400))
 
     def test_recheck_timestamp_survives_compact_cache_restart(self):
         from datetime import datetime, timezone

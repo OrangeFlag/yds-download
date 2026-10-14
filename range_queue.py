@@ -88,6 +88,8 @@ class JsonCache:
                                    source=job['source'], attempt=job['attempt'],
                                    item={key: item[key] for key in ('path', 'size', 'sha256', 'file') if key in item},
                                    superseded_by_manifest=job.get('superseded_by_manifest', False),
+                                   superseded_by_nextcloud=job.get('superseded_by_nextcloud', False),
+                                   superseded_by_local_copy=job.get('superseded_by_local_copy', False),
                                    yandex_recheck=job.get('yandex_recheck',False),
                                    yandex_checked_at=job.get('yandex_checked_at'),
                                    result={'event': {'range_recovered_complete':
