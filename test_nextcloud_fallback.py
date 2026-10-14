@@ -23,6 +23,28 @@ class Response(io.BytesIO):
 
 
 class FallbackChecks(unittest.TestCase):
+    def test_fallback_urlerror_logs_reason_and_clears_it_after_success(self):
+        import socket
+        import time
+        error = urllib.error.URLError(socket.gaierror(socket.EAI_AGAIN, 'DNS temporarily unavailable'))
+        output = io.StringIO()
+        fallback = Fallback(self.root, self.link, Event())
+        with patch.object(nextcloud.Share, 'listing', side_effect=error), patch('sys.stdout', output):
+            self.assertIsNone(fallback.recover(self.item, self.event))
+        row = fallback.read(self.item)
+        self.assertEqual(row['state'], 'pending')
+        self.assertGreater(row['retry_after'], time.time())
+        self.assertEqual(row['error_reason'], str(error.reason))
+        self.assertEqual(row['error_errno'], socket.EAI_AGAIN)
+        self.assertIn('DNS temporarily unavailable', output.getvalue())
+        self.assertIn(f'errno={socket.EAI_AGAIN}', output.getvalue())
+        with patch.object(nextcloud.Share, 'listing', return_value=[self.row]), \
+                patch.object(nextcloud.Share, 'request', return_value=Response(self.content)):
+            self.assertEqual(fallback.recover(self.item, self.event)['status'], 'valid')
+        row = fallback.read(self.item)
+        self.assertIsNone(row['error_reason'])
+        self.assertIsNone(row['error_errno'])
+
     def setUp(self):
         temporary=tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup)
         self.root=Path(temporary.name);self.state=self.root/'.download';self.state.mkdir()

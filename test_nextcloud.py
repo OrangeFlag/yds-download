@@ -21,6 +21,24 @@ class Response(io.BytesIO):
 
 
 class NextcloudChecks(unittest.TestCase):
+    def test_upload_urlerror_logs_and_saves_underlying_reason(self):
+        import errno
+        error = urllib.error.URLError(ConnectionRefusedError(errno.ECONNREFUSED, 'proxy refused'))
+        output = io.StringIO()
+        with patch.object(nextcloud.Share, 'listing', return_value=[]), \
+                patch.object(nextcloud.Share, 'request', side_effect=error), \
+                patch('sys.stdout', output):
+            nextcloud.Sync(self.read, self.upload, Event()).run_once([self.root])
+        self.assertIn('reason=', output.getvalue())
+        self.assertIn('proxy refused', output.getvalue())
+        self.assertIn(f'errno={errno.ECONNREFUSED}', output.getvalue())
+        row = next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+        self.assertEqual(row['error_type'], 'URLError')
+        self.assertEqual(row['error_reason'], str(error.reason))
+        self.assertEqual(row['error_errno'], errno.ECONNREFUSED)
+        self.assertEqual(row['state'], 'creating_collection')
+        self.assertEqual(download.read_events(self.state/'nextcloud-uploads.jsonl')[-1]['error_errno'], errno.ECONNREFUSED)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

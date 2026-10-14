@@ -26,6 +26,11 @@ VIDEO = {'.mp4', '.mkv', '.mov', '.webm', '.avi', '.m4v', '.ts', '.3gp'}
 PROPERTIES = b'<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><d:resourcetype/><d:getcontentlength/><d:getetag/><oc:checksums/></d:prop></d:propfind>'
 
 
+def error_details(error):
+    return dict(error_type=type(error).__name__, http_status=getattr(error, 'code', None),
+                error_reason=str(getattr(error, 'reason', error)), error_errno=network.failure(error)['errno'])
+
+
 def normalized(value):
     return unicodedata.normalize('NFC', value).strip()
 
@@ -296,7 +301,8 @@ class Sync:
                     except (OSError,RuntimeError,ValueError) as error:
                         if storage.disk_error(error):
                             raise
-                        print(f'NEXTCLOUD ERROR: {item["path"]}; {type(error).__name__}; HTTP={getattr(error,"code",None)}',flush=True)
+                        details = error_details(error)
+                        print(f'NEXTCLOUD ERROR: {item["path"]}; {type(error).__name__}; HTTP={details["http_status"]}; reason={details["error_reason"]!r}; errno={details["error_errno"]}',flush=True)
 
     def upload(self, root, data, item, local, variant, target, size, percent):
         state=root/'.download/nextcloud-uploads.json'
@@ -389,7 +395,7 @@ class Sync:
             print('NEXTCLOUD UPLOADED: '+target,flush=True)
         except BaseException as error:
             row.update(state=row['state'] if row['state'] in ('creating_collection','assembling','unconfirmed') else 'pending',
-                       error_type=type(error).__name__,http_status=getattr(error,'code',None))
+                       **error_details(error))
             raise
         finally:
             row['time']=datetime.now().astimezone().isoformat()

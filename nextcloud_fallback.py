@@ -15,7 +15,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 import download as d
-from nextcloud import Index, VIDEO, remote_path
+from nextcloud import Index, VIDEO, remote_path, error_details
 import recovery as r
 import storage
 
@@ -156,7 +156,8 @@ class Fallback:
                 body=row.get('bodies',{}).get(key,{})
                 row.update({name:body.get(name) for name in ('etag','body_complete','received_bytes')})
                 row.update(remote_path=remote,remote_size=size)
-            row.update(state='downloading',retry_after=0,error_type=None,http_status=None)
+            row.update(state='downloading',retry_after=0,error_type=None,http_status=None,
+                       error_reason=None,error_errno=None)
             self.save(item,row)
             storage.check(self.root)
             offset=part.stat().st_size if part.exists() else 0
@@ -250,9 +251,10 @@ class Fallback:
             if 'candidate' in locals():
                 signature=[candidate.get('download_path',candidate['path']),candidate['size'],candidate.get('etag')]
                 if signature not in row.setdefault('failed_candidates',[]):row['failed_candidates'].append(signature)
-            row.update(state='pending',retry_after=time.time()+60,error_type=type(error).__name__,http_status=getattr(error,'code',None))
+            details = error_details(error)
+            row.update(state='pending',retry_after=time.time()+60,**details)
             self.save(item,row)
-            print(f'NEXTCLOUD DOWNLOAD RETRY: {item["path"]}; {type(error).__name__}; HTTP={getattr(error,"code",None)}',flush=True)
+            print(f'NEXTCLOUD DOWNLOAD RETRY: {item["path"]}; {type(error).__name__}; HTTP={details["http_status"]}; reason={details["error_reason"]!r}; errno={details["error_errno"]}',flush=True)
             return None
         finally:
             if acquired:TRANSFERS.release()
