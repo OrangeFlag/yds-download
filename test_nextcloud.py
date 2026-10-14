@@ -218,15 +218,13 @@ class NextcloudChecks(unittest.TestCase):
 
     def test_old_success_journal_does_not_cancel_retry_of_new_upload_session(self):
         from datetime import datetime, timedelta, timezone
-        uploads = []
+        sent = []
         def request(share, method, path='', data=None, headers=None, uploads=False):
             if method == 'PUT':
-                uploads_list = (path, data.read())
-                uploads_log.append(uploads_list)
-                if len(uploads_log) == 2:
+                sent.append((path, data.read()))
+                if len(sent) == 2:
                     raise TimeoutError('new upload session interrupted')
             return Response()
-        uploads_log = uploads
         ledger = self.state / 'nextcloud-uploads.json'
         with patch.object(nextcloud.Share, 'listing', return_value=[]), \
                 patch.object(nextcloud.Share, 'request', request):
@@ -239,8 +237,8 @@ class NextcloudChecks(unittest.TestCase):
             pending = next(iter(json.loads(ledger.read_text()).values()))
             self.assertEqual(pending['state'], 'pending')
             nextcloud.Sync(self.read, self.upload, Event()).run_once([self.root])
-        self.assertEqual(len(uploads), 3)
-        self.assertEqual(uploads[1][0], uploads[2][0])
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sent[1][0], sent[2][0])
         self.assertEqual(next(iter(json.loads(ledger.read_text()).values()))['state'], 'uploaded')
 
     def test_failed_or_ambiguous_upload_is_not_a_success_receipt(self):
