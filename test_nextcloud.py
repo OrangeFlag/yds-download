@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
+import ssl
 from threading import Event
 from types import SimpleNamespace
 import unittest
@@ -402,6 +403,11 @@ class NextcloudChecks(unittest.TestCase):
         fail=True
         def request(share,method,path='',data=None,headers=None,uploads=False):
             nonlocal created,fail
+            if method=='PROPFIND':
+                if not created:raise urllib.error.HTTPError('https://example.invalid',404,'expired',{},None)
+                response=Response(b'<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>')
+                response.status=207
+                return response
             if method=='MKCOL':
                 if created:raise urllib.error.HTTPError('https://example.invalid',405,'exists',{},None)
                 created=True
@@ -416,6 +422,67 @@ class NextcloudChecks(unittest.TestCase):
             nextcloud.Sync(self.read,self.upload,Event(),chunk_size=4).run_once([self.root])
         self.assertEqual([body for _,body in sent],[b'lect',b'ure',b'ure'])
         self.assertEqual(sent[1][0],sent[2][0])
+
+    def test_tls_failure_checking_upload_session_preserves_confirmed_chunks(self):
+        sent = []
+        created = False
+        checks = 0
+        def request(share, method, path='', data=None, headers=None, uploads=False):
+            nonlocal created, checks
+            if method in ('MKCOL', 'PROPFIND'):
+                if created:
+                    checks += 1
+                    if checks == 1:
+                        raise urllib.error.URLError(ssl.SSLEOFError(8, 'TLS EOF'))
+                    if method == 'MKCOL':
+                        raise urllib.error.HTTPError('https://example.invalid',405,'exists',{},None)
+                    response = Response(b'<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>')
+                    response.status = 207
+                    return response
+                created = True
+            if method == 'PUT':
+                sent.append((path, data.read()))
+                if len(sent) == 2:
+                    raise TimeoutError('Interrupt second chunk')
+            return Response()
+        with patch.object(nextcloud.Share, 'listing', return_value=[]), patch.object(nextcloud.Share, 'request', request):
+            for _ in range(3):
+                nextcloud.Sync(self.read, self.upload, Event(), chunk_size=4).run_once([self.root])
+                if len(sent) == 2:
+                    row = next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+                    self.assertEqual(row['next_chunk'],1)
+        self.assertEqual([body for _,body in sent], [b'lect',b'ure',b'ure'])
+        self.assertEqual(sent[1][0],sent[2][0])
+        self.assertEqual(row['sent_bytes'],4)
+        row = next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+        self.assertEqual(row['state'],'uploaded')
+
+    def test_expired_session_lost_creation_response_does_not_skip_missing_chunks(self):
+        sent=[]
+        created=False
+        expire=False
+        def request(share,method,path='',data=None,headers=None,uploads=False):
+            nonlocal created
+            if method=='PROPFIND':
+                raise urllib.error.HTTPError('https://example.invalid',404,'expired',{},None)
+            if method=='MKCOL':
+                if created:raise urllib.error.HTTPError('https://example.invalid',405,'exists',{},None)
+                created=True
+                if expire:raise urllib.error.URLError(ssl.SSLEOFError(8,'Creation response lost'))
+            if method=='PUT':
+                sent.append(data.read())
+                if len(sent)==2:raise TimeoutError('Second chunk interrupted')
+            return Response()
+        with patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
+            nextcloud.Sync(self.read,self.upload,Event(),chunk_size=4).run_once([self.root])
+            created=False;expire=True
+            nextcloud.Sync(self.read,self.upload,Event(),chunk_size=4).run_once([self.root])
+            row=next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+            self.assertEqual(row['next_chunk'],0)
+            nextcloud.Sync(self.read,self.upload,Event(),chunk_size=4).run_once([self.root])
+        self.assertEqual(sent,[b'lect',b'ure',b'lect',b'ure'])
+        row=next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+        self.assertEqual(row['state'],'uploaded')
 
     def test_lost_move_response_does_not_create_a_second_upload(self):
         sent=[]
@@ -442,6 +509,11 @@ class NextcloudChecks(unittest.TestCase):
         crash=False
         def request(share,method,path='',data=None,headers=None,uploads=False):
             nonlocal created
+            if method=='PROPFIND':
+                if not created:raise urllib.error.HTTPError('https://example.invalid',404,'expired',{},None)
+                response=Response(b'<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>')
+                response.status=207
+                return response
             if method=='MKCOL':
                 if created:raise urllib.error.HTTPError('https://example.invalid',405,'exists',{},None)
                 created=True

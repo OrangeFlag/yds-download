@@ -356,6 +356,7 @@ class Sync:
                  upload_id=old.get('upload_id') or uuid.uuid4().hex,
                  chunk_size=old.get('chunk_size',self.chunk_size),
                  next_chunk=0 if old.get('state')=='creating_collection' else old.get('next_chunk',0))
+        row['sent_bytes']=min(size,row['next_chunk']*row['chunk_size'])
         ledger[key]=row;d.write_json(state,ledger)
         d.append_events(state.with_suffix('.jsonl'),[dict(row)])
         headers={'Destination':self.share.url(target),'OC-Total-Length':str(size)}
@@ -364,19 +365,41 @@ class Sync:
             raise ValueError('Nextcloud upload needs larger chunks for this video')
         try:
             if row['next_chunk']<count:
-                row['state']='creating_collection'
-                d.write_json(state,ledger)
-                try:
-                    # Chunking v2 checks the cached parent before file-drop creates course folders.
-                    with self.share.request('MKCOL',row['upload_id'],
-                        headers={**headers,'Destination':self.share.url(row['upload_id']+'.upload')},uploads=True):
-                        row['next_chunk']=0
-                        row['sent_bytes']=0
-                except urllib.error.HTTPError as error:
-                    if error.code!=405:
-                        raise
-                row['state']='uploading'
-                d.write_json(state,ledger)
+                collection_exists=False
+                if row['next_chunk']:
+                    try:
+                        # Check existence without creating a new empty session after a lost response.
+                        with self.share.request('PROPFIND',row['upload_id'],data=PROPERTIES,
+                                headers={'Depth':'0','Content-Type':'application/xml'},uploads=True) as response:
+                            if response.status!=207:
+                                raise RuntimeError('Nextcloud did not confirm the upload session')
+                            try:
+                                tree=ET.fromstring(response.read())
+                            except ET.ParseError as error:
+                                raise RuntimeError('Invalid Nextcloud upload session response') from error
+                            collection_exists=any(' 200 ' in prop.findtext('{DAV:}status','')
+                                and prop.find('{DAV:}prop/{DAV:}resourcetype/{DAV:}collection') is not None
+                                for prop in tree.findall('.//{DAV:}propstat'))
+                            if not collection_exists:
+                                raise RuntimeError('Nextcloud did not confirm the upload collection')
+                    except urllib.error.HTTPError as error:
+                        if error.code!=404:
+                            raise
+                        row.update(next_chunk=0,sent_bytes=0)
+                if not collection_exists:
+                    row['state']='creating_collection'
+                    d.write_json(state,ledger)
+                    try:
+                        # Chunking v2 checks the cached parent before file-drop creates course folders.
+                        with self.share.request('MKCOL',row['upload_id'],
+                            headers={**headers,'Destination':self.share.url(row['upload_id']+'.upload')},uploads=True):
+                            row['next_chunk']=0
+                            row['sent_bytes']=0
+                    except urllib.error.HTTPError as error:
+                        if error.code!=405:
+                            raise
+                    row['state']='uploading'
+                    d.write_json(state,ledger)
             print('NEXTCLOUD UPLOAD START: '+target,flush=True)
             digest=hashlib.sha256()
             with local.open('rb') as stream:
