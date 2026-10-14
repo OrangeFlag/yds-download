@@ -254,7 +254,7 @@ class Sync:
             return default
         stat = path.stat();stamp=(stat.st_ino,stat.st_size,stat.st_mtime_ns)
         if path not in self.cache or self.cache[path][0]!=stamp:
-            value = json.loads(path.read_text())
+            value = d.read_events(path) if path.suffix=='.jsonl' else json.loads(path.read_text())
             self.cache[path] = stamp,value
         return self.cache[path][1]
 
