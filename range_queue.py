@@ -93,6 +93,60 @@ class JsonCache:
         return tasks
 
 
+
+class EventIndex:
+    """Hold current compact proofs, not the complete append-only JSONL history."""
+
+    FIELDS = ('path', 'source', 'status', 'local', 'size', 'sha256', 'mtime_ns')
+
+    def __init__(self, path):
+        self.path = path
+        self.events = {}
+        self.inode = None
+        self.offset = 0
+
+    def refresh(self):
+        # record() and append_events() share this lock with the tail reader.
+        with d.STATE_LOCK:
+            try:
+                stat = self.path.stat()
+            except FileNotFoundError:
+                self.events.clear()
+                self.inode = None
+                self.offset = 0
+                return self.events
+            if self.inode != stat.st_ino or stat.st_size < self.offset:
+                self.events.clear()
+                self.offset = 0
+            self.inode = stat.st_ino
+            if stat.st_size == self.offset:
+                return self.events
+            with self.path.open('rb') as stream:
+                stream.seek(self.offset)
+                while line := stream.readline():
+                    end = stream.tell()
+                    try:
+                        row = json.loads(line)
+                    except (ValueError, UnicodeDecodeError):
+                        if line.endswith(b'\\n') or end != stat.st_size:
+                            raise
+                        # A crash may leave a final, unterminated JSON object.
+                        with self.path.open('r+b') as output:
+                            output.truncate(self.offset)
+                            output.flush()
+                            os.fsync(output.fileno())
+                        return self.events
+                    self.events[row['path']] = {key: row[key] for key in self.FIELDS if key in row}
+                    self.offset = end
+                    if not line.endswith(b'\\n'):
+                        with self.path.open('ab') as output:
+                            output.write(b'\\n')
+                            output.flush()
+                            os.fsync(output.fileno())
+                        self.offset += 1
+        return self.events
+
+
 def retire_cached_copy(background, path, job, proofs):
     item = job['item']
     destination = d.target(background.root, item, job['course'])
@@ -138,11 +192,14 @@ def finish_courses(background, config, changed_courses=()):
     courses = json.loads((state / 'courses.json').read_text())
     history_path = state / 'course-history.json'
     history = json.loads(history_path.read_text())
-    events = {row['path']: row for row in d.read_events(state / 'events.jsonl')}
+    events = (background.event_index.refresh() if hasattr(background, 'event_index')
+              else {row['path']: row for row in d.read_events(state / 'events.jsonl')})
     registry = state / 'local-copies.json'
     external = {row['path']: row for row in (json.loads(registry.read_text()) if registry.exists() else [])
                 if row.get('source', '').rstrip('/') == background.source.rstrip('/') and row.get('status') == 'valid'}
-    jobs = [json.loads(path.read_text()) for path in background.directory.glob('*.json')]
+    jobs = ([job for _, job in background.task_cache.tasks(background.directory)]
+            if hasattr(background, 'task_cache')
+            else [json.loads(path.read_text()) for path in background.directory.glob('*.json')])
     for index, course in enumerate(courses, 1):
         pending = any(job['kind'] == 'range' and job['course'] == course and job['state'] != 'applied' for job in jobs)
         if history.get(course, {}).get('state') == 'finished' and not pending and course not in changed_courses:
@@ -262,11 +319,14 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 raise
                             roots[root] = background, lock, config
                             priorities[root] = priority
-                            background.cached_events = {row['path']: row for row in d.read_events(state / 'events.jsonl', repair=True)}
+                            background.event_index = EventIndex(state / 'events.jsonl')
+                            background.cached_events = background.event_index.refresh()
+                            background.task_cache = cache
                             background.manifest_items = {(course, item['path']): (item['size'], item['sha256'])
                                 for index, course in enumerate(cache.read(state / 'courses.json'), 1)
                                 for item in cache.read(state / f'{index:02d}-manifest.json')}
                         background = roots[root][0]
+                        background.cached_events = background.event_index.refresh()
                         retired = set()
                         external = cache.read(state / 'local-copies.json', [])
                         external_by_path = {}
