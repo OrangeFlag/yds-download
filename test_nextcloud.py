@@ -153,6 +153,22 @@ class NextcloudChecks(unittest.TestCase):
         with patch.object(nextcloud.Share, 'listing', return_value=[row]):
             self.assertFalse(nextcloud.Index(self.root, self.read).contains(self.data, self.item))
 
+    def test_old_upload_receipt_is_not_permanent_proof_of_remote_file(self):
+        from datetime import datetime, timedelta, timezone
+        receipt = dict(state='uploaded', variant='original',
+                       read_share=nextcloud.Share(self.read).url(),
+                       source=self.data['source'], http_status=201,
+                       sent_bytes=self.item['size'], payload_sha256=self.item['sha256'],
+                       path=self.item['path'], size=self.item['size'], sha256=self.item['sha256'],
+                       time=(datetime.now(timezone.utc)-timedelta(days=7)).isoformat())
+        download.write_json(self.state / 'nextcloud-uploads.json', {'old': receipt})
+        with patch.object(nextcloud.Share, 'listing', return_value=[]):
+            self.assertFalse(nextcloud.Index(self.root, self.read).contains(self.data, self.item))
+        receipt['time'] = datetime.now(timezone.utc).isoformat()
+        download.write_json(self.state / 'nextcloud-uploads.json', {'recent': receipt})
+        with patch.object(nextcloud.Share, 'listing', return_value=[]):
+            self.assertTrue(nextcloud.Index(self.root, self.read).contains(self.data, self.item))
+
     def test_failed_or_ambiguous_upload_is_not_a_success_receipt(self):
         def request(share, method, path='', data=None, headers=None,uploads=False):
             if method=='PUT':data.read()
