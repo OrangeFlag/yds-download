@@ -8,6 +8,7 @@ from threading import Event
 from types import SimpleNamespace
 import unittest
 import urllib.error
+import urllib.parse
 from unittest.mock import patch
 
 import download
@@ -78,9 +79,9 @@ class NextcloudChecks(unittest.TestCase):
 
     def test_successful_upload_is_not_repeated_before_public_listing_catches_up(self):
         sent = []
-        def request(share, method, path='', data=None, headers=None):
+        def request(share, method, path='', data=None, headers=None,uploads=False):
             if method == 'PUT':
-                sent.append((path, data.read(), headers))
+                sent.append((urllib.parse.unquote(headers['Destination'].split('/files/upload/',1)[1]), data.read(), headers))
             return Response()
         with patch.object(nextcloud.Share,'listing',return_value=[]), \
                 patch.object(nextcloud.Share,'request',request):
@@ -90,7 +91,7 @@ class NextcloudChecks(unittest.TestCase):
         self.assertEqual(len(sent),1)
         self.assertEqual(sent[0][0], '2023-fall/Course/001 - 2023-09-15 Лекция.mp4')
         self.assertEqual(sent[0][1],self.content)
-        self.assertEqual(sent[0][2]['If-None-Match'],'*')
+        self.assertEqual(sent[0][2]['OC-Total-Length'],'7')
         journal=download.read_events(self.state/'nextcloud-uploads.jsonl')
         self.assertEqual(len([row for row in journal if row['state']=='uploaded']),1)
         self.assertEqual(journal[-1]['sent_bytes'],7)
@@ -99,9 +100,9 @@ class NextcloudChecks(unittest.TestCase):
             self.assertTrue(nextcloud.Index(self.root,self.read).contains(self.data,self.item))
 
     def test_failed_or_ambiguous_upload_is_not_a_success_receipt(self):
-        def request(share, method, path='', data=None, headers=None):
-            if method=='PUT':
-                data.read()
+        def request(share, method, path='', data=None, headers=None,uploads=False):
+            if method=='PUT':data.read()
+            if method=='MOVE':
                 raise urllib.error.HTTPError('https://example.invalid/file',412,'exists',{},None)
             return Response()
         with patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
@@ -130,8 +131,8 @@ class NextcloudChecks(unittest.TestCase):
             recovered_path=str(partial.relative_to(self.root)),local_size=7,mtime_ns=partial.stat().st_mtime_ns,
             downloaded_bytes=5,downloaded_percent=71.428571)])
         sent=[]
-        def request(share,method,path='',data=None,headers=None):
-            if method=='PUT':sent.append((path,data.read()))
+        def request(share,method,path='',data=None,headers=None,uploads=False):
+            if method=='PUT':sent.append((urllib.parse.unquote(headers['Destination'].split('/files/upload/',1)[1]),data.read()))
             return Response()
         with patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
             nextcloud.Sync(self.read,self.upload,Event()).run_once([self.root])
@@ -144,6 +145,44 @@ class NextcloudChecks(unittest.TestCase):
         self.assertEqual(share.url('Course/video.mp4'),'https://example.invalid/public.php/dav/files/token/sub/Course/video.mp4')
         for path in ('../other','Course/../video.mp4','file\n.mp4'):
             with self.assertRaises(ValueError):share.url(path)
+
+    def test_file_request_nickname_is_sent_with_write_requests(self):
+        sync=nextcloud.Sync(self.read,self.upload,Event(),nickname='Walterit')
+        requests=[]
+        def open_request(request,**kwargs):
+            requests.append(request)
+            return Response()
+        with patch.object(sync.share.opener,'open',open_request):
+            with sync.share.request('MKCOL','2024-spring'):pass
+        self.assertEqual(requests[0].get_header('X-nc-nickname'),'Walterit')
+
+    def test_unicode_move_destination_uses_utf8_header_bytes(self):
+        share=nextcloud.Share(self.upload)
+        requests=[]
+        def open_request(request,**kwargs):
+            requests.append(request)
+            return Response()
+        target='2023-fall/Курс/001 - Лекция (partially available 71.43%).mp4'
+        with patch.object(share.opener,'open',open_request):
+            with share.request('MOVE','upload/.file',headers={'Destination':share.url(target)},uploads=True):pass
+        wire=requests[0].get_header('Destination').encode('latin1')
+        self.assertEqual(wire.decode('utf8'),urllib.parse.unquote(share.url(target)))
+
+    def test_session_stages_in_share_root_then_moves_to_course_folder(self):
+        destinations={}
+        def request(share,method,path='',data=None,headers=None,uploads=False):
+            destinations[method]=headers['Destination']
+            if method=='PUT':data.read()
+            if method=='MOVE':self.assertNotIn('Content-Length',headers)
+            response=Response()
+            if method=='PUT':response.status=200
+            return response
+        with patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
+            nextcloud.Sync(self.read,self.upload,Event()).run_once([self.root])
+        base=nextcloud.Share(self.upload).url()
+        self.assertNotIn('/',destinations['MKCOL'][len(base):])
+        self.assertEqual(destinations['PUT'],destinations['MOVE'])
+        self.assertIn('/2023-fall/Course/',destinations['MOVE'])
 
     def test_old_year_archive_uses_nested_semester_without_duplicate_folder(self):
         item=dict(self.item,path='/Весна 2021/Course/video.mp4')
@@ -169,7 +208,7 @@ class NextcloudChecks(unittest.TestCase):
 
     def test_http_503_after_sending_body_is_retried_on_next_cycle(self):
         sent=[]
-        def request(share,method,path='',data=None,headers=None):
+        def request(share,method,path='',data=None,headers=None,uploads=False):
             if method=='PUT':
                 sent.append(data.read())
                 if len(sent)==1:raise urllib.error.HTTPError('https://example.invalid/file',503,'unavailable',{},None)
@@ -179,10 +218,78 @@ class NextcloudChecks(unittest.TestCase):
             sync.run_once([self.root]);sync.run_once([self.root])
         self.assertEqual(sent,[self.content,self.content])
 
+    def test_confirmed_chunks_are_not_sent_again_after_restart(self):
+        sent=[]
+        created=False
+        fail=True
+        def request(share,method,path='',data=None,headers=None,uploads=False):
+            nonlocal created,fail
+            if method=='MKCOL':
+                if created:raise urllib.error.HTTPError('https://example.invalid',405,'exists',{},None)
+                created=True
+            if method=='PUT':
+                sent.append((path,data.read()))
+                if path.endswith('/00002') and fail:
+                    fail=False
+                    raise TimeoutError()
+            return Response()
+        with patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
+            nextcloud.Sync(self.read,self.upload,Event(),chunk_size=4).run_once([self.root])
+            nextcloud.Sync(self.read,self.upload,Event(),chunk_size=4).run_once([self.root])
+        self.assertEqual([body for _,body in sent],[b'lect',b'ure',b'ure'])
+        self.assertEqual(sent[1][0],sent[2][0])
+
+    def test_lost_move_response_does_not_create_a_second_upload(self):
+        sent=[]
+        moves=[]
+        def request(share,method,path='',data=None,headers=None,uploads=False):
+            if method=='PUT':sent.append(data.read())
+            if method=='MOVE':
+                moves.append(path)
+                if len(moves)==1:raise TimeoutError()
+                raise urllib.error.HTTPError('https://example.invalid',404,'upload already moved',{},None)
+            return Response()
+        with patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
+            nextcloud.Sync(self.read,self.upload,Event()).run_once([self.root])
+            nextcloud.Sync(self.read,self.upload,Event()).run_once([self.root])
+        self.assertEqual(sent,[self.content])
+        self.assertEqual(moves[0],moves[1])
+        row=next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+        self.assertEqual(row['state'],'unconfirmed')
+
+    def test_expired_collection_reset_survives_disk_failure(self):
+        import errno
+        sent=[]
+        created=False
+        crash=False
+        def request(share,method,path='',data=None,headers=None,uploads=False):
+            nonlocal created
+            if method=='MKCOL':
+                if created:raise urllib.error.HTTPError('https://example.invalid',405,'exists',{},None)
+                created=True
+            if method=='PUT':
+                sent.append(data.read())
+                if len(sent)==2:raise TimeoutError()
+            return Response()
+        original=download.write_json
+        def write_json(path,value):
+            if crash and path.name=='nextcloud-uploads.json' and any(
+                    r.get('state')=='uploading' and r.get('next_chunk')==0 for r in value.values()):
+                raise OSError(errno.EIO,'disk disconnected after MKCOL')
+            return original(path,value)
+        with patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
+            nextcloud.Sync(self.read,self.upload,Event(),chunk_size=4).run_once([self.root])
+            created=False;crash=True
+            with patch.object(download,'write_json',write_json),self.assertRaises(OSError):
+                nextcloud.Sync(self.read,self.upload,Event(),chunk_size=4).run_once([self.root])
+            crash=False
+            nextcloud.Sync(self.read,self.upload,Event(),chunk_size=4).run_once([self.root])
+        self.assertEqual(sent,[b'lect',b'ure',b'lect',b'ure'])
+
     def test_durable_success_journal_prevents_reupload_after_ledger_write_failure(self):
         import errno
         sent=[]
-        def request(share,method,path='',data=None,headers=None):
+        def request(share,method,path='',data=None,headers=None,uploads=False):
             if method=='PUT':sent.append(data.read())
             return Response()
         original=download.write_json
