@@ -128,7 +128,7 @@ class EventIndex:
                     try:
                         row = json.loads(line)
                     except (ValueError, UnicodeDecodeError):
-                        if line.endswith(b'\\n') or end != stat.st_size:
+                        if line.endswith(b'\n') or end != stat.st_size:
                             raise
                         # A crash may leave a final, unterminated JSON object.
                         with self.path.open('r+b') as output:
@@ -138,9 +138,9 @@ class EventIndex:
                         return self.events
                     self.events[row['path']] = {key: row[key] for key in self.FIELDS if key in row}
                     self.offset = end
-                    if not line.endswith(b'\\n'):
+                    if not line.endswith(b'\n'):
                         with self.path.open('ab') as output:
-                            output.write(b'\\n')
+                            output.write(b'\n')
                             output.flush()
                             os.fsync(output.fileno())
                         self.offset += 1
