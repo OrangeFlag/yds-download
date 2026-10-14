@@ -149,6 +149,11 @@ class NextcloudChecks(unittest.TestCase):
         item=dict(self.item,path='/Весна 2021/Course/video.mp4')
         for title in ('ШАД 2021','ШАД весна 2021'):
             self.assertEqual(nextcloud.remote_path(dict(title=title),item),'2021-spring/Course/video.mp4')
+        for title,prefix,expected in (
+                ('ШАД 2021','Шад осень 2021','2021-fall/Course/video.mp4'),
+                ('ШАД 2016',' Shad_autumn_2016','2016-fall/Course/video.mp4'),
+                ('ШАД 2015','Shad_spring_2015','2015-spring/Course/video.mp4')):
+            self.assertEqual(nextcloud.remote_path(dict(title=title),dict(self.item,path='/'+prefix+'/Course/video.mp4')),expected)
 
     def test_unavailable_catalog_neither_stops_download_nor_allows_blind_upload(self):
         self.local.unlink();(self.state/'events.jsonl').unlink()

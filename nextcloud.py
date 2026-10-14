@@ -33,20 +33,22 @@ def remote_path(data, item):
     path = PurePosixPath(item['path'])
     if not path.is_absolute() or '..' in path.parts:
         raise ValueError('Unsafe source path for Nextcloud')
-    year = re.search(r'\b(20\d\d)\b', data['title'])
-    title = data['title'].casefold()
+    year_match = re.search(r'(?<!\d)(20\d\d)(?!\d)', data['title'])
+    year = year_match[1] if year_match else None
+    title = data['title'].casefold().replace('_',' ')
     parts = list(path.parts[1:])
-    season = 'spring' if 'весна' in title else 'fall' if 'осень' in title else None
-    nested = re.fullmatch(r'(весна|осень)(?:\s+(20\d\d))?',parts[0],re.I) if parts else None
+    season = 'spring' if 'весна' in title or re.search(r'\bspring\b',title) else 'fall' if 'осень' in title or re.search(r'\b(?:autumn|fall)\b',title) else None
+    nested = re.fullmatch(r'(?:(?:шад|shad)[ _-]*)?(весна|осень|spring|autumn|fall)(?:[ _-]*(20\d\d))?',parts[0].strip(),re.I) if parts else None
     if nested:
-        nested_season = 'spring' if nested[1].casefold()=='весна' else 'fall'
-        if season and season!=nested_season or year and nested[2] and year[1]!=nested[2]:
+        nested_season = 'spring' if nested[1].casefold() in ('весна','spring') else 'fall'
+        if season and season!=nested_season or year and nested[2] and year!=nested[2]:
             raise ValueError('Conflicting Nextcloud year/semester metadata')
         season = nested_season
+        year = year or nested[2]
         parts.pop(0)
     if not year or not season or len(parts) < 2:
         raise ValueError('Nextcloud requires a course archive with a known year and semester')
-    return year[1]+'-'+season+'/'+normalized('/'.join(parts))
+    return year+'-'+season+'/'+normalized('/'.join(parts))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -106,14 +108,20 @@ class Share:
 class Index:
     def __init__(self, root, link, strict=True):
         self.root, self.link = Path(root), Share(link).url()
-        self.share = Share(link)
+        self.share = Share(link,timeout=30)
         self.strict = strict
         self.folders = {}
 
     def contains(self, data, item):
         if PurePosixPath(item['path']).suffix.casefold() not in VIDEO:
             return False
-        relative = remote_path(data,item)
+        try:
+            relative = remote_path(data,item)
+        except ValueError:
+            if self.strict:
+                raise
+            print('NEXTCLOUD PATH UNMAPPED: '+item['path']+'; downloading from source',flush=True)
+            return False
         receipts = self.root/'.download/nextcloud-uploads.json'
         if receipts.exists():
             for row in json.loads(receipts.read_text()).values():
@@ -258,7 +266,7 @@ class Sync:
                         name=local_path(Path('/'),f'/{ordinal:03} - {stem}{relative.suffix}').name
                         target=str(relative.with_name(name))
                         self.upload(root,data,item,local,variant,target,expected_size,percent)
-                    except (OSError,RuntimeError) as error:
+                    except (OSError,RuntimeError,ValueError) as error:
                         if storage.disk_error(error):
                             raise
                         print(f'NEXTCLOUD ERROR: {item["path"]}; {type(error).__name__}; HTTP={getattr(error,"code",None)}',flush=True)
