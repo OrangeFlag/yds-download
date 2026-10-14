@@ -106,6 +106,14 @@ class PipelineChecks(unittest.TestCase):
                 patch('pipeline.transfer_process', side_effect=self.transfer):
             return download.download(self.data, ['First', 'Second'], self.root, retries=0, **kwargs)
 
+    def test_downloader_streams_event_history_without_bulk_jsonl_read(self):
+        with patch.object(download, 'read_events',
+                          side_effect=AssertionError('Whole event journal materialized')):
+            self.assertEqual(self.run_download(), 0)
+        events = list(download.iter_events(self.root / '.download/events.jsonl'))
+        self.assertTrue(events)
+        self.assertTrue(all(event['status'] == 'valid' for event in events))
+
     def test_foreground_shared_budget_uses_configured_rps(self):
         from request_budget import ProcessRangeBudget
         budget = self.root / 'http-budget'
