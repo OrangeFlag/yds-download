@@ -32,6 +32,16 @@ class StorageChecks(unittest.TestCase):
             with self.assertRaises(storage.StorageUnavailable):
                 download.inspect(self.root, item, 'Course')
 
+    def test_manual_recovery_refuses_a_missing_mount(self):
+        (self.root / '.download').mkdir()
+        download.write_json(self.root / '.download/source.json', {'source': 'test'})
+        with patch.dict(os.environ, dict(self.env, YDS_DISK_DEVICE='-1')), \
+                patch('sys.argv', ['download.py', 'recover', '--destination', str(self.root)]), \
+                patch.object(recovery, 'recover_corrupted', side_effect=AssertionError('Recovery ran on an offline disk')):
+            with self.assertRaises(SystemExit) as caught:
+                download.main()
+        self.assertEqual(caught.exception.code, storage.TEMPFAIL)
+
     def test_readonly_mount_blocks_state_writes(self):
         with patch.dict(os.environ, self.env), \
                 patch('storage.os.statvfs', return_value=SimpleNamespace(f_flag=os.ST_RDONLY)):
