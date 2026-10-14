@@ -31,6 +31,16 @@ def error_details(error):
                 error_reason=str(getattr(error, 'reason', error)), error_errno=network.failure(error)['errno'])
 
 
+def recent_receipt(row):
+    # Allow delayed public indexing, but not indefinite trust after remote deletion.
+    try:
+        written = datetime.fromisoformat(row['time'])
+    except (KeyError, TypeError, ValueError):
+        return False
+    age = (datetime.now().astimezone() - written).total_seconds() if written.tzinfo else -1
+    return 0 <= age < 24 * 60 * 60
+
+
 def normalized(value):
     return unicodedata.normalize('NFC', value).strip()
 
@@ -138,24 +148,26 @@ class Index:
             print('NEXTCLOUD PATH UNMAPPED: '+item['path']+'; downloading from source',flush=True)
             return False
         receipts = self.root/'.download/nextcloud-uploads.json'
-        uploaded = False
+        uploaded = []
         if receipts.exists():
-            uploaded = any(
-                row.get('state')=='uploaded' and row.get('variant')=='original'
+            uploaded = [
+                row for row in json.loads(receipts.read_text()).values()
+                if row.get('state')=='uploaded' and row.get('variant')=='original'
                 and row.get('read_share')==self.link and row.get('source')==data['source']
                 and row.get('http_status')==201 and row.get('sent_bytes')==item['size']
                 and row.get('payload_sha256')==item['sha256']
-                and (row.get('path'),row.get('size'),row.get('sha256'))==(item['path'],item['size'],item['sha256'])
-                for row in json.loads(receipts.read_text()).values())
+                and (row.get('path'),row.get('size'),row.get('sha256'))==(item['path'],item['size'],item['sha256'])]
+        candidates = self.candidates(data,item)
         conflicting = False
-        for row in self.candidates(data,item):
+        for row in candidates:
             hashes = [value.split(':',1)[1].lower() for value in row.get('checksums',[])
                       if value.upper().startswith('SHA256:')]
             if row['size']==item['size'] and item['sha256'].lower() in hashes:
                 return True
             # An old upload receipt must not override newer, conflicting WebDAV evidence.
             conflicting |= row['size'] != item['size'] or bool(hashes)
-        return uploaded and not conflicting
+        # A receipt without a visible file is a short-lived eventual-consistency hint.
+        return bool(uploaded) and not conflicting and (bool(candidates) or any(map(recent_receipt, uploaded)))
 
     def candidates(self, data, item):
         relative=remote_path(data,item)
@@ -318,7 +330,10 @@ class Sync:
                 ledger[key]=completed;d.write_json(state,ledger)
                 return
         if old.get('state')=='uploaded':
-            return
+            if recent_receipt(old):
+                return
+            # Remote file is no longer confirmed; a fresh upload needs a new session.
+            old = {}
         row=dict(key=key,source=data['source'],path=item['path'],size=item['size'],sha256=item['sha256'],variant=variant,
                  target=target,upload_share=self.share.url(),read_share=Share(self.existing).url() if self.existing else None,
                  local=str(local),local_stat=fingerprint,payload_size=size,bytes_percent=percent,state='uploading',
