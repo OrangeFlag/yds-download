@@ -133,21 +133,24 @@ class Index:
             print('NEXTCLOUD PATH UNMAPPED: '+item['path']+'; downloading from source',flush=True)
             return False
         receipts = self.root/'.download/nextcloud-uploads.json'
+        uploaded = False
         if receipts.exists():
-            for row in json.loads(receipts.read_text()).values():
-                if (row.get('state')=='uploaded' and row.get('variant')=='original'
-                        and row.get('read_share')==self.link and row.get('source')==data['source']
-                        and row.get('http_status')==201 and row.get('sent_bytes')==item['size']
-                        and row.get('payload_sha256')==item['sha256']
-                        and (row.get('path'),row.get('size'),row.get('sha256'))==(item['path'],item['size'],item['sha256'])):
-                    return True
+            uploaded = any(
+                row.get('state')=='uploaded' and row.get('variant')=='original'
+                and row.get('read_share')==self.link and row.get('source')==data['source']
+                and row.get('http_status')==201 and row.get('sent_bytes')==item['size']
+                and row.get('payload_sha256')==item['sha256']
+                and (row.get('path'),row.get('size'),row.get('sha256'))==(item['path'],item['size'],item['sha256'])
+                for row in json.loads(receipts.read_text()).values())
+        conflicting = False
         for row in self.candidates(data,item):
             hashes = [value.split(':',1)[1].lower() for value in row.get('checksums',[])
                       if value.upper().startswith('SHA256:')]
-            # A matching filename and size do not prove the remote bytes are intact.
             if row['size']==item['size'] and item['sha256'].lower() in hashes:
                 return True
-        return False
+            # An old upload receipt must not override newer, conflicting WebDAV evidence.
+            conflicting |= row['size'] != item['size'] or bool(hashes)
+        return uploaded and not conflicting
 
     def candidates(self, data, item):
         relative=remote_path(data,item)

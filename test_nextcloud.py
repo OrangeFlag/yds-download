@@ -124,6 +124,17 @@ class NextcloudChecks(unittest.TestCase):
         with patch.object(nextcloud.Share,'listing',return_value=[]):
             self.assertTrue(nextcloud.Index(self.root,self.read).contains(self.data,self.item))
 
+    def test_old_upload_receipt_cannot_override_a_conflicting_remote_checksum(self):
+        download.write_json(self.state / 'nextcloud-uploads.json', {'receipt': dict(
+            state='uploaded', variant='original', read_share=nextcloud.Share(self.read).url(),
+            source=self.data['source'], http_status=201, sent_bytes=self.item['size'],
+            payload_sha256=self.item['sha256'], path=self.item['path'],
+            size=self.item['size'], sha256=self.item['sha256'])})
+        row = dict(path='2023-fall/Course/001 - 2023-09-15 Лекция.mp4',
+                   size=self.item['size'], directory=False, checksums=['SHA256:'+'0'*64])
+        with patch.object(nextcloud.Share, 'listing', return_value=[row]):
+            self.assertFalse(nextcloud.Index(self.root, self.read).contains(self.data, self.item))
+
     def test_failed_or_ambiguous_upload_is_not_a_success_receipt(self):
         def request(share, method, path='', data=None, headers=None,uploads=False):
             if method=='PUT':data.read()
