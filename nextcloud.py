@@ -144,7 +144,8 @@ class Index:
         for row in self.candidates(data,item):
             hashes = [value.split(':',1)[1].lower() for value in row.get('checksums',[])
                       if value.upper().startswith('SHA256:')]
-            if row['size']==item['size'] and (not hashes or item['sha256'] in hashes):
+            # A matching filename and size do not prove the remote bytes are intact.
+            if row['size']==item['size'] and item['sha256'].lower() in hashes:
                 return True
         return False
 
