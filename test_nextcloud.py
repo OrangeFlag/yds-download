@@ -153,6 +153,32 @@ class NextcloudChecks(unittest.TestCase):
         with patch.object(nextcloud.Share, 'listing', return_value=[row]):
             self.assertFalse(nextcloud.Index(self.root, self.read).contains(self.data, self.item))
 
+    def test_index_caches_upload_receipts_until_ledger_changes(self):
+        from datetime import datetime, timezone
+        ledger = self.state / 'nextcloud-uploads.json'
+        receipt = dict(state='uploaded', variant='original',
+                       read_share=nextcloud.Share(self.read).url(), source=self.data['source'],
+                       http_status=201, sent_bytes=self.item['size'],
+                       payload_sha256=self.item['sha256'], path=self.item['path'],
+                       size=self.item['size'], sha256=self.item['sha256'],
+                       time=datetime.now(timezone.utc).isoformat())
+        download.write_json(ledger, {'one': receipt})
+        index = nextcloud.Index(self.root, self.read)
+        original = Path.read_text
+        reads = []
+        def read(path, *args, **kwargs):
+            if path == ledger:
+                reads.append(path)
+            return original(path, *args, **kwargs)
+        with patch.object(nextcloud.Share, 'listing', return_value=[]), \
+                patch.object(Path, 'read_text', read):
+            for _ in range(4):
+                self.assertTrue(index.contains(self.data, self.item))
+            self.assertEqual(len(reads), 1)
+            download.write_json(ledger, {})
+            self.assertFalse(index.contains(self.data, self.item))
+            self.assertEqual(len(reads), 2)
+
     def test_old_upload_receipt_is_not_permanent_proof_of_remote_file(self):
         from datetime import datetime, timedelta, timezone
         receipt = dict(state='uploaded', variant='original',

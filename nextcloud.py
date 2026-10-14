@@ -132,10 +132,13 @@ class Share:
 
 class Index:
     def __init__(self, root, link, strict=True):
-        self.root, self.link = Path(root), Share(link).url()
+        self.root = Path(root)
         self.share = Share(link,timeout=30)
+        self.link = self.share.url()
         self.strict = strict
         self.folders = {}
+        self.receipts_stamp = None
+        self.receipts = {}
 
     def contains(self, data, item):
         if PurePosixPath(item['path']).suffix.casefold() not in VIDEO:
@@ -148,15 +151,23 @@ class Index:
             print('NEXTCLOUD PATH UNMAPPED: '+item['path']+'; downloading from source',flush=True)
             return False
         receipts = self.root/'.download/nextcloud-uploads.json'
-        uploaded = []
-        if receipts.exists():
-            uploaded = [
-                row for row in json.loads(receipts.read_text()).values()
-                if row.get('state')=='uploaded' and row.get('variant')=='original'
-                and row.get('read_share')==self.link and row.get('source')==data['source']
-                and row.get('http_status')==201 and row.get('sent_bytes')==item['size']
-                and row.get('payload_sha256')==item['sha256']
-                and (row.get('path'),row.get('size'),row.get('sha256'))==(item['path'],item['size'],item['sha256'])]
+        try:
+            stat = receipts.stat()
+            stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        except FileNotFoundError:
+            stamp = None
+        if stamp != self.receipts_stamp:
+            indexed = {}
+            for row in json.loads(receipts.read_text()).values() if stamp else ():
+                if (row.get('state')=='uploaded' and row.get('variant')=='original'
+                        and row.get('read_share')==self.link and row.get('http_status')==201
+                        and row.get('sent_bytes')==row.get('size')
+                        and row.get('payload_sha256')==row.get('sha256')):
+                    key = (row.get('source'), row.get('path'), row.get('size'), row.get('sha256'))
+                    indexed.setdefault(key, []).append(row)
+            self.receipts = indexed
+            self.receipts_stamp = stamp
+        uploaded = self.receipts.get((data['source'], item['path'], item['size'], item['sha256']), [])
         candidates = self.candidates(data,item)
         conflicting = False
         for row in candidates:
