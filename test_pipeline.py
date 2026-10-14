@@ -36,6 +36,29 @@ class PipelineChecks(unittest.TestCase):
         bg.submit('range',item,'First',3,event,force=True,fallback_only=True)
         self.assertEqual(bg.jobs[path]['yandex_checked_at'],checked)
 
+    def test_yandex_recheck_keeps_better_task_archive_than_stale_recovery_ledger(self):
+        from settings import resolve
+        state = self.root / '.download'
+        state.mkdir()
+        item = self.items['First']
+        old = dict(item, course='First', attempt=3, status='partial',
+                   corrupted_path='corrupted/old/First/video.mp4')
+        better = dict(old, corrupted_path='corrupted/new/First/video.mp4')
+        archive = self.root / better['corrupted_path']
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b'lec')
+        download.write_json(Path(str(archive) + '.ranges.json'),
+                            dict(size=item['size'], sha256=item['sha256'], ranges=[[0, 3]]))
+        recovery.recovery_state(self.root, old, 'finished')
+        self.assertFalse(recovery.prefer_saved_event(self.root, better, old))
+        bg = pipeline.Background(self.root, self.data['source'], 2, resolve(), defer_range=True)
+        self.addCleanup(bg.close)
+        bg.submit('range', item, 'First', 3, better, force=True, yandex_recheck=True)
+        path = next(iter(bg.jobs))
+        with patch.object(recovery, 'finish_recovery') as recover:
+            bg.work(path, bg.jobs[path])
+        self.assertEqual(recover.call_args.args[1]['corrupted_path'], better['corrupted_path'])
+
     def test_interrupted_daily_task_is_not_satisfied_by_old_finished_partial(self):
         from settings import resolve
         state=self.root/'.download';state.mkdir()

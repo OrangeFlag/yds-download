@@ -299,8 +299,9 @@ class Background:
                     ledger=self.state/'recovery-state.json'
                     saved=json.loads(ledger.read_text()).get(event['path'],{}) if ledger.exists() else {}
                     previous=saved.get('event',{})
-                    if (previous.get('size'),previous.get('sha256'))==(job['item']['size'],job['item']['sha256']):
-                        event=dict(previous)
+                    if ((previous.get('size'), previous.get('sha256')) == (job['item']['size'], job['item']['sha256'])
+                            and r.prefer_saved_event(self.root, event, previous)):
+                        event = dict(previous)
                 event.pop('range_recovered_complete', None)
                 checked_yandex = False
                 try:
