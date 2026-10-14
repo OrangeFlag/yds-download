@@ -83,7 +83,7 @@ class JsonCache:
                     item = job['item']
                     summary = dict(kind='range', state=job['state'], course=job['course'],
                                    source=job['source'], attempt=job['attempt'],
-                                   item={key: item[key] for key in ('path', 'size', 'sha256')},
+                                   item={key: item[key] for key in ('path', 'size', 'sha256', 'file') if key in item},
                                    superseded_by_manifest=job.get('superseded_by_manifest', False),
                                    result={'event': {'range_recovered_complete':
                                        job.get('result', {}).get('event', {}).get('range_recovered_complete', False)}})
