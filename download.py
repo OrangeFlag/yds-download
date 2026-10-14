@@ -175,6 +175,17 @@ def write_json(path, data):
             os.close(directory)
 
 
+def write_failures(path, events):
+    # Full request diagnostics live in per-file recovery state, not shared summaries.
+    rows = []
+    for event in events:
+        row = {key: value for key, value in event.items() if key != 'range_attempts'}
+        if event.get('range_attempts'):
+            row['range_attempted'] = True
+        rows.append(row)
+    write_json(path, rows)
+
+
 def append_events(path, rows):
     storage.check(path)
     with STATE_LOCK:
@@ -572,8 +583,8 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                         event['corrupted_path'] = str(broken.relative_to(root))
                         course_failed.append(event)
                         failed.append(event)
-                        write_json(root / 'corrupted' / 'failed.json', failed)
-                        write_json(broken_root / 'failed.json', failed)
+                        write_failures(root / 'corrupted' / 'failed.json', failed)
+                        write_failures(broken_root / 'failed.json', failed)
                         for src, out in [(destination, broken),
                                          (Path(str(destination) + '.aria2'), Path(str(broken) + '.aria2'))]:
                             if src.exists():
@@ -592,12 +603,12 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                             verified += 1
                             course_failed.remove(event)
                             failed.remove(event)
-                            write_json(root / 'corrupted' / 'failed.json', failed)
-                            write_json(broken_root / 'failed.json', failed)
+                            write_failures(root / 'corrupted' / 'failed.json', failed)
+                            write_failures(broken_root / 'failed.json', failed)
                             continue
                         append_events(state / 'events.jsonl', [event])
-                        write_json(root / 'corrupted' / 'failed.json', failed)
-                        write_json(broken_root / 'failed.json', failed)
+                        write_failures(root / 'corrupted' / 'failed.json', failed)
+                        write_failures(broken_root / 'failed.json', failed)
                 pending = remaining
             complete = not course_failed
             course_status = dict(course=course, source=source, complete=complete,
@@ -618,7 +629,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                        failed=sum(history.get(name, {}).get('failed', 0) for name in queue_courses) if preserve_queue else len(failed),
                        last_finished_course=course, complete=False))
         (root / 'corrupted').mkdir(exist_ok=True)
-        write_json(root / 'corrupted' / 'failed.json', failed)
+        write_failures(root / 'corrupted' / 'failed.json', failed)
         failed_count = sum(history[course]['failed'] for course in courses)
         summary_verified = sum(history.get(course, {}).get('verified', 0) for course in queue_courses) if preserve_queue else verified
         summary_failed = sum(history.get(course, {}).get('failed', 0) for course in queue_courses) if preserve_queue else failed_count

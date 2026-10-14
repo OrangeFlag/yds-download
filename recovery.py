@@ -1,5 +1,8 @@
 """Retry independent ranges and retain partial videos by confirmed byte coverage."""
 from datetime import datetime
+from bisect import bisect_left, bisect_right
+from collections.abc import Sequence
+from itertools import islice
 import hashlib
 import errno
 import http.client
@@ -131,30 +134,63 @@ def _promote_partial(root, event):
 
 
 def new_recovery_body(root, event, reason):
-    from download import write_json
+    from download import write_json, write_failures
     archive = root / 'corrupted' / (datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '-recovery')
     archive.mkdir(parents=True)
     event.setdefault('preserved_archive_paths', []).append(event['corrupted_path'])
     event['corrupted_path'] = str(local_path(archive, event['path']).relative_to(root))
-    for key in ('sha256_mismatch', 'recovery_error', 'available_seconds', 'available_time_percent', 'available_intervals', 'time_method', 'range_attempts', 'recheck_continue', 'recheck_full_pass'):
+    for key in ('sha256_mismatch', 'recovery_error', 'available_seconds', 'available_time_percent', 'available_intervals', 'time_method', 'range_attempts', 'range_attempted', 'recheck_continue', 'recheck_full_pass'):
         event.pop(key, None)
     event['restart_reason'] = reason
     event.update(progress(body_path(root, event), event['size'], sha256=event['sha256']))
     recovery_state(root, event, 'running')
-    write_json(archive / 'failed.json', [event])
+    write_failures(archive / 'failed.json', [event])
 
 
-def missing_chunks(ranges, total, block):
-    """Split only unconfirmed holes, keeping the remote byte alignment."""
-    missing = []
-    position = 0
-    for start, end in ranges + [[total, total]]:
-        while position < start:
-            stop = min(start, (position // block + 1) * block)
-            missing.append((position, stop))
-            position = stop
-        position = end
-    return missing
+class MissingChunks(Sequence):
+    """Index missing blocks using only gap boundaries, including cursor rotation."""
+    def __init__(self, ranges, total, block, cursor=0):
+        self.holes, self.ends = [], []
+        self.block, self.offset = block, 0
+        position, count = 0, 0
+        for start, end in ranges + [[total, total]]:
+            if position < start:
+                self.holes.append((position, start))
+                count += (start - 1) // block - position // block + 1
+                self.ends.append(count)
+            position = end
+        if count and cursor:
+            self.offset = bisect_left(self, cursor, key=lambda bounds: bounds[0]) % count
+
+    def __len__(self):
+        return self.ends[-1] if self.ends else 0
+
+    def __contains__(self, bounds):
+        start, end = bounds
+        gap = bisect_right(self.holes, start, key=lambda hole: hole[0]) - 1
+        if gap < 0:
+            return False
+        a, b = self.holes[gap]
+        aligned = start // self.block * self.block
+        return a <= start < b and (start, end) == (max(a, aligned), min(b, aligned + self.block))
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[i] for i in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        index = (index + self.offset) % len(self)
+        gap = bisect_right(self.ends, index)
+        start, end = self.holes[gap]
+        number = index - (self.ends[gap - 1] if gap else 0)
+        aligned = (start // self.block + number) * self.block
+        return max(start, aligned), min(end, aligned + self.block)
+
+
+def missing_chunks(ranges, total, block, cursor=0):
+    return MissingChunks(ranges, total, block, cursor)
 
 
 def spread_probes(missing, limit):
@@ -546,24 +582,23 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
         elif fine:
             budget = tuning['range_linear_probes']
             # Reserve at least half the budget for expansion and resumable linear coverage.
-            ordered = [bounds for bounds in missing if bounds[0] >= cursor]
-            ordered += [bounds for bounds in missing if bounds[0] < cursor]
+            ordered = missing_chunks(ranges, total, block, cursor)
             scatter = spread_probes(ordered, budget // 2)
             execute(scatter, 'scatter')
             previous = [row for earlier in attempts for row in earlier['ranges']]
             expansions = expand_probes(ranges, total, previous + outcomes,
                                        tuning['range_block_size_kib'] * 1024, budget // 4, block, outcomes)
             execute(expansions, 'expand')
-            remaining = missing_chunks(ranges, total, block)
+            remaining = missing_chunks(ranges, total, block, cursor)
             tested = set(scatter)
-            linear = [bounds for bounds in remaining if bounds[0] >= cursor and bounds not in tested]
-            linear += [bounds for bounds in remaining if bounds[0] < cursor and bounds not in tested]
-            linear = linear[:budget - len(outcomes)]
+            linear = list(islice((bounds for bounds in remaining if bounds not in tested),
+                                 max(0, budget - len(outcomes))))
             execute(linear, 'linear')
             if linear:
                 cursor = linear[-1][1] % total
             small_tests = tested | set(linear)
-            unprobed = sum(bounds not in small_tests for bounds in missing_chunks(ranges, total, block))
+            remaining = missing_chunks(ranges, total, block)
+            unprobed = len(remaining) - sum(bounds in remaining for bounds in small_tests)
             write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor, control_imported=True))
         else:
             unprobed = execute(missing, 'halving')
@@ -683,7 +718,7 @@ def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=
 
 
 def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None, metrics=None, probe_requests=0):
-    from download import record, target, write_json, sha256_file, inspect
+    from download import record, target, write_json, write_failures, sha256_file, inspect
     path = body_path(root, event)
     if item:
         try:
@@ -738,7 +773,7 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
                             rows[index] = rejected
                             changed = True
                     if changed:
-                        write_json(manifest, rows)
+                        write_failures(manifest, rows)
                 registry = root / '.download/partial-copies.json'
                 if registry.exists():
                     copies = json.loads(registry.read_text())
@@ -780,7 +815,7 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
 
 
 def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, mark=None, git_push=False, courses=None, force=False, tuning=None, deep=False):
-    from download import files, write_json, read_events
+    from download import files, write_json, write_failures, read_events
     root = root.resolve()
     candidates = {}
     for manifest in (root / 'corrupted').glob('**/failed.json'):
@@ -838,7 +873,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                 results.append(event)
                 print('RECOVERY SKIPPED: ' + event['path'] + '; attempt already finished', flush=True)
                 continue
-        elif not saved and retry and not force and event.get('range_attempts'):
+        elif not saved and retry and not force and (event.get('range_attempts') or event.get('range_attempted')):
             # Previous completed passes predate the per-file ledger.
             ledger.set(event['path'], dict(state='finished', event=dict(event)))
             results.append(event)
@@ -900,7 +935,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                 rows[index] = replacement
                 changed = True
         if changed:
-            write_json(manifest, rows)
+            write_failures(manifest, rows)
     if report_repo:
         from report import queue_report
         queue_report(root, report_repo, mark, git_push, f'Update {mark} partially available copies and range recovery')

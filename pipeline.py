@@ -142,7 +142,7 @@ def failure_manifests_batch(root, events):
                     updates[path][key] = event
         for path, rows in updates.items():
             path.parent.mkdir(parents=True, exist_ok=True)
-            d.write_json(path, list(rows.values()))
+            d.write_failures(path, list(rows.values()))
 
 
 class Background:
@@ -757,7 +757,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                             archived = old
                         if not retry_check and (same and ledger.get('state') == 'finished'
                                                 and background.range_result_current(item, archived)
-                                                or not ledger and archived.get('range_attempts')):
+                                                or not ledger and (archived.get('range_attempts') or archived.get('range_attempted'))):
                             if not ledger:
                                 r.recovery_state(root, archived, 'finished')
                             d.append_events(state / 'events.jsonl', [archived])
