@@ -216,6 +216,17 @@ class NextcloudChecks(unittest.TestCase):
         self.assertEqual(len(sent), 2)
         self.assertNotEqual(first_upload_id, next(iter(receipts.values()))['upload_id'])
 
+    def test_sync_streams_source_events_without_retaining_bulk_jsonl_history(self):
+        sync = nextcloud.Sync(self.read, self.upload, Event())
+        journal = self.state / 'events.jsonl'
+        with patch.object(nextcloud.Share, 'listing', return_value=[]), \
+                patch.object(sync, 'upload') as upload, \
+                patch.object(download, 'read_events',
+                             side_effect=AssertionError('Entire event history loaded')):
+            sync.run_once([self.root])
+        upload.assert_called_once()
+        self.assertNotIn(journal, sync.cache)
+
     def test_upload_journal_recovery_streams_without_caching_full_history(self):
         sent = []
         def request(share, method, path='', data=None, headers=None, uploads=False):
