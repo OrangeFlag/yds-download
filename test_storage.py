@@ -69,9 +69,7 @@ class StorageChecks(unittest.TestCase):
         path = new / 'YandexDisk/Course/.download/queue.json'; path.parent.mkdir(parents=True)
         path.write_text(json.dumps({'destination': str(old / 'YandexDisk/Course')}))
         failure = OSError(errno.EIO, 'Disk disconnected during scan')
-        import glob
-        with patch('os.scandir', side_effect=failure), \
-                patch.object(glob._StringGlobber, 'scandir', side_effect=failure):
+        with patch('os.scandir', side_effect=failure):
             with self.assertRaises(OSError):
                 storage.migrate(old, new, 'uuid', state)
         self.assertFalse((state / 'uuid.json').exists())
