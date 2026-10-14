@@ -145,7 +145,7 @@ def failure_manifests_batch(root, events):
 
 
 class Background:
-    def __init__(self, root, source, retries, tuning, defer_range=False, range_pool=None, budget=None, range_files=1):
+    def __init__(self, root, source, retries, tuning, defer_range=False, range_pool=None, budget=None, range_files=1, nextcloud_fallback=None, retry_check=False):
         self.root, self.source, self.retries, self.tuning = root, source, retries, tuning
         self.state = root / '.download'
         self.directory = self.state / 'tasks'
@@ -157,10 +157,13 @@ class Background:
         self.defer_range = defer_range
         self.budget = budget
         self.shared_pool = range_pool
+        self.retry_check=retry_check
         if range_pool is not None:
             self.pools['range'].shutdown()
             self.pools['range'] = range_pool
         self.stopping = Event()
+        from nextcloud_fallback import Fallback
+        self.fallback = Fallback(root,nextcloud_fallback,self.stopping) if nextcloud_fallback else None
         self.download_active = Event()
         self.wake = Event()
         self.retry = []
@@ -169,7 +172,7 @@ class Background:
         self.ledger_path = self.state / 'transfer-state.json'
         self.ledger = json.loads(self.ledger_path.read_text()) if self.ledger_path.exists() else {}
         self.metrics = Metrics(self.state/'metrics.jsonl', 'range-worker' if range_pool else 'downloader',
-                               interval=tuning['metrics_interval'], settings=dict(tuning=tuning, retries=retries, range_files=range_files))
+                               interval=tuning['metrics_interval'], settings=dict(tuning=tuning, retries=retries, range_files=range_files,nextcloud_fallback=nextcloud_fallback))
         self.aria_metrics = AriaMetrics(self.state/'aria2.log',self.metrics)
         self.metrics.sample = self.aria_metrics.sample
 
@@ -186,13 +189,14 @@ class Background:
         row = self.ledger.get(item['path'], {})
         return row if (row.get('source'), row.get('size'), row.get('sha256')) == (self.source, item['size'], item['sha256']) else {}
 
-    def submit(self, kind, item, course, attempt, event=None, force=False):
+    def submit(self, kind, item, course, attempt, event=None, force=False, fallback_only=False):
         key = hashlib.sha256(json.dumps([self.source, item['path'], item['size'], item['sha256'], kind]).encode()).hexdigest()
         path = self.directory / (key + '.json')
         if path in self.futures:
             return
         job = dict(source=self.source, kind=kind, item=item, course=course, attempt=attempt,
                    state='pending', time=now(), queued_at=now())
+        if fallback_only:job['fallback_only']=True
         if event is not None:
             job['event'] = event
         old = {}
@@ -225,6 +229,7 @@ class Background:
                     job['event'] = proof
                     if saved.get('state') == 'finished' and self.range_result_current(item, proof):
                         job.update(state='done', result=dict(event=proof))
+        if not force and old.get('fallback_only'):job['fallback_only']=True
         previous = old.get('timing')
         timing = dict(previous) if isinstance(previous, dict) else {}
         if timing.get('started_at') and not timing.get('stopped_at'):
@@ -282,11 +287,25 @@ class Background:
                 result = dict(status=status, detail=detail, stat=before)
             else:
                 event = job['event']
+                if self.fallback:
+                    ledger=self.state/'recovery-state.json'
+                    saved=json.loads(ledger.read_text()).get(event['path'],{}) if ledger.exists() else {}
+                    previous=saved.get('event',{})
+                    if (previous.get('size'),previous.get('sha256'))==(job['item']['size'],job['item']['sha256']):
+                        event=dict(previous)
                 event.pop('range_recovered_complete', None)
                 try:
-                    r.finish_recovery(self.root, event, job['item'], self.retries, tuning=self.tuning,
-                                      stopping=self.stopping, download_active=self.download_active if self.budget is None else None,
-                                      background=True, request_budget=self.budget, metrics=self.metrics)
+                    fallback=self.fallback.recover_all(job['item'],event) if self.fallback else None
+                    if fallback and fallback['status']=='valid':
+                        event=fallback
+                    else:
+                        if fallback:event['nextcloud_alternative']=fallback
+                        ledger=self.state/'recovery-state.json'
+                        saved=json.loads(ledger.read_text()).get(event['path'],{}) if self.fallback and ledger.exists() else {}
+                        if not (job.get('fallback_only') or not self.retry_check and saved.get('state')=='finished' and self.range_result_current(job['item'],saved.get('event',{}))):
+                            r.finish_recovery(self.root, event, job['item'], self.retries, tuning=self.tuning,
+                                              stopping=self.stopping, download_active=self.download_active if self.budget is None else None,
+                                              background=True, request_budget=self.budget, metrics=self.metrics)
                 except InterruptedError:
                     raise
                 except (ValueError, FileExistsError) as error:
@@ -489,7 +508,7 @@ class Background:
             self.metrics.close()
 
 
-def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range=False, range_budget=None, range_files=16, nextcloud_existing=None):
+def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range=False, range_budget=None, range_files=16, nextcloud_existing=None, nextcloud_fallback=None):
     storage.check(root)
     tuning = resolve(tuning)
     if not all(shutil.which(name) for name in ('aria2c', 'cp')):
@@ -504,7 +523,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
         if identity.exists() and json.loads(identity.read_text())['source'] != source:
             raise ValueError('Use a separate destination for a different public folder/year')
         d.write_json(identity, dict(source=source, title=data['title']))
-        d.write_json(state / 'settings.json', dict(retries=retries, deep=False, retry_check=retry_check, tuning=tuning, defer_range=defer_range, nextcloud_existing=nextcloud_existing))
+        d.write_json(state / 'settings.json', dict(retries=retries, deep=False, retry_check=retry_check, tuning=tuning, defer_range=defer_range, nextcloud_existing=nextcloud_existing, nextcloud_fallback=nextcloud_fallback))
         remote_index = None
         remote_files = {}
         if nextcloud_existing:
@@ -555,7 +574,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             from request_budget import ProcessRangeBudget
             budget = ProcessRangeBudget(range_budget, rps=tuning['range_rps'])
         background = Background(root, source, retries, tuning, defer_range=defer_range and budget is None,
-                                budget=budget, range_files=range_files if budget else 1)
+                                budget=budget, range_files=range_files if budget else 1, nextcloud_fallback=nextcloud_fallback,retry_check=retry_check)
         for path in background.directory.glob('*.json'):
             job = json.loads(path.read_text())
             if (job['source'] == source and job['course'] in courses

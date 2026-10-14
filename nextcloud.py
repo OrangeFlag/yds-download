@@ -23,7 +23,7 @@ import network
 import storage
 
 VIDEO = {'.mp4', '.mkv', '.mov', '.webm', '.avi', '.m4v', '.ts', '.3gp'}
-PROPERTIES = b'<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><d:resourcetype/><d:getcontentlength/><oc:checksums/></d:prop></d:propfind>'
+PROPERTIES = b'<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><d:resourcetype/><d:getcontentlength/><d:getetag/><oc:checksums/></d:prop></d:propfind>'
 
 
 def normalized(value):
@@ -108,6 +108,7 @@ class Share:
                 continue
             length = properties.findtext('{DAV:}getcontentlength')
             result.append(dict(path=normalized(path[len(prefix):].rstrip('/')),
+                download_path=path[len(prefix):].rstrip('/'),etag=properties.findtext('{DAV:}getetag'),
                 directory=properties.find('{DAV:}resourcetype/{DAV:}collection') is not None,
                 size=int(length) if length is not None else None,
                 checksums=[c.text or '' for c in properties.findall('.//{http://owncloud.org/ns}checksum')]))
@@ -140,31 +141,31 @@ class Index:
                         and row.get('payload_sha256')==item['sha256']
                         and (row.get('path'),row.get('size'),row.get('sha256'))==(item['path'],item['size'],item['sha256'])):
                     return True
-        folder = str(PurePosixPath(relative).parent)
+        for row in self.candidates(data,item):
+            hashes = [value.split(':',1)[1].lower() for value in row.get('checksums',[])
+                      if value.upper().startswith('SHA256:')]
+            if row['size']==item['size'] and (not hashes or item['sha256'] in hashes):
+                return True
+        return False
+
+    def candidates(self, data, item):
+        relative=remote_path(data,item)
+        folder=str(PurePosixPath(relative).parent)
         if folder not in self.folders:
             try:
-                self.folders[folder] = self.share.listing(folder)
+                self.folders[folder]=self.share.listing(folder)
             except urllib.error.HTTPError as error:
-                self.folders[folder] = [] if error.code==404 else error
+                self.folders[folder]=[] if error.code==404 else error
             except (OSError,RuntimeError,ET.ParseError) as error:
-                self.folders[folder] = error
+                self.folders[folder]=error
         if isinstance(self.folders[folder],Exception):
             if self.strict:
                 raise self.folders[folder]
             print('NEXTCLOUD LOOKUP UNAVAILABLE: '+folder+'; downloading from source',flush=True)
-            return False
-        for row in self.folders[folder]:
-            path = PurePosixPath(row['path'])
-            name = re.sub(r'^\d{3,} - ', '',path.name)
-            if (row['directory'] or normalized(str(path.parent))!=folder
-                    or normalized(name)!=PurePosixPath(relative).name or row['size']!=item['size']):
-                continue
-            hashes = [value.split(':',1)[1].lower() for value in row.get('checksums',[])
-                      if value.upper().startswith('SHA256:')]
-            if hashes and item['sha256'] not in hashes:
-                continue
-            return True
-        return False
+            return []
+        return [row for row in self.folders[folder] if not row['directory']
+                and normalized(str(PurePosixPath(row['path']).parent))==folder
+                and normalized(re.sub(r'^\d{3,} - ','',PurePosixPath(row['path']).name))==PurePosixPath(relative).name]
 
 
 def remote_saved(state, item, link):

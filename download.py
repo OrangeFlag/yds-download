@@ -333,15 +333,17 @@ def list_course(source, course, retries=2, retry_delay=60):
             time.sleep(retry_delay)
 
 
-def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None, defer_range=False, range_budget=None, range_files=16, nextcloud_existing=None):
-    if nextcloud_existing and data.get('root'):
+def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None, defer_range=False, range_budget=None, range_files=16, nextcloud_existing=None, nextcloud_fallback=None):
+    if nextcloud_existing and nextcloud_fallback:
+        raise ValueError('Choose remote skipping or verified fallback, not both')
+    if (nextcloud_existing or nextcloud_fallback) and data.get('root'):
         raise ValueError('Nextcloud course filtering cannot be used for personal/root archives')
     if deep:
-        if nextcloud_existing:
+        if nextcloud_existing or nextcloud_fallback:
             raise ValueError('--nextcloud-existing cannot replace local SHA checks in --deep mode')
         return download_deep(data, courses, root, retries, report_repo, mark, git_push, deep, retry_check, tuning)
     from pipeline import run
-    return run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range, range_budget, range_files, nextcloud_existing)
+    return run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range, range_budget, range_files, nextcloud_existing, nextcloud_fallback)
 
 
 def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None):
@@ -630,6 +632,7 @@ def main():
     fetching.add_argument('--range-files', type=int, default=16, help='Range files during overlapping downloads (default: 16)')
     fetching.add_argument('--git-push', action='store_true', help='Commit and push reports after each course')
     fetching.add_argument('--nextcloud-existing', help='Skip originals present in this public Nextcloud share; remote copies are not local SHA proofs')
+    fetching.add_argument('--nextcloud-fallback', help='After Yandex transfer retries, download failed course videos from this public share and compare SHA-256')
     add_arguments(fetching)
     salvage = commands.add_parser('recover', help='Retain videos with over 50 percent confirmed bytes next to originals')
     salvage.add_argument('--destination', required=True, type=Path)
@@ -684,7 +687,7 @@ def main():
             available = {item['name'] for item in catalog(data['source'])['courses']}
             if {PurePosixPath(name).parts[0] for name in chosen} - available:
                 raise ValueError('Selected courses no longer exist in the source folder')
-        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep, args.retry_check, tuning, args.defer_range, args.range_budget, args.range_files, args.nextcloud_existing)
+        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep, args.retry_check, tuning, args.defer_range, args.range_budget, args.range_files, args.nextcloud_existing, args.nextcloud_fallback)
     except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(storage.TEMPFAIL if storage.disk_error(error) else 2, f'Error: {error}\n')
 

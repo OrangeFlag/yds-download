@@ -143,7 +143,7 @@ def finish_courses(background, config, changed_courses=()):
                     break
         from nextcloud import remote_saved
         settings=json.loads((state/'settings.json').read_text())
-        remote=sum(remote_saved(state,item,settings.get('nextcloud_existing')) for item in entries
+        remote=sum(remote_saved(state,item,None if getattr(background,'fallback',None) else settings.get('nextcloud_existing')) for item in entries
                    if item['path'] not in verified_paths)
         status = dict(course=course, source=background.source, state='recovering' if pending else 'finished',
                       complete=not pending and valid + remote == len(entries), total=len(entries), verified=valid, remote_available=remote,
@@ -162,7 +162,14 @@ def finish_courses(background, config, changed_courses=()):
                  failed=failed, pending_courses=pending, downloads_complete=True, complete=not failed and not pending))
 
 
-def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60):
+def fallback_due(fallback,job):
+    return (fallback is not None and job['state']=='applied' and job['kind']=='range'
+            and not job.get('superseded_by_manifest')
+            and not job.get('result',{}).get('event',{}).get('range_recovered_complete')
+            and fallback.ready(job['item']))
+
+
+def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60, nextcloud_fallback=None):
     if files < 1 or per_file < 1:
         raise ValueError('Range file limits must be positive')
     if not 1 <= secondary_slots <= max(1, files - 1):
@@ -176,6 +183,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
     cache = JsonCache()
     roots = {}
     priorities = {}
+    fallbacks = {}
     with Metrics(queues[0].with_suffix('.range.metrics.jsonl'),'range-queue',interval=metrics_interval,
                  settings=dict(files=files,per_file=per_file,requests=requests,rps=rps,secondary_slots=secondary_slots)) as metrics, \
             ThreadPoolExecutor(max_workers=files, thread_name_prefix='range-file') as pool:
@@ -203,7 +211,15 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         if not summary.get('downloads_complete') and archive.get('state') != 'finished':
                             continue
                         tasks = cache.tasks(state / 'tasks')
-                        if not summary.get('pending_courses') and not any(job['kind'] == 'range' and job['state'] in ('pending', 'running', 'done') for _, job in tasks):
+                        settings=cache.read(state/'settings.json',{})
+                        link=nextcloud_fallback or settings.get('nextcloud_fallback')
+                        fallback=None
+                        if link and state.joinpath('source.json').exists() and not cache.read(state/'catalog.json',{}).get('root'):
+                            from nextcloud_fallback import Fallback
+                            if root not in fallbacks or fallbacks[root].link!=link:
+                                fallbacks[root]=Fallback(root,link,stopping)
+                            fallback=fallbacks[root]
+                        if not summary.get('pending_courses') and not any(job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or fallback_due(fallback,job)) for _, job in tasks):
                             continue
                         if root not in roots:
                             lock = (state / 'download.lock').open('a')
@@ -220,7 +236,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 settings = cache.read(state / 'settings.json')
                                 tuning = resolve({**settings['tuning'], 'range_workers': per_file, 'range_rps': rps})
                                 background = Background(root, identity['source'], settings['retries'], tuning,
-                                                        range_pool=pool, budget=budget, range_files=files)
+                                                        range_pool=pool, budget=budget, range_files=files, nextcloud_fallback=link if fallback else None,retry_check=settings.get('retry_check',False))
                             except BaseException:
                                 lock.close()
                                 raise
@@ -236,14 +252,14 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         for path, job in tasks:
                             if path in background.futures:
                                 continue
-                            if job['kind'] == 'range' and job['state'] in ('pending', 'running', 'done'):
+                            if job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or fallback_due(fallback,job)):
                                 if job['source'] != background.source:
                                     raise ValueError('Range task source mismatch')
                                 d.target(root, job['item'], job['course'])
                                 item = job['item']
                                 from nextcloud import remote_saved
                                 settings=cache.read(state/'settings.json')
-                                if remote_saved(state,item,settings.get('nextcloud_existing')):
+                                if not fallback and remote_saved(state,item,settings.get('nextcloud_existing')):
                                     background.checkpoint(item,job['course'],job['attempt'],'remote')
                                     job.update(state='applied',time=now(),superseded_by_nextcloud=True)
                                     d.write_json(path,job)
@@ -272,7 +288,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                             chosen = next(i for i, row in enumerate(eligible) if row[0] > 0)
                     _, background, job = eligible.pop(chosen)
                     print('RANGE START: ' + str(background.root) + job['item']['path'], flush=True)
-                    background.submit('range', job['item'], job['course'], job['attempt'], job['event'])
+                    background.submit('range', job['item'], job['course'], job['attempt'], job['event'],force=job['state']=='applied',fallback_only=job['state']=='applied')
                     active += 1
                 for root, (background, lock, config) in list(roots.items()):
                     if not background.futures:
@@ -309,6 +325,7 @@ def main():
     parser.add_argument('--rps', type=float, default=12)
     parser.add_argument('--metrics-interval',type=int,default=60,help='Service metrics interval, seconds')
     parser.add_argument('--budget', type=Path, help='Share the HTTP budget with overlapping ordinary downloaders')
+    parser.add_argument('--nextcloud-fallback',help='Also backfill completed failed course tasks from this public share')
     args = parser.parse_args()
     stopping = Event()
     for number in (signal.SIGINT, signal.SIGTERM):
@@ -316,7 +333,7 @@ def main():
     # Prevent two workers from multiplying the global limits.
     with args.queue[0].with_suffix('.range.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget, args.metrics_interval)
+        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget, args.metrics_interval, args.nextcloud_fallback)
 
 
 if __name__ == '__main__':

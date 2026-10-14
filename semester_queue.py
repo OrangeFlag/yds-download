@@ -24,7 +24,10 @@ def main():
     parser.add_argument('--range-budget', type=Path, help='Shared budget directory for overlapping foreground and worker Range')
     parser.add_argument('--range-files', type=int, default=16)
     parser.add_argument('--nextcloud-existing', help='Skip originals already available in this public Nextcloud share')
+    parser.add_argument('--nextcloud-fallback', help='Verified fallback for failed course videos')
     args = parser.parse_args()
+    if args.nextcloud_existing and args.nextcloud_fallback:
+        parser.error('Choose remote skipping or verified fallback, not both')
     if args.range_budget is not None and (not args.defer_range or args.range_files < 1):
         parser.error('--range-budget requires --defer-range and positive --range-files')
     storage.check(args.queue)
@@ -76,6 +79,8 @@ def main():
             command += arguments({**data.get('tuning', {}), **job.get('tuning', {})})
             if args.nextcloud_existing:
                 command += ['--nextcloud-existing', args.nextcloud_existing]
+            if args.nextcloud_fallback:
+                command += ['--nextcloud-fallback',args.nextcloud_fallback]
             if args.defer_range and not data.get('deep'):
                 command += ['--defer-range']
                 if args.range_budget is not None:
