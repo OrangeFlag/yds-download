@@ -243,8 +243,9 @@ def yandex_checked_time(job):
 def recheck_due(job, interval, timestamp=None):
     result=job.get('result',{}).get('event',{})
     if (not interval or job['kind']!='range' or job['state']!='applied'
-            or job.get('superseded_by_manifest') or result.get('range_recovered_complete')
-            or result.get('status')=='valid'):
+            or any(job.get('superseded_by_'+reason) for reason in
+                   ('manifest', 'nextcloud', 'local_copy'))
+            or result.get('range_recovered_complete') or result.get('status')=='valid'):
         return False
     last=yandex_checked_time(job)
     if not last:return True

@@ -34,6 +34,14 @@ class SharedRangeChecks(unittest.TestCase):
         job['superseded_by_manifest'] = True
         self.assertFalse(q.recheck_due(job, 86400, stamp.timestamp()+86401))
 
+    def test_daily_recheck_does_not_rewrite_tasks_superseded_by_verified_copies(self):
+        task = dict(kind='range', state='applied',
+                    result={'event': {'status': 'missing'}})
+        for reason in ('superseded_by_manifest', 'superseded_by_nextcloud',
+                       'superseded_by_local_copy'):
+            with self.subTest(reason=reason):
+                self.assertFalse(q.recheck_due(dict(task, **{reason: True}), 86400))
+
     def test_recheck_timestamp_survives_compact_cache_restart(self):
         from datetime import datetime, timezone
         with tempfile.TemporaryDirectory() as folder:
