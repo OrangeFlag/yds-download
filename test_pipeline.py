@@ -234,6 +234,38 @@ class PipelineChecks(unittest.TestCase):
             paths.append(path)
         return background, paths
 
+    def test_completed_range_drops_duplicate_large_event_from_transfer_ledger(self):
+        background, paths = self.ready_range_jobs(1)
+        event = background.jobs[paths[0]]['result']['event']
+        event['range_attempts'] = ['history' * 5000 for _ in range(20)]
+        with patch.object(background, 'range_result_current', return_value=True):
+            background.poll()
+        ledger = json.loads(background.ledger_path.read_text())
+        self.assertEqual(ledger[event['path']]['phase'], 'finished')
+        self.assertNotIn('event', ledger[event['path']])
+        self.assertEqual(json.loads(paths[0].read_text())['result']['event']['range_attempts'],
+                         event['range_attempts'])
+
+    def test_legacy_finished_transfer_event_is_compacted_without_dropping_active_resume(self):
+        from settings import resolve
+        state = self.root / '.download'
+        state.mkdir()
+        item = self.items['First']
+        finished = dict(source=self.data['source'], size=item['size'], sha256=item['sha256'],
+                        course='First', attempt=3, phase='finished',
+                        event={'range_attempts': ['x' * 50000]})
+        pending = dict(finished, phase='range', event=dict(corrupted_path='corrupted/old'))
+        path = state / 'transfer-state.json'
+        download.write_json(path, {item['path']: finished, '/Second/video.mp4': pending})
+        bg = pipeline.Background(self.root, self.data['source'], 2, resolve(), defer_range=True)
+        self.addCleanup(bg.close)
+        self.assertNotIn('event', bg.ledger[item['path']])
+        self.assertEqual(bg.ledger['/Second/video.mp4']['event'], pending['event'])
+        bg.checkpoint(item, 'First', 3, 'finished')
+        saved = json.loads(path.read_text())
+        self.assertNotIn('event', saved[item['path']])
+        self.assertEqual(saved['/Second/video.mp4']['event'], pending['event'])
+
     def test_poll_batches_ledger_and_failure_manifest_before_applied_jobs(self):
         background, paths = self.ready_range_jobs(70)
         original = download.write_json
