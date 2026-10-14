@@ -189,7 +189,7 @@ class Background:
         row = self.ledger.get(item['path'], {})
         return row if (row.get('source'), row.get('size'), row.get('sha256')) == (self.source, item['size'], item['sha256']) else {}
 
-    def submit(self, kind, item, course, attempt, event=None, force=False, fallback_only=False):
+    def submit(self, kind, item, course, attempt, event=None, force=False, fallback_only=False, yandex_recheck=False):
         key = hashlib.sha256(json.dumps([self.source, item['path'], item['size'], item['sha256'], kind]).encode()).hexdigest()
         path = self.directory / (key + '.json')
         if path in self.futures:
@@ -197,6 +197,7 @@ class Background:
         job = dict(source=self.source, kind=kind, item=item, course=course, attempt=attempt,
                    state='pending', time=now(), queued_at=now())
         if fallback_only:job['fallback_only']=True
+        if yandex_recheck:job['yandex_recheck']=True
         if event is not None:
             job['event'] = event
         old = {}
@@ -227,9 +228,12 @@ class Background:
                 proof = saved.get('event', {})
                 if r.prefer_saved_event(self.root, event, proof):
                     job['event'] = proof
-                    if saved.get('state') == 'finished' and self.range_result_current(item, proof):
+                    if (not (yandex_recheck or old.get('yandex_recheck'))
+                            and saved.get('state') == 'finished' and self.range_result_current(item, proof)):
                         job.update(state='done', result=dict(event=proof))
         if not force and old.get('fallback_only'):job['fallback_only']=True
+        if not force and old.get('yandex_recheck'):job['yandex_recheck']=True
+        if old.get('yandex_checked_at'):job['yandex_checked_at']=old['yandex_checked_at']
         previous = old.get('timing')
         timing = dict(previous) if isinstance(previous, dict) else {}
         if timing.get('started_at') and not timing.get('stopped_at'):
@@ -287,22 +291,26 @@ class Background:
                 result = dict(status=status, detail=detail, stat=before)
             else:
                 event = job['event']
-                if self.fallback:
+                if self.fallback or job.get('yandex_recheck'):
                     ledger=self.state/'recovery-state.json'
                     saved=json.loads(ledger.read_text()).get(event['path'],{}) if ledger.exists() else {}
                     previous=saved.get('event',{})
                     if (previous.get('size'),previous.get('sha256'))==(job['item']['size'],job['item']['sha256']):
                         event=dict(previous)
                 event.pop('range_recovered_complete', None)
+                checked_yandex = False
                 try:
-                    fallback=self.fallback.recover_all(job['item'],event) if self.fallback else None
+                    fallback=self.fallback.recover_all(job['item'],event) if self.fallback and not job.get('yandex_recheck') else None
                     if fallback and fallback['status']=='valid':
                         event=fallback
                     else:
                         if fallback:event['nextcloud_alternative']=fallback
                         ledger=self.state/'recovery-state.json'
                         saved=json.loads(ledger.read_text()).get(event['path'],{}) if self.fallback and ledger.exists() else {}
-                        if not (job.get('fallback_only') or not self.retry_check and saved.get('state')=='finished' and self.range_result_current(job['item'],saved.get('event',{}))):
+                        if job.get('yandex_recheck') or not (job.get('fallback_only') or not self.retry_check and saved.get('state')=='finished' and self.range_result_current(job['item'],saved.get('event',{}))):
+                            checked_yandex = True
+                            if job.get('yandex_recheck') and event.get('sha256_mismatch'):
+                                r.new_recovery_body(self.root,event,'Daily Yandex recheck of SHA-rejected bytes; keep previous body')
                             r.finish_recovery(self.root, event, job['item'], self.retries, tuning=self.tuning,
                                               stopping=self.stopping, download_active=self.download_active if self.budget is None else None,
                                               background=True, request_budget=self.budget, metrics=self.metrics)
@@ -312,6 +320,11 @@ class Background:
                     event['recovery_error'] = str(error)
                     print('RECOVERY ERROR: ' + event['path'] + '; ' + type(error).__name__, flush=True)
                     r.recovery_state(self.root, event, 'finished')
+                if checked_yandex:
+                    job['yandex_checked_at'] = now()
+                if job.get('yandex_recheck'):
+                    self.metrics.add(yandex_rechecks=1, yandex_recheck_full_files=int(event.get('range_recovered_complete',False)))
+                    print('YANDEX RECHECK FINISHED: ' + event['path'] + '; full=' + str(bool(event.get('range_recovered_complete'))) + '; checked_at=' + job.get('yandex_checked_at',''), flush=True)
                 result = dict(event=event)
             seconds = time.monotonic()-started
             if job['kind'] == 'sha':

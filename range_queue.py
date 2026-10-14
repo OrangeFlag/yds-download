@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Recover durable Range tasks across archives without blocking ordinary downloads."""
 import argparse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import fcntl
@@ -10,6 +11,8 @@ from pathlib import Path
 import signal
 import subprocess
 import math
+import hashlib
+from datetime import datetime
 from threading import Event, Lock, Semaphore
 import time
 
@@ -85,8 +88,11 @@ class JsonCache:
                                    source=job['source'], attempt=job['attempt'],
                                    item={key: item[key] for key in ('path', 'size', 'sha256', 'file') if key in item},
                                    superseded_by_manifest=job.get('superseded_by_manifest', False),
+                                   yandex_recheck=job.get('yandex_recheck',False),
+                                   yandex_checked_at=job.get('yandex_checked_at'),
                                    result={'event': {'range_recovered_complete':
-                                       job.get('result', {}).get('event', {}).get('range_recovered_complete', False)}})
+                                       job.get('result', {}).get('event', {}).get('range_recovered_complete', False),
+                                       'status':job.get('result',{}).get('event',{}).get('status')}})
             current[path] = file_stamp, summary
         tasks = [(path, row) for path, (_, row) in current.items() if row is not None]
         self.directories[directory] = stamp, current, tasks
@@ -229,11 +235,62 @@ def fallback_due(fallback,job):
             and fallback.ready(job['item']))
 
 
-def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60, nextcloud_fallback=None):
+def yandex_checked_time(job):
+    try:return datetime.fromisoformat(job.get('yandex_checked_at')).timestamp()
+    except (TypeError,ValueError):return 0
+
+
+def recheck_due(job, interval, timestamp=None):
+    result=job.get('result',{}).get('event',{})
+    if (not interval or job['kind']!='range' or job['state']!='applied'
+            or job.get('superseded_by_manifest') or result.get('range_recovered_complete')
+            or result.get('status')=='valid'):
+        return False
+    last=yandex_checked_time(job)
+    if not last:return True
+    return (time.time() if timestamp is None else timestamp)-last>=interval
+
+
+def seed_legacy_tasks(background):
+    """Convert legacy failed manifests to replayable tasks under the archive lock."""
+    root,state=background.root,background.state
+    marker=state/'legacy-recheck-seeded.json'
+    if marker.exists() and json.loads(marker.read_text()).get('complete'):return
+    aggregate=root/'corrupted/failed.json'
+    paths=[aggregate] if aggregate.exists() else list((root/'corrupted').glob('*/failed.json'))
+    failures={row['path']:row for path in paths for row in json.loads(path.read_text())}
+    ledger=state/'recovery-state.json'
+    saved=json.loads(ledger.read_text()) if ledger.exists() else {}
+    count=0
+    for index,course in enumerate(json.loads((state/'courses.json').read_text()),1):
+        for item in json.loads((state/f'{index:02d}-manifest.json').read_text()):
+            event=failures.get(item['path'])
+            if not event or (event.get('size'),event.get('sha256'))!=(item['size'],item['sha256']):continue
+            previous=saved.get(item['path'],{}).get('event',{})
+            if r.prefer_saved_event(root,event,previous):event=previous
+            if event.get('status')=='valid' or event.get('range_recovered_complete'):continue
+            r.body_path(root,event)
+            item=dict(item,file=background.source)
+            d.target(root,item,course)
+            key=hashlib.sha256(json.dumps([background.source,item['path'],item['size'],item['sha256'],'range']).encode()).hexdigest()
+            path=background.directory/(key+'.json')
+            if path.exists():continue
+            d.write_json(path,dict(kind='range',state='applied',source=background.source,item=item,course=course,
+                                  attempt=event.get('attempt',background.retries+1),event=event,result={'event':event},time=now()))
+            count+=1
+    d.write_json(marker,dict(complete=True,time=now(),files_seeded=count))
+    if count:print('YANDEX RECHECK LEGACY QUEUED: '+str(root)+'; files='+str(count),flush=True)
+
+
+def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60, nextcloud_fallback=None, recheck_interval=0, recheck_files=8):
     if files < 1 or per_file < 1:
         raise ValueError('Range file limits must be positive')
     if not 1 <= secondary_slots <= max(1, files - 1):
         raise ValueError('Secondary slots must leave a slot for the first queue')
+    if not math.isfinite(recheck_interval) or recheck_interval<0 or recheck_files<1:
+        raise ValueError('Recheck interval must be nonnegative and recheck files positive')
+    if recheck_interval and len(queues)>1 and recheck_files<2:
+        raise ValueError('Rechecks across queues require at least two file slots')
     stopping = stopping if stopping is not None else Event()
     if budget_directory is None:
         budget = RangeBudget(requests, rps)
@@ -244,9 +301,11 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
     roots = {}
     priorities = {}
     fallbacks = {}
+    recheck_roots = {}
+    recheck_limits = ([recheck_files] if len(queues)==1 else [(recheck_files+1)//2,recheck_files//2])
     with Metrics(queues[0].with_suffix('.range.metrics.jsonl'),'range-queue',interval=metrics_interval,
-                 settings=dict(files=files,per_file=per_file,requests=requests,rps=rps,secondary_slots=secondary_slots)) as metrics, \
-            ThreadPoolExecutor(max_workers=files, thread_name_prefix='range-file') as pool:
+                 settings=dict(files=files,per_file=per_file,requests=requests,rps=rps,secondary_slots=secondary_slots,recheck_interval=recheck_interval,recheck_files=recheck_files)) as metrics, \
+            ThreadPoolExecutor(max_workers=files+(recheck_files if recheck_interval else 0), thread_name_prefix='range-file') as pool:
         try:
             while not stopping.is_set():
                 for queue in queues:
@@ -259,9 +318,17 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                     if len(background.futures) != before:
                         finish_courses(background, config, changed_courses)
                 eligible = []
+                rechecks = []
+                recheck_times = {}
                 for priority, queue in enumerate(queues):
                     config = cache.read(queue)
-                    for archive in config['archives']:
+                    archives=list(config['archives'])
+                    predecessor=config.get('wait_for',{}).get('destination')
+                    if recheck_interval and predecessor and all(row['destination']!=predecessor for row in archives):
+                        old_root=Path(predecessor)
+                        if (old_root/'.download/catalog.json').exists():
+                            archives.insert(0,dict(destination=predecessor,catalog=str(old_root/'.download/catalog.json'),state='finished',legacy_recheck=True))
+                    for archive in archives:
                         if not archive.get('enabled', True):
                             continue
                         root = Path(archive['destination']).resolve()
@@ -279,7 +346,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                             if root not in fallbacks or fallbacks[root].link!=link:
                                 fallbacks[root]=Fallback(root,link,stopping)
                             fallback=fallbacks[root]
-                        if not summary.get('pending_courses') and not any(job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or fallback_due(fallback,job)) for _, job in tasks):
+                        legacy=recheck_interval and archive.get('legacy_recheck') and not cache.read(state/'legacy-recheck-seeded.json',{}).get('complete')
+                        if not legacy and not summary.get('pending_courses') and not any(job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or recheck_due(job,recheck_interval) or fallback_due(fallback,job)) for _, job in tasks):
                             continue
                         if root not in roots:
                             lock = (state / 'download.lock').open('a')
@@ -305,6 +373,9 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                             background.event_index = EventIndex(state / 'events.jsonl')
                             background.cached_events = background.event_index.refresh()
                             background.task_cache = cache
+                            if legacy:
+                                seed_legacy_tasks(background)
+                                tasks=cache.tasks(state/'tasks')
                             background.manifest_items = {(course, item['path']): (item['size'], item['sha256'])
                                 for index, course in enumerate(cache.read(state / 'courses.json'), 1)
                                 for item in cache.read(state / f'{index:02d}-manifest.json')}
@@ -323,7 +394,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         for path, job in tasks:
                             if path in background.futures:
                                 continue
-                            if job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or fallback_due(fallback,job)):
+                            checking=bool(recheck_interval and (job.get('yandex_recheck') and job['state']!='applied' or recheck_due(job,recheck_interval)))
+                            if job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or checking or fallback_due(fallback,job)):
                                 if job['source'] != background.source:
                                     raise ValueError('Range task source mismatch')
                                 d.target(root, job['item'], job['course'])
@@ -346,16 +418,19 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                     if retire_cached_copy(background, path, json.loads(path.read_text()), proofs):
                                         retired.add(job['course'])
                                         continue
-                                eligible.append((priority, background, path))
+                                (rechecks if checking else eligible).append((priority, background, path))
+                                if checking:recheck_times[path]=(job['state']=='applied',yandex_checked_time(job))
                         if retired:
                             finish_courses(background, config, retired)
-                active = sum(len(background.futures) for background, _, _ in roots.values())
+                def is_recheck(background,path):
+                    return bool(recheck_interval and background.jobs[path].get('yandex_recheck'))
+                active = sum(not is_recheck(bg,path) for bg,_,_ in roots.values() for path in bg.futures)
                 while eligible and active < files:
                     # Reserve slots for courses while retaining priority for personal files.
                     chosen = 0
                     if len(queues) > 1 and any(row[0] > 0 for row in eligible):
-                        first_active = sum(len(bg.futures) for bg, _, config in roots.values()
-                                           if priorities[bg.root] == 0)
+                        first_active = sum(not is_recheck(bg,path) for bg,_,_ in roots.values()
+                                           if priorities[bg.root] == 0 for path in bg.futures)
                         if first_active >= max(1, files - secondary_slots):
                             chosen = next(i for i, row in enumerate(eligible) if row[0] > 0)
                     _, background, path = eligible.pop(chosen)
@@ -363,9 +438,26 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                     print('RANGE START: ' + str(background.root) + job['item']['path'], flush=True)
                     background.submit('range', job['item'], job['course'], job['attempt'], job['event'],force=job['state']=='applied',fallback_only=job['state']=='applied')
                     active += 1
+                checking_active=Counter(min(priorities[bg.root],1) for bg,_,_ in roots.values()
+                                        for path in bg.futures if is_recheck(bg,path))
+                rechecks.sort(key=lambda row:recheck_times[row[2]])
+                for group,limit in enumerate(recheck_limits):
+                    while checking_active[group]<limit:
+                        options=[row for row in rechecks if min(row[0],1)==group]
+                        if not options:break
+                        candidates=list(dict.fromkeys(row[1].root for row in options))
+                        previous=recheck_roots.get(group)
+                        root=candidates[(candidates.index(previous)+1)%len(candidates)] if previous in candidates else candidates[0]
+                        row=next(row for row in options if row[1].root==root);rechecks.remove(row)
+                        _,background,path=row;job=json.loads(path.read_text())
+                        event=job.get('result',{}).get('event') or job['event']
+                        print('YANDEX RECHECK START: '+str(background.root)+job['item']['path'],flush=True)
+                        background.submit('range',job['item'],job['course'],job['attempt'],event,
+                                          force=job['state']=='applied',yandex_recheck=True)
+                        recheck_roots[group]=root;checking_active[group]+=1
                 for root, (background, lock, config) in list(roots.items()):
                     if not background.futures:
-                        if any(row[1] is background for row in eligible):
+                        if any(row[1] is background for row in eligible+rechecks):
                             continue
                         if cache.read(background.state / 'summary.json', {}).get('pending_courses'):
                             finish_courses(background, config)
@@ -374,6 +466,9 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         del roots[root]
                 metrics.gauge('range_active_files',sum(len(bg.futures) for bg,_,_ in roots.values()))
                 metrics.gauge('range_eligible_files',len(eligible))
+                metrics.gauge('range_recheck_active_files',sum(checking_active.values()))
+                metrics.gauge('range_recheck_eligible_files',len(rechecks))
+                metrics.gauge('range_regular_active_files',active)
                 metrics.gauge('archives_owned',len(roots))
                 stopping.wait(2)
         finally:
@@ -399,6 +494,8 @@ def main():
     parser.add_argument('--metrics-interval',type=int,default=60,help='Service metrics interval, seconds')
     parser.add_argument('--budget', type=Path, help='Share the HTTP budget with overlapping ordinary downloaders')
     parser.add_argument('--nextcloud-fallback',help='Also backfill completed failed course tasks from this public share')
+    parser.add_argument('--recheck-interval',type=float,default=0,help='Seconds between completed Yandex rechecks; 0 disables')
+    parser.add_argument('--recheck-files',type=int,default=8,help='Extra recheck file slots, split between first and later queues')
     args = parser.parse_args()
     stopping = Event()
     for number in (signal.SIGINT, signal.SIGTERM):
@@ -406,7 +503,7 @@ def main():
     # Prevent two workers from multiplying the global limits.
     with args.queue[0].with_suffix('.range.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget, args.metrics_interval, args.nextcloud_fallback)
+        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget, args.metrics_interval, args.nextcloud_fallback,args.recheck_interval,args.recheck_files)
 
 
 if __name__ == '__main__':

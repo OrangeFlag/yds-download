@@ -15,6 +15,36 @@ from test_regressions import Response
 
 
 class ResumeChecks(unittest.TestCase):
+    def test_daily_yandex_recheck_downloads_only_missing_confirmed_ranges(self):
+        import pipeline
+        recovery.recovery_state(self.root,self.event,'finished')
+        background=pipeline.Background(self.root,self.source,2,settings.resolve(),defer_range=True)
+        self.addCleanup(background.close)
+        background.submit('range',self.item,'Course',3,self.event,force=True,yandex_recheck=True)
+        path=next(iter(background.jobs))
+        with patch.object(download.OPENER,'open',side_effect=self.serve):
+            job=background.work(path,background.jobs[path])
+        self.assertEqual(self.requests,[(64,128)])
+        self.assertEqual((self.root/'Course/video.mp4').read_bytes(),self.content)
+        self.assertEqual(self.body.read_bytes(),self.content)
+        self.assertTrue(job['result']['event']['range_recovered_complete'])
+        self.assertIn('yandex_checked_at',job)
+
+    def test_daily_recheck_preserves_sha_rejected_body_and_fetches_fresh_bytes(self):
+        import pipeline
+        damaged=b'B'*128;self.body.write_bytes(damaged)
+        download.write_json(Path(str(self.body)+'.ranges.json'),dict(size=128,sha256=self.item['sha256'],ranges=[[0,128]]))
+        self.event.update(sha256_mismatch=True,sha256_rejected_paths=[self.event['corrupted_path']])
+        recovery.recovery_state(self.root,self.event,'finished')
+        background=pipeline.Background(self.root,self.source,2,settings.resolve(),defer_range=True);self.addCleanup(background.close)
+        background.submit('range',self.item,'Course',3,self.event,force=True,yandex_recheck=True)
+        path=next(iter(background.jobs))
+        with patch.object(download.OPENER,'open',side_effect=self.serve):job=background.work(path,background.jobs[path])
+        self.assertEqual(self.requests,[(0,128)])
+        self.assertEqual(self.body.read_bytes(),damaged)
+        self.assertEqual((self.root/'Course/video.mp4').read_bytes(),self.content)
+        self.assertTrue(job['result']['event']['range_recovered_complete'])
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

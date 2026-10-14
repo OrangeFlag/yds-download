@@ -17,6 +17,140 @@ from settings import resolve
 
 
 class SharedRangeChecks(unittest.TestCase):
+    def test_daily_recheck_cooldown_and_verified_exclusions(self):
+        from datetime import datetime, timezone
+        stamp = datetime.now(timezone.utc)
+        job = dict(kind='range', state='applied', result={'event': {'status': 'missing'}})
+        self.assertTrue(q.recheck_due(job, 86400, stamp.timestamp()))
+        self.assertFalse(q.recheck_due(job, 0, stamp.timestamp()))
+        job['yandex_checked_at'] = stamp.isoformat()
+        self.assertFalse(q.recheck_due(job, 86400, stamp.timestamp()+86399))
+        self.assertTrue(q.recheck_due(job, 86400, stamp.timestamp()+86401))
+        job['result']['event']['range_recovered_complete'] = True
+        self.assertFalse(q.recheck_due(job, 86400, stamp.timestamp()+86401))
+        job['result']['event'] = {'status': 'valid'}
+        self.assertFalse(q.recheck_due(job, 86400, stamp.timestamp()+86401))
+        job['result']['event'] = {'status': 'invalid'}
+        job['superseded_by_manifest'] = True
+        self.assertFalse(q.recheck_due(job, 86400, stamp.timestamp()+86401))
+
+    def test_recheck_timestamp_survives_compact_cache_restart(self):
+        from datetime import datetime, timezone
+        with tempfile.TemporaryDirectory() as folder:
+            directory=Path(folder);stamp=datetime.now(timezone.utc)
+            d.write_json(directory/'task.json',dict(kind='range',state='applied',course='Course',source='test',attempt=3,
+                item=dict(path='/Course/video.mp4',size=7,sha256='a'*64),
+                yandex_recheck=True,yandex_checked_at=stamp.isoformat(),result={'event':{'status':'invalid'}}))
+            _,job=q.JsonCache().tasks(directory)[0]
+            self.assertFalse(q.recheck_due(job,86400,stamp.timestamp()+60))
+            self.assertTrue(q.recheck_due(job,86400,stamp.timestamp()+86401))
+
+    def test_legacy_tasks_are_seeded_once_using_latest_saved_body(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);state=root/'.download';directory=state/'tasks';directory.mkdir(parents=True)
+            item=dict(path='/Course/video.mp4',size=7,sha256=hashlib.sha256(b'lecture').hexdigest())
+            event=dict(item,course='Course',attempt=3,status='invalid',corrupted_path='corrupted/old/Course/video.mp4')
+            (root/'corrupted').mkdir()
+            d.write_json(root/'corrupted/failed.json',[event])
+            d.write_json(state/'courses.json',['Course']);d.write_json(state/'01-manifest.json',[item])
+            latest=dict(event,recovered_path='Course/video (partially available).mp4')
+            d.write_json(state/'recovery-state.json',{item['path']:dict(state='finished',event=latest)})
+            bg=SimpleNamespace(root=root,state=state,directory=directory,source='https://disk.yandex.ru/d/test',retries=2)
+            q.seed_legacy_tasks(bg);q.seed_legacy_tasks(bg)
+            paths=list(directory.glob('*.json'));self.assertEqual(len(paths),1)
+            job=json.loads(paths[0].read_text());self.assertTrue(q.recheck_due(job,86400))
+            self.assertEqual(job['event']['recovered_path'],latest['recovered_path'])
+            self.assertEqual(job['item']['sha256'],item['sha256'])
+
+    def test_legacy_seed_resumes_after_interruption(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);state=root/'.download';directory=state/'tasks';directory.mkdir(parents=True);(root/'corrupted').mkdir()
+            entries=[dict(path=f'/Course/{i}.mp4',size=7,sha256=hashlib.sha256(b'lecture').hexdigest()) for i in range(3)]
+            events=[dict(item,course='Course',attempt=3,status='invalid',corrupted_path='corrupted/old'+item['path']) for item in entries]
+            d.write_json(root/'corrupted/failed.json',events);d.write_json(state/'courses.json',['Course']);d.write_json(state/'01-manifest.json',entries)
+            bg=SimpleNamespace(root=root,state=state,directory=directory,source='https://disk.yandex.ru/d/test',retries=2)
+            original=d.write_json;calls=[]
+            def interrupted(path,row):
+                if path.parent==directory:
+                    calls.append(path)
+                    if len(calls)==2:raise InterruptedError('seed interrupted')
+                return original(path,row)
+            with patch.object(d,'write_json',side_effect=interrupted):
+                with self.assertRaises(InterruptedError):q.seed_legacy_tasks(bg)
+            self.assertEqual(len(list(directory.glob('*.json'))),1)
+            source=bg.source;d.write_json(state/'source.json',dict(source=source));d.write_json(state/'catalog.json',dict(source=source))
+            d.write_json(state/'settings.json',dict(retries=2,tuning=resolve()));d.write_json(state/'summary.json',dict(downloads_complete=True,pending_courses=[]))
+            d.write_json(state/'course-history.json',{'Course':dict(state='finished',failed=3)})
+            queue=state/'queue.json';d.write_json(queue,dict(archives=[],wait_for={'destination':str(root)}));stopping=Event()
+            with patch('recovery.finish_recovery',side_effect=lambda *a,**kw:stopping.set()):
+                q.run([queue],files=1,stopping=stopping,recheck_interval=86400,recheck_files=1)
+            self.assertEqual(len(list(directory.glob('*.json'))),3)
+            self.assertTrue(json.loads((state/'legacy-recheck-seeded.json').read_text())['complete'])
+
+    def test_never_checked_file_precedes_older_hash_sorted_retry(self):
+        from datetime import datetime,timezone,timedelta
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);state=root/'.download';(state/'tasks').mkdir(parents=True);source='https://disk.yandex.ru/d/test';stopping=Event()
+            d.write_json(state/'source.json',dict(source=source));d.write_json(state/'catalog.json',dict(source=source))
+            d.write_json(state/'settings.json',dict(retries=2,tuning=resolve()));d.write_json(state/'courses.json',['Course'])
+            d.write_json(state/'summary.json',dict(downloads_complete=True,pending_courses=[]));d.write_json(state/'course-history.json',{'Course':dict(state='finished',failed=2)})
+            entries=[dict(path=f'/Course/{i}.mp4',size=7,sha256=hashlib.sha256(b'lecture').hexdigest(),file='https://example.invalid/video') for i in range(2)]
+            keys=[hashlib.sha256(json.dumps([source,item['path'],item['size'],item['sha256'],'range']).encode()).hexdigest() for item in entries]
+            old_index=keys.index(min(keys));never=entries[1-old_index]['path']
+            for i,item in enumerate(entries):
+                event=dict(item,course='Course',attempt=3,status='missing',corrupted_path='corrupted/old'+item['path'])
+                job=dict(kind='range',state='applied',source=source,item=item,course='Course',attempt=3,event=event,result={'event':event})
+                if i==old_index:job['yandex_checked_at']=(datetime.now(timezone.utc)-timedelta(days=2)).isoformat()
+                d.write_json(state/'tasks'/(keys[i]+'.json'),job)
+            d.write_json(state/'01-manifest.json',entries);queue=state/'queue.json';d.write_json(queue,dict(archives=[dict(destination=str(root),catalog=str(state/'catalog.json'))]))
+            selected=[]
+            def recover(root,event,item,*args,**kwargs):selected.append(item['path']);stopping.set()
+            with patch('recovery.finish_recovery',side_effect=recover):q.run([queue],files=1,stopping=stopping,recheck_interval=86400,recheck_files=1)
+            self.assertEqual(selected,[never])
+
+    def test_recheck_slots_are_added_and_split_between_personal_and_courses(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder); queues = []; stopping = Event(); gate = Event(); mutex = Lock(); started = []
+            content = b'lecture'; digest = hashlib.sha256(content).hexdigest()
+            for group in ('personal', 'courses'):
+                root = base/group; state = root/'.download'; (state/'tasks').mkdir(parents=True)
+                source = 'https://disk.yandex.ru/d/'+group
+                d.write_json(state/'source.json', dict(source=source))
+                d.write_json(state/'catalog.json', dict(source=source))
+                d.write_json(state/'settings.json', dict(retries=2, tuning=resolve()))
+                d.write_json(state/'courses.json', ['Course'])
+                d.write_json(state/'summary.json', dict(downloads_complete=True, pending_courses=['Course']))
+                d.write_json(state/'course-history.json', {'Course': dict(state='recovering')})
+                entries = []
+                for index in range(12):
+                    checking = index>=8
+                    item = dict(path=f'/Course/{index}.mp4', size=len(content), sha256=digest, file='https://example.invalid/video')
+                    event = dict(item, course='Course', attempt=3, status='missing', corrupted_path='corrupted/old'+item['path'], checking=checking)
+                    key = hashlib.sha256(json.dumps([source, item['path'], item['size'], item['sha256'], 'range']).encode()).hexdigest()
+                    job = dict(kind='range', state='applied' if checking else 'pending', source=source,
+                               item=item, course='Course', attempt=3, event=event, result={'event': event})
+                    d.write_json(state/'tasks'/(key+'.json'), job); entries.append(item)
+                d.write_json(state/'01-manifest.json', entries)
+                queue = state/'queue.json';d.write_json(queue,dict(archives=[dict(destination=str(root),catalog=str(state/'catalog.json'))]));queues.append(queue)
+            def recover(root, event, item, *args, **kwargs):
+                with mutex:
+                    started.append((root.name, event['checking']))
+                    if len(started)==24:gate.set()
+                self.assertTrue(gate.wait(5), 'Extra rechecks blocked normal slots')
+                local=d.target(root,item,'Course');local.parent.mkdir(exist_ok=True);local.write_bytes(content)
+                proof=d.record(root/'.download',item,'Course',3,'valid','verified')
+                event.update(proof,range_recovered_complete=True,recovered_stat=q.Background.stat(local))
+                stopping.set()
+            with patch('recovery.finish_recovery',side_effect=recover):
+                q.run(queues,files=16,secondary_slots=8,stopping=stopping,recheck_interval=86400,recheck_files=8)
+            from collections import Counter
+            self.assertEqual(Counter(started),{('personal',False):8,('courses',False):8,('personal',True):4,('courses',True):4})
+            for queue in queues:
+                for path in (queue.parent/'tasks').glob('*.json'):
+                    row=json.loads(path.read_text());self.assertIn('yandex_checked_at',row)
+
     def test_budget_bounds_concurrency_and_request_start_rate(self):
         budget = q.RangeBudget(2, 50)
         mutex = Lock()

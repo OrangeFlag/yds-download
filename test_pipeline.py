@@ -18,6 +18,37 @@ import pipeline
 
 
 class PipelineChecks(unittest.TestCase):
+    def test_daily_recheck_bypasses_saved_finished_and_fallback_only(self):
+        from settings import resolve
+        state=self.root/'.download';state.mkdir()
+        item=self.items['First'];event=dict(item,course='First',attempt=3,status='missing',corrupted_path='corrupted/old/First/video.mp4')
+        download.write_json(state/'recovery-state.json',{item['path']:dict(state='finished',event=event)})
+        bg=pipeline.Background(self.root,self.data['source'],2,resolve(),defer_range=True)
+        self.addCleanup(bg.close)
+        bg.submit('range',item,'First',3,event,fallback_only=True)
+        path=next(iter(bg.jobs));bg.submit('range',item,'First',3,event,force=True,yandex_recheck=True)
+        with patch.object(recovery,'finish_recovery') as recover:
+            job=bg.work(path,bg.jobs[path])
+        recover.assert_called_once()
+        self.assertFalse(job.get('fallback_only',False))
+        self.assertTrue(job['yandex_recheck'])
+        checked=job['yandex_checked_at']
+        bg.submit('range',item,'First',3,event,force=True,fallback_only=True)
+        self.assertEqual(bg.jobs[path]['yandex_checked_at'],checked)
+
+    def test_interrupted_daily_task_is_not_satisfied_by_old_finished_partial(self):
+        from settings import resolve
+        state=self.root/'.download';state.mkdir()
+        item=self.items['First'];event=dict(item,course='First',attempt=3,status='missing',corrupted_path='corrupted/old/First/video.mp4')
+        download.write_json(state/'recovery-state.json',{item['path']:dict(state='finished',event=event)})
+        first=pipeline.Background(self.root,self.data['source'],2,resolve(),defer_range=True)
+        first.submit('range',item,'First',3,event,force=True,yandex_recheck=True);first.close()
+        resumed=pipeline.Background(self.root,self.data['source'],2,resolve(),defer_range=True);self.addCleanup(resumed.close)
+        resumed.submit('range',item,'First',3,event)
+        path=next(iter(resumed.jobs));self.assertEqual(resumed.jobs[path]['state'],'pending')
+        with patch.object(recovery,'finish_recovery') as recover:resumed.work(path,resumed.jobs[path])
+        recover.assert_called_once()
+
     def setUp(self):
         connectivity = patch('network.RequestRetry.retry', return_value=False)
         connectivity.start()
