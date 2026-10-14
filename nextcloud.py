@@ -254,7 +254,7 @@ class Sync:
             return default
         stat = path.stat();stamp=(stat.st_ino,stat.st_size,stat.st_mtime_ns)
         if path not in self.cache or self.cache[path][0]!=stamp:
-            value = d.read_events(path) if path.suffix=='.jsonl' else json.loads(path.read_text())
+            value = json.loads(path.read_text())
             self.cache[path] = stamp,value
         return self.cache[path][1]
 
@@ -336,7 +336,11 @@ class Sync:
         old=ledger.get(key,{})
         journal=state.with_suffix('.jsonl')
         if old and old.get('state')!='uploaded' and journal.exists():
-            completed=next((e for e in reversed(self.read(journal,[])) if e.get('key')==key and e.get('state')=='uploaded' and e.get('upload_id')==old.get('upload_id')),None)
+            completed = None
+            for entry in d.iter_events(journal):
+                if (entry.get('key') == key and entry.get('state') == 'uploaded'
+                        and entry.get('upload_id') == old.get('upload_id')):
+                    completed = entry
             if completed:
                 ledger[key]=completed;d.write_json(state,ledger)
                 return
