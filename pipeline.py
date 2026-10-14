@@ -489,7 +489,7 @@ class Background:
             self.metrics.close()
 
 
-def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range=False, range_budget=None, range_files=16):
+def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range=False, range_budget=None, range_files=16, nextcloud_existing=None):
     storage.check(root)
     tuning = resolve(tuning)
     if not all(shutil.which(name) for name in ('aria2c', 'cp')):
@@ -504,7 +504,16 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
         if identity.exists() and json.loads(identity.read_text())['source'] != source:
             raise ValueError('Use a separate destination for a different public folder/year')
         d.write_json(identity, dict(source=source, title=data['title']))
-        d.write_json(state / 'settings.json', dict(retries=retries, deep=False, retry_check=retry_check, tuning=tuning, defer_range=defer_range))
+        d.write_json(state / 'settings.json', dict(retries=retries, deep=False, retry_check=retry_check, tuning=tuning, defer_range=defer_range, nextcloud_existing=nextcloud_existing))
+        remote_index = None
+        remote_files = {}
+        if nextcloud_existing:
+            from nextcloud import Index
+            remote_index = Index(root, nextcloud_existing)
+            saved_path=state/'nextcloud-existing.json'
+            saved=json.loads(saved_path.read_text()) if saved_path.exists() else {}
+            if saved.get('source')==source and saved.get('share')==remote_index.link:
+                remote_files=saved.get('files',{})
         events = {row['path']: row for row in d.read_events(state / 'events.jsonl', repair=True)}
         history_path = state / 'course-history.json'
         history = json.loads(history_path.read_text()) if history_path.exists() else {}
@@ -582,9 +591,10 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                                 and not Path(str(local) + '.aria2').exists()):
                             valid += 1
                             break
+                remote = sum(item['path'] in remote_files for item in entries)
                 status = dict(course=course, source=source, state=('recovering' if any(job['kind'] == 'range' for job in jobs) else 'verifying') if waiting else 'finished',
-                              complete=not waiting and valid == len(entries), total=len(entries), verified=valid,
-                              failed=0 if waiting else len(entries) - valid, pending=len(entries) - valid if waiting else 0, time=now())
+                              complete=not waiting and valid + remote == len(entries), total=len(entries), verified=valid, remote_available=remote,
+                              failed=0 if waiting else len(entries) - valid - remote, pending=len(entries) - valid - remote if waiting else 0, time=now())
                 if not waiting and report_repo:
                     from report import queue_report
                     queue_report(root, report_repo, mark, git_push,
@@ -595,7 +605,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                     d.write_json(history_path, history)
                 if not waiting:
                     del active[course]
-                    print(('COURSE VERIFIED COMPLETE: ' if status['complete'] else 'COURSE FINISHED WITH ERRORS: ') + course, flush=True)
+                    print(('COURSE AVAILABLE: ' if status['complete'] and remote else 'COURSE VERIFIED COMPLETE: ' if status['complete'] else 'COURSE FINISHED WITH ERRORS: ') + course, flush=True)
             summary = dict(verified=sum(history.get(course, {}).get('verified', 0) for course in courses),
                          failed=sum(history.get(course, {}).get('failed', 0) for course in courses),
                          pending_courses=list(active), complete=False)
@@ -611,7 +621,8 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                 finalize()
                 events.update({path: row for path, row in proofs.items() if row['status'] == 'valid'})
                 previous = history.get(course, {})
-                if previous.get('state') == 'finished' and previous.get('source') == source and not (retry_check and previous.get('failed')):
+                if (previous.get('state') == 'finished' and previous.get('source') == source
+                        and not (retry_check and previous.get('failed')) and not previous.get('remote_available')):
                     d.write_json(state / f'{index:02d}-status.json', previous)
                     print('COURSE SKIPPED: ' + course, flush=True)
                     continue
@@ -630,12 +641,21 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                 active[course] = index, entries
                 pending = []
                 for item in entries:
+                    remote_files.pop(item['path'],None)
+                    if remote_index:
+                        d.write_json(state/'nextcloud-existing.json',dict(source=source,share=remote_index.link,files=remote_files))
                     cached = events.get(item['path'], {})
                     local = Path(cached['local']) if cached.get('local') and cached.get('status') == 'valid' else d.target(root, item, course)
                     if (cached.get('status') == 'valid' and (cached.get('size'), cached.get('sha256')) == (item['size'], item['sha256'])
                             and local.exists() and local.stat().st_size == item['size']
                             and ('mtime_ns' not in cached or local.stat().st_mtime_ns == cached['mtime_ns'])
                             and not Path(str(local) + '.aria2').exists()):
+                        continue
+                    if remote_index and remote_index.contains(data,item):
+                        remote_files[item['path']] = {key:item[key] for key in ('size','sha256')}
+                        d.write_json(state/'nextcloud-existing.json',dict(source=source,share=remote_index.link,files=remote_files))
+                        background.checkpoint(item,course,0,'remote')
+                        print('NEXTCLOUD SKIPPED: '+item['path'],flush=True)
                         continue
                     archived = candidates.get(item['path'], (None, None))[1]
                     continuation = background.continuation(item)
@@ -699,6 +719,6 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             background.close()
         failed = sum(history[course]['failed'] for course in courses)
         verified = sum(history[course]['verified'] for course in courses)
-        d.write_json(state / 'summary.json', dict(verified=verified, failed=failed, pending_courses=list(active), downloads_complete=True, complete=not failed and not active))
+        d.write_json(state / 'summary.json', dict(verified=verified, remote_available=sum(history[course].get('remote_available',0) for course in courses), failed=failed, pending_courses=list(active), downloads_complete=True, complete=not failed and not active))
         print(f'ALL SELECTED COURSES PROCESSED: verified={verified}, failed={failed}', flush=True)
         return 1 if failed or active else 0

@@ -23,6 +23,7 @@ def main():
     parser.add_argument('--defer-range', action='store_true', help='Continue archives while range_queue.py recovers failures')
     parser.add_argument('--range-budget', type=Path, help='Shared budget directory for overlapping foreground and worker Range')
     parser.add_argument('--range-files', type=int, default=16)
+    parser.add_argument('--nextcloud-existing', help='Skip originals already available in this public Nextcloud share')
     args = parser.parse_args()
     if args.range_budget is not None and (not args.defer_range or args.range_files < 1):
         parser.error('--range-budget requires --defer-range and positive --range-files')
@@ -52,12 +53,15 @@ def main():
             metrics.gauge('current_archive',job['title'])
             if job.get('enabled', True):
                 retry_reports(Path(job['destination']))
-            if not job.get('enabled', True) or ((job.get('state') == 'finished' or (args.defer_range and job.get('downloads_complete'))) and not (data.get('deep', False) or data.get('retry_check', False))):
+            summary_path = Path(job['destination']) / '.download/summary.json'
+            summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+            remote_archive = bool(summary.get('remote_available'))
+            if not job.get('enabled', True) or ((job.get('state') == 'finished' or (args.defer_range and job.get('downloads_complete'))) and not (data.get('deep', False) or data.get('retry_check', False) or remote_archive)):
                 continue
             if args.defer_range and not (data.get('deep') or data.get('retry_check')):
                 summary_path = Path(job['destination']) / '.download/summary.json'
                 summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
-                if summary.get('downloads_complete'):
+                if summary.get('downloads_complete') and not remote_archive:
                     job.update(downloads_complete=True, state='recovering' if summary.get('pending_courses') else 'finished')
                     write_json(path, data)
                     continue
@@ -70,6 +74,8 @@ def main():
                        '--catalog', job['catalog'], '--destination', job['destination'],
                        '--retries', str(data.get('retries', 2))]
             command += arguments({**data.get('tuning', {}), **job.get('tuning', {})})
+            if args.nextcloud_existing:
+                command += ['--nextcloud-existing', args.nextcloud_existing]
             if args.defer_range and not data.get('deep'):
                 command += ['--defer-range']
                 if args.range_budget is not None:

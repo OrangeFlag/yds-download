@@ -129,6 +129,7 @@ def finish_courses(background, config, changed_courses=()):
             continue
         entries = json.loads((state / f'{index:02d}-manifest.json').read_text())
         valid = 0
+        verified_paths=set()
         for item in entries:
             for proof in (events.get(item['path'], {}), external.get(item['path'], {})):
                 # Manifests deliberately omit expiring URLs; only the destination is needed here.
@@ -138,21 +139,26 @@ def finish_courses(background, config, changed_courses=()):
                         and ('mtime_ns' not in proof or local.stat().st_mtime_ns == proof['mtime_ns'])
                         and not Path(str(local) + '.aria2').exists()):
                     valid += 1
+                    verified_paths.add(item['path'])
                     break
+        from nextcloud import remote_saved
+        settings=json.loads((state/'settings.json').read_text())
+        remote=sum(remote_saved(state,item,settings.get('nextcloud_existing')) for item in entries
+                   if item['path'] not in verified_paths)
         status = dict(course=course, source=background.source, state='recovering' if pending else 'finished',
-                      complete=not pending and valid == len(entries), total=len(entries), verified=valid,
-                      failed=0 if pending else len(entries) - valid, pending=len(entries) - valid if pending else 0, time=now())
+                      complete=not pending and valid + remote == len(entries), total=len(entries), verified=valid, remote_available=remote,
+                      failed=0 if pending else len(entries) - valid - remote, pending=len(entries) - valid - remote if pending else 0, time=now())
         if not pending and config.get('report_repo'):
             queue_report(root, Path(config['report_repo']), config['mark'], config.get('git_push', False),
                          f"Update {config['mark']} copies: {root.name} / {course}")
         history[course] = status
         d.write_json(state / f'{index:02d}-status.json', status)
         if not pending:
-            print(('COURSE VERIFIED COMPLETE: ' if status['complete'] else 'COURSE FINISHED WITH ERRORS: ') + str(root) + ' / ' + course, flush=True)
+            print(('COURSE AVAILABLE: ' if status['complete'] and remote else 'COURSE VERIFIED COMPLETE: ' if status['complete'] else 'COURSE FINISHED WITH ERRORS: ') + str(root) + ' / ' + course, flush=True)
     d.write_json(history_path, history)
     pending = [course for course in courses if history[course]['state'] != 'finished']
     failed = sum(history[course]['failed'] for course in courses)
-    d.write_json(state / 'summary.json', dict(verified=sum(history[course]['verified'] for course in courses),
+    d.write_json(state / 'summary.json', dict(verified=sum(history[course]['verified'] for course in courses),remote_available=sum(history[course].get('remote_available',0) for course in courses),
                  failed=failed, pending_courses=pending, downloads_complete=True, complete=not failed and not pending))
 
 
@@ -235,6 +241,14 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                     raise ValueError('Range task source mismatch')
                                 d.target(root, job['item'], job['course'])
                                 item = job['item']
+                                from nextcloud import remote_saved
+                                settings=cache.read(state/'settings.json')
+                                if remote_saved(state,item,settings.get('nextcloud_existing')):
+                                    background.checkpoint(item,job['course'],job['attempt'],'remote')
+                                    job.update(state='applied',time=now(),superseded_by_nextcloud=True)
+                                    d.write_json(path,job)
+                                    retired.add(job['course'])
+                                    continue
                                 if background.manifest_items.get((job['course'], item['path'])) != (item['size'], item['sha256']):
                                     job.update(state='applied', time=now(), superseded_by_manifest=True)
                                     d.write_json(path, job)
