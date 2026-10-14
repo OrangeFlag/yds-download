@@ -171,6 +171,10 @@ class Background:
         self.on_tick = self.poll
         self.ledger_path = self.state / 'transfer-state.json'
         self.ledger = json.loads(self.ledger_path.read_text()) if self.ledger_path.exists() else {}
+        # Only active phases need the full event for crash recovery.
+        for row in self.ledger.values():
+            if row.get('phase') == 'finished':
+                row.pop('event', None)
         self.metrics = Metrics(self.state/'metrics.jsonl', 'range-worker' if range_pool else 'downloader',
                                interval=tuning['metrics_interval'], settings=dict(tuning=tuning, retries=retries, range_files=range_files,nextcloud_fallback=nextcloud_fallback))
         self.aria_metrics = AriaMetrics(self.state/'aria2.log',self.metrics)
@@ -179,7 +183,7 @@ class Background:
     def checkpoint(self, item, course, attempt, phase, event=None, persist=True):
         row = dict(source=self.source, size=item['size'], sha256=item['sha256'],
                    course=course, attempt=attempt, phase=phase, time=now())
-        if event is not None:
+        if event is not None and phase != 'finished':
             row['event'] = event
         self.ledger[item['path']] = row
         if persist:
