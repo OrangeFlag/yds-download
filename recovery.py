@@ -18,6 +18,7 @@ import urllib.request
 import urllib.error
 import network
 import storage
+from file_state import FileState
 from progress import merge_ranges, saved_ranges, progress
 from settings import resolve
 
@@ -590,12 +591,7 @@ def reconcile_course(root, course):
 
 
 def recovery_state(root, event, state):
-    from download import write_json, STATE_LOCK
-    path = root / '.download/recovery-state.json'
-    with STATE_LOCK:
-        ledger = json.loads(path.read_text()) if path.exists() else {}
-        ledger[event['path']] = dict(state=state, event=dict(event))
-        write_json(path, ledger)
+    FileState(root/'.download', 'recovery-state').set(event['path'], dict(state=state, event=dict(event)))
 
 
 def prefer_saved_event(root, event, proof):
@@ -760,8 +756,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                 local = Path(row['local'])
                 if local.exists() and (local.stat().st_size, local.stat().st_mtime_ns) == (row['size'], row['mtime_ns']):
                     valid[row['path']] = row
-    ledger_path = root / '.download/recovery-state.json'
-    ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
+    ledger = FileState(root/'.download', 'recovery-state')
     metadata = {}
     results = []
     for _, event in candidates.values():
@@ -783,7 +778,6 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
         if retry and complete:
             reconcile_course(root, event['course'])
             continue
-        ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
         local_only = False
         saved = ledger.get(event['path'])
         if saved and not prefer_saved_event(root, event, saved['event']):
@@ -798,8 +792,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                 continue
         elif not saved and retry and not force and event.get('range_attempts'):
             # Previous completed passes predate the per-file ledger.
-            ledger[event['path']] = dict(state='finished', event=dict(event))
-            write_json(ledger_path, ledger)
+            ledger.set(event['path'], dict(state='finished', event=dict(event)))
             results.append(event)
             continue
         archived = body_path(root, event)
@@ -823,9 +816,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                 item = metadata[course].get(event['path'])
                 if item is None:
                     event['recovery_error'] = 'File no longer listed in source'
-                    ledger = json.loads(ledger_path.read_text()) if ledger_path.exists() else {}
-                    ledger[event['path']] = dict(state='finished', event=dict(event))
-                    write_json(ledger_path, ledger)
+                    ledger.set(event['path'], dict(state='finished', event=dict(event)))
                     raise ValueError('File no longer listed in source')
             finish_recovery(root, event, item, retries, _redownload=not local_only, tuning=tuning)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:

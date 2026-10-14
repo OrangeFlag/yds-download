@@ -1,4 +1,5 @@
 """Temporary proof-read errors must keep partial recovery resumable."""
+from file_state import FileState
 import errno
 import hashlib
 import json
@@ -43,11 +44,11 @@ class OutageProgressChecks(unittest.TestCase):
             with patch.object(progress, 'saved_ranges', side_effect=OSError(errno.EIO, 'Disk interrupted')):
                 with self.assertRaises(OSError):
                     recovery.finish_recovery(self.root, self.event, self.item, background=True)
-            ledger = self.root / '.download/recovery-state.json'
-            self.assertEqual(json.loads(ledger.read_text())[self.item['path']]['state'], 'running')
+            ledger = FileState(self.root/'.download', 'recovery-state')
+            self.assertEqual(ledger.get(self.item['path'])['state'], 'running')
             self.assertEqual(self.body.read_bytes(), self.content[:600])
             self.assertTrue(recovery.finish_recovery(self.root, self.event, self.item, background=True))
-        self.assertEqual(json.loads(ledger.read_text())[self.item['path']]['state'], 'finished')
+        self.assertEqual(ledger.get(self.item['path'])['state'], 'finished')
         partial = self.root / 'Course/video (partially available).mp4'
         self.assertEqual(partial.read_bytes(), self.content[:600])
         self.assertFalse((self.root / 'Course/video.mp4').exists())

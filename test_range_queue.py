@@ -1,5 +1,6 @@
 """Shared Range budgets, archive handoff and durable results."""
 from concurrent.futures import ThreadPoolExecutor
+from file_state import FileState
 import fcntl
 import hashlib
 import json
@@ -327,9 +328,9 @@ class SharedRangeChecks(unittest.TestCase):
             self.assertEqual(bg.checkpoint.call_args.args[3], 'finished')
             self.assertEqual(json.loads((root / 'corrupted/failed.json').read_text()), [])
             self.assertEqual(json.loads((root / 'corrupted/new/failed.json').read_text()), [])
-            self.assertEqual(json.loads((state / 'recovery-state.json').read_text())[item['path']]['event']['corrupted_path'], latest['corrupted_path'])
-            self.assertEqual(json.loads((state / 'recovery-state.json').read_text())[item['path']]['event']['range_attempts'], latest['range_attempts'])
-            self.assertEqual(json.loads((state / 'recovery-state.json').read_text())[item['path']]['state'], 'finished')
+            self.assertEqual(FileState(state, 'recovery-state').get(item['path'])['event']['corrupted_path'], latest['corrupted_path'])
+            self.assertEqual(FileState(state, 'recovery-state').get(item['path'])['event']['range_attempts'], latest['range_attempts'])
+            self.assertEqual(FileState(state, 'recovery-state').get(item['path'])['state'], 'finished')
             self.assertEqual(d.read_events(state / 'events.jsonl')[-1]['local'], str(local))
 
     def test_finished_archive_retires_obsolete_range_without_network_or_sha(self):
@@ -366,7 +367,7 @@ class SharedRangeChecks(unittest.TestCase):
             self.assertEqual(json.loads(task.read_text())['state'], 'applied')
             self.assertTrue(json.loads(stale.read_text())['superseded_by_manifest'])
             self.assertEqual(d.read_events(state / 'events.jsonl')[-1]['sha256'], item['sha256'])
-            self.assertEqual(json.loads((state / 'transfer-state.json').read_text())[item['path']]['phase'], 'finished')
+            self.assertEqual(FileState(state, 'transfer-state').get(item['path'])['phase'], 'finished')
             self.assertTrue(json.loads((state / 'summary.json').read_text())['complete'])
             self.assertFalse(d.target(root, item, 'Course').exists())
             # A crash after task application must still finalize the pending summary.

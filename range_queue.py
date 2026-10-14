@@ -20,6 +20,7 @@ import download as d
 import storage
 from report import queue_report, retry_reports
 from pipeline import Background, failure_manifests, now
+from file_state import FileState
 import recovery as r
 from settings import resolve
 from metrics import Metrics
@@ -150,8 +151,7 @@ def retire_cached_copy(background, path, job, proofs):
         if ((stat.st_size, stat.st_mtime_ns) != (item['size'], proof['mtime_ns'])
                 or not local.is_file() or Path(str(local) + '.aria2').exists()):
             continue
-        recovery_path = background.state / 'recovery-state.json'
-        saved = json.loads(recovery_path.read_text()).get(item['path'], {}).get('event', {}) if recovery_path.exists() else {}
+        saved = FileState(background.state, 'recovery-state').get(item['path'], {}).get('event', {})
         previous = saved if (saved.get('size'), saved.get('sha256')) == (item['size'], item['sha256']) else job.get('event', {})
         archived = previous.get('corrupted_path')
         if archived:
@@ -262,8 +262,7 @@ def seed_legacy_tasks(background):
     aggregate=root/'corrupted/failed.json'
     paths=[aggregate] if aggregate.exists() else list((root/'corrupted').glob('*/failed.json'))
     failures={row['path']:row for path in paths for row in json.loads(path.read_text())}
-    ledger=state/'recovery-state.json'
-    saved=json.loads(ledger.read_text()) if ledger.exists() else {}
+    saved=FileState(state, 'recovery-state')
     count=0
     for index,course in enumerate(json.loads((state/'courses.json').read_text()),1):
         for item in json.loads((state/f'{index:02d}-manifest.json').read_text()):

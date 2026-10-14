@@ -1,4 +1,5 @@
 """Resume interrupted archives and bound listing retries without live requests."""
+from file_state import FileState
 import hashlib
 import json
 from pathlib import Path
@@ -137,8 +138,8 @@ class ResumeChecks(unittest.TestCase):
         with patch.object(recovery, 'retry_ranges', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 recovery.finish_recovery(self.root, self.event, self.item, 0)
-        ledger = json.loads((self.state / 'recovery-state.json').read_text())
-        self.assertEqual(ledger[self.item['path']]['state'], 'running')
+        ledger = FileState(self.state, 'recovery-state')
+        self.assertEqual(ledger.get(self.item['path'])['state'], 'running')
         with patch.object(download.OPENER, 'open', side_effect=self.serve):
             self.assertEqual(self.run_download(), 0)
 
@@ -147,13 +148,13 @@ class ResumeChecks(unittest.TestCase):
         download.write_json(self.body.parents[1] / 'failed.json', [self.event])
         with patch.object(download.OPENER, 'open', side_effect=AssertionError('Legacy replay')):
             self.assertEqual(self.run_download(), 1)
-        self.assertEqual(json.loads((self.state / 'recovery-state.json').read_text())[self.item['path']]['state'], 'finished')
+        self.assertEqual(FileState(self.state, 'recovery-state').get(self.item['path'])['state'], 'finished')
 
     def test_deep_only_checks_local_missing_without_ranges(self):
         self.status('finished')
         with patch.object(download.OPENER, 'open', side_effect=AssertionError('Deep fetched content')):
             self.assertEqual(self.run_download(deep=True), 1)
-        self.assertFalse((self.state / 'recovery-state.json').exists())
+        self.assertFalse((self.state / 'recovery-state').exists())
 
     def test_deep_external_copy_checks_sha_and_updates_registry(self):
         external = self.root / 'external.mp4'
@@ -347,7 +348,7 @@ class ResumeChecks(unittest.TestCase):
             self.item['path']: dict(state='running', event=self.event)})
         with patch.object(download.OPENER, 'open', side_effect=AssertionError('Offline made request')):
             recovery.recover_corrupted(self.root, self.source)
-        self.assertEqual(json.loads((self.state / 'recovery-state.json').read_text())[self.item['path']]['state'], 'running')
+        self.assertEqual(FileState(self.state, 'recovery-state').get(self.item['path'])['state'], 'running')
         with patch.object(download.OPENER, 'open', side_effect=self.serve):
             self.assertEqual(self.run_download(), 0)
         self.assertEqual(self.requests, [(64, 128)])

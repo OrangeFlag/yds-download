@@ -20,6 +20,7 @@ import network
 from network import aria_resource
 import storage
 import recovery as r
+from file_state import FileState
 from settings import resolve
 
 
@@ -169,12 +170,9 @@ class Background:
         self.retry = []
         self.transferring = None
         self.on_tick = self.poll
-        self.ledger_path = self.state / 'transfer-state.json'
-        self.ledger = json.loads(self.ledger_path.read_text()) if self.ledger_path.exists() else {}
-        # Only active phases need the full event for crash recovery.
-        for row in self.ledger.values():
-            if row.get('phase') == 'finished':
-                row.pop('event', None)
+        self.transfer_state = FileState(self.state, 'transfer-state')
+        self.recovery_state = FileState(self.state, 'recovery-state')
+        self.pending_checkpoints = {}
         self.metrics = Metrics(self.state/'metrics.jsonl', 'range-worker' if range_pool else 'downloader',
                                interval=tuning['metrics_interval'], settings=dict(tuning=tuning, retries=retries, range_files=range_files,nextcloud_fallback=nextcloud_fallback))
         self.aria_metrics = AriaMetrics(self.state/'aria2.log',self.metrics)
@@ -185,12 +183,22 @@ class Background:
                    course=course, attempt=attempt, phase=phase, time=now())
         if event is not None and phase != 'finished':
             row['event'] = event
-        self.ledger[item['path']] = row
-        if persist:
-            d.write_json(self.ledger_path, self.ledger)
+        with d.STATE_LOCK:
+            self.pending_checkpoints[item['path']] = row
+            if persist:
+                self.flush_checkpoints()
+
+    def flush_checkpoints(self):
+        with d.STATE_LOCK:
+            for key, row in list(self.pending_checkpoints.items()):
+                self.transfer_state.set(key, row)
+                del self.pending_checkpoints[key]
 
     def continuation(self, item):
-        row = self.ledger.get(item['path'], {})
+        with d.STATE_LOCK:
+            row = self.pending_checkpoints.get(item['path'])
+            if row is None:
+                row = self.transfer_state.get(item['path'], {})
         return row if (row.get('source'), row.get('size'), row.get('sha256')) == (self.source, item['size'], item['sha256']) else {}
 
     def submit(self, kind, item, course, attempt, event=None, force=False, fallback_only=False, yandex_recheck=False):
@@ -227,8 +235,7 @@ class Background:
                         and not Path(str(local) + '.aria2').exists()):
                     job = old
             elif kind == 'range':
-                ledger = self.state / 'recovery-state.json'
-                saved = json.loads(ledger.read_text()).get(item['path'], {}) if ledger.exists() else {}
+                saved = self.recovery_state.get(item['path'], {})
                 proof = saved.get('event', {})
                 if r.prefer_saved_event(self.root, event, proof):
                     job['event'] = proof
@@ -296,8 +303,7 @@ class Background:
             else:
                 event = job['event']
                 if self.fallback or job.get('yandex_recheck'):
-                    ledger=self.state/'recovery-state.json'
-                    saved=json.loads(ledger.read_text()).get(event['path'],{}) if ledger.exists() else {}
+                    saved=self.recovery_state.get(event['path'],{})
                     previous=saved.get('event',{})
                     if ((previous.get('size'), previous.get('sha256')) == (job['item']['size'], job['item']['sha256'])
                             and r.prefer_saved_event(self.root, event, previous)):
@@ -310,8 +316,7 @@ class Background:
                         event=fallback
                     else:
                         if fallback:event['nextcloud_alternative']=fallback
-                        ledger=self.state/'recovery-state.json'
-                        saved=json.loads(ledger.read_text()).get(event['path'],{}) if self.fallback and ledger.exists() else {}
+                        saved=self.recovery_state.get(event['path'],{}) if self.fallback else {}
                         if job.get('yandex_recheck') or not (job.get('fallback_only') or not self.retry_check and saved.get('state')=='finished' and self.range_result_current(job['item'],saved.get('event',{}))):
                             checked_yandex = True
                             if job.get('yandex_recheck') and event.get('sha256_mismatch'):
@@ -446,7 +451,7 @@ class Background:
         if events:
             d.append_events(self.state / 'events.jsonl', events)
         failure_manifests_batch(self.root, failures)
-        d.write_json(self.ledger_path, self.ledger)
+        self.flush_checkpoints()
         for path, job in completed:
             job['state'] = 'applied'
             self.metrics.task(path,job['kind'],'applied',job.get('queued_at') or job.get('time',now()))
@@ -476,7 +481,7 @@ class Background:
             local.parent.mkdir(parents=True, exist_ok=True)
             lines.append(f"{item['file']}\n dir={local.parent}\n out={local.name}\n")
             self.checkpoint(item, course, previous_attempt + 1, 'downloading', persist=False)
-        d.write_json(self.ledger_path, self.ledger)
+        self.flush_checkpoints()
         (self.state / 'queue.txt').write_text(''.join(lines))
         t = self.tuning
         command = ['aria2c', '--input-file=' + str(self.state / 'queue.txt'), '--continue=true',
@@ -503,7 +508,7 @@ class Background:
         attempt = previous_attempt + 1
         for item in pending:
             self.checkpoint(item, course, attempt, 'verifying', persist=False)
-        d.write_json(self.ledger_path, self.ledger)
+        self.flush_checkpoints()
         for item in pending:
             self.submit('sha', item, course, attempt, force=True)
         self.poll()
@@ -719,8 +724,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                         background.submit('range', item, course, continuation['attempt'], event, force=retry_check)
                     elif (archived and (retry_check or previous.get('state') in ('running', 'verifying', 'recovering'))
                           and (archived['size'], archived['sha256']) == (item['size'], item['sha256'])):
-                        ledger_path = state / 'recovery-state.json'
-                        ledger = json.loads(ledger_path.read_text()).get(item['path'], {}) if ledger_path.exists() else {}
+                        ledger = background.recovery_state.get(item['path'], {})
                         old = ledger.get('event', {})
                         same = r.prefer_saved_event(root, archived, old)
                         if same:

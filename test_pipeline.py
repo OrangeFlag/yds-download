@@ -1,4 +1,5 @@
 """Background work must not hold up the next course's transfer."""
+from file_state import FileState
 import hashlib
 from collections import namedtuple
 import json
@@ -271,9 +272,9 @@ class PipelineChecks(unittest.TestCase):
         event['range_attempts'] = ['history' * 5000 for _ in range(20)]
         with patch.object(background, 'range_result_current', return_value=True):
             background.poll()
-        ledger = json.loads(background.ledger_path.read_text())
-        self.assertEqual(ledger[event['path']]['phase'], 'finished')
-        self.assertNotIn('event', ledger[event['path']])
+        ledger = background.transfer_state
+        self.assertEqual(ledger.get(event['path'])['phase'], 'finished')
+        self.assertNotIn('event', ledger.get(event['path']))
         self.assertEqual(json.loads(paths[0].read_text())['result']['event']['range_attempts'],
                          event['range_attempts'])
 
@@ -290,41 +291,41 @@ class PipelineChecks(unittest.TestCase):
         download.write_json(path, {item['path']: finished, '/Second/video.mp4': pending})
         bg = pipeline.Background(self.root, self.data['source'], 2, resolve(), defer_range=True)
         self.addCleanup(bg.close)
-        self.assertNotIn('event', bg.ledger[item['path']])
-        self.assertEqual(bg.ledger['/Second/video.mp4']['event'], pending['event'])
+        self.assertNotIn('event', bg.transfer_state.get(item['path']))
+        self.assertEqual(bg.transfer_state.get('/Second/video.mp4')['event'], pending['event'])
         bg.checkpoint(item, 'First', 3, 'finished')
-        saved = json.loads(path.read_text())
-        self.assertNotIn('event', saved[item['path']])
-        self.assertEqual(saved['/Second/video.mp4']['event'], pending['event'])
+        saved = bg.transfer_state
+        self.assertNotIn('event', saved.get(item['path']))
+        self.assertEqual(saved.get('/Second/video.mp4')['event'], pending['event'])
 
     def test_poll_batches_ledger_and_failure_manifest_before_applied_jobs(self):
         background, paths = self.ready_range_jobs(70)
         original = download.write_json
         writes = []
         def write(path, data):
-            if path == background.ledger_path or path == self.root / 'corrupted/failed.json':
+            if path.is_relative_to(background.transfer_state.directory) or path == self.root / 'corrupted/failed.json':
                 writes.append(path)
             if path in paths and data['state'] == 'applied':
-                ledger = json.loads(background.ledger_path.read_text())
+                ledger = background.transfer_state
                 failures = json.loads((self.root / 'corrupted/failed.json').read_text())
-                self.assertEqual(ledger[data['item']['path']]['phase'], 'finished')
+                self.assertEqual(ledger.get(data['item']['path'])['phase'], 'finished')
                 self.assertIn(data['item']['path'], [row['path'] for row in failures])
             original(path, data)
         with patch.object(background, 'range_result_current', return_value=True),                 patch.object(download, 'write_json', side_effect=write):
             background.poll()
             self.assertEqual(len(background.futures), 6)
-            self.assertEqual(writes.count(background.ledger_path), 1)
+            self.assertEqual(sum(path.is_relative_to(background.transfer_state.directory) for path in writes), 64)
             self.assertEqual(writes.count(self.root / 'corrupted/failed.json'), 1)
             background.poll()
         self.assertFalse(background.futures)
-        self.assertEqual(writes.count(background.ledger_path), 2)
+        self.assertEqual(sum(path.is_relative_to(background.transfer_state.directory) for path in writes), 70)
         self.assertEqual(len(json.loads((self.root / 'corrupted/failed.json').read_text())), 70)
 
     def test_interrupted_batch_retains_done_tasks_for_reapplication(self):
         background, paths = self.ready_range_jobs(3)
         original = download.write_json
         def interrupt(path, data):
-            if path == background.ledger_path:
+            if path.is_relative_to(background.transfer_state.directory):
                 raise KeyboardInterrupt
             original(path, data)
         with patch.object(background, 'range_result_current', return_value=True):
@@ -349,12 +350,12 @@ class PipelineChecks(unittest.TestCase):
         original = download.write_json
         writes = []
         def write(path, data):
-            if path == background.ledger_path:
+            if path.is_relative_to(background.transfer_state.directory):
                 writes.append(dict(data))
             original(path, data)
         def expect_phase(phase):
-            saved = json.loads(background.ledger_path.read_text())
-            self.assertEqual(set(saved), {item['path'] for item in items})
+            saved = {item['path']: background.transfer_state.get(item['path']) for item in items}
+            self.assertTrue(all(saved.values()))
             self.assertEqual({row['phase'] for row in saved.values()}, {phase})
         def transfer(*args, **kwargs):
             expect_phase('downloading')
@@ -365,9 +366,9 @@ class PipelineChecks(unittest.TestCase):
                 patch.object(pipeline, 'transfer_process', side_effect=transfer), \
                 patch.object(background, 'submit', side_effect=submit):
             background.transfer(items, 'First')
-        self.assertEqual(len(writes), 2)
+        self.assertEqual(len(writes), 2*len(items))
         background.checkpoint(items[0], 'First', 1, 'finished')
-        self.assertEqual(json.loads(background.ledger_path.read_text())[items[0]['path']]['phase'], 'finished')
+        self.assertEqual(background.transfer_state.get(items[0]['path'])['phase'], 'finished')
 
     def test_deep_preserves_deferred_range_handoff(self):
         self.items['First']['size'] = 20
@@ -841,12 +842,12 @@ class PipelineChecks(unittest.TestCase):
             with self.assertRaisesRegex(type(error), 'Insufficient disk space'):
                 self.run_download()
         state = self.root / '.download'
-        ledger = json.loads((state / 'recovery-state.json').read_text())
-        self.assertEqual(ledger['/First/video.mp4']['state'], 'running')
+        ledger = FileState(state, 'recovery-state')
+        self.assertEqual(ledger.get('/First/video.mp4')['state'], 'running')
         with patch.object(recovery, 'retry_ranges', return_value=None):
             self.assertEqual(self.run_download(), 1)
-        ledger = json.loads((state / 'recovery-state.json').read_text())
-        self.assertEqual(ledger['/First/video.mp4']['state'], 'finished')
+        ledger = FileState(state, 'recovery-state')
+        self.assertEqual(ledger.get('/First/video.mp4')['state'], 'finished')
 
 
 if __name__ == '__main__':

@@ -1,3 +1,4 @@
+from file_state import FileState
 import errno
 import hashlib
 import http.client
@@ -150,13 +151,13 @@ class OutageIntegrationChecks(unittest.TestCase):
                 self.assertTrue(target.exists())
                 with self.assertRaises(OSError):
                     recovery.finish_recovery(self.root, event, self.item, background=True)
-            ledger = self.state / 'recovery-state.json'
-            self.assertEqual(json.loads(ledger.read_text())[self.item['path']]['state'], 'running')
+            ledger = FileState(self.state, 'recovery-state')
+            self.assertEqual(ledger.get(self.item['path'])['state'], 'running')
             self.assertEqual(download.read_events(self.state / 'events.jsonl'), [])
             with patch.object(storage, 'sync_directory', wraps=original) as synced:
                 self.assertTrue(recovery.finish_recovery(self.root, event, self.item, background=True))
             self.assertIn(unittest.mock.call(target.parent), synced.call_args_list)
-        self.assertEqual(json.loads(ledger.read_text())[self.item['path']]['state'], 'finished')
+        self.assertEqual(ledger.get(self.item['path'])['state'], 'finished')
         self.assertEqual(download.read_events(self.state / 'events.jsonl')[-1]['status'], 'valid')
 
     def test_copy_io_error_is_retryable_disk_error(self):
