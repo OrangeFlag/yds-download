@@ -91,6 +91,10 @@ class NextcloudChecks(unittest.TestCase):
         self.assertEqual(sent[0][0], '2023-fall/Course/001 - 2023-09-15 Лекция.mp4')
         self.assertEqual(sent[0][1],self.content)
         self.assertEqual(sent[0][2]['If-None-Match'],'*')
+        journal=download.read_events(self.state/'nextcloud-uploads.jsonl')
+        self.assertEqual(len([row for row in journal if row['state']=='uploaded']),1)
+        self.assertEqual(journal[-1]['sent_bytes'],7)
+        self.assertEqual(journal[-1]['payload_sha256'],self.item['sha256'])
         with patch.object(nextcloud.Share,'listing',return_value=[]):
             self.assertTrue(nextcloud.Index(self.root,self.read).contains(self.data,self.item))
 
@@ -145,6 +149,18 @@ class NextcloudChecks(unittest.TestCase):
         item=dict(self.item,path='/Весна 2021/Course/video.mp4')
         for title in ('ШАД 2021','ШАД весна 2021'):
             self.assertEqual(nextcloud.remote_path(dict(title=title),item),'2021-spring/Course/video.mp4')
+
+    def test_unavailable_catalog_neither_stops_download_nor_allows_blind_upload(self):
+        self.local.unlink();(self.state/'events.jsonl').unlink()
+        def transfer(*args,**kwargs):
+            self.local.write_bytes(self.content)
+            return 0
+        with patch.object(download,'list_course',return_value=[self.item]), \
+                patch.object(nextcloud.Share,'listing',side_effect=TimeoutError()),patch('pipeline.transfer_process',transfer):
+            self.assertEqual(download.download(self.data,['Course'],self.root,retries=0,nextcloud_existing=self.read),0)
+        with patch.object(nextcloud.Share,'listing',side_effect=TimeoutError()), \
+                patch.object(nextcloud.Share,'request',side_effect=AssertionError('blind upload')):
+            nextcloud.Sync(self.read,self.upload,Event()).run_once([self.root])
 
     def test_http_503_after_sending_body_is_retried_on_next_cycle(self):
         sent=[]

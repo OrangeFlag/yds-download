@@ -168,7 +168,8 @@ def update_report(destination, repo, mark, git_push=False, message=None, stoppin
             transaction = common / 'yds-report-transaction.json'
             resume_publication(repo, transaction)
             return _update_report(destination, repo, mark, git_push, message, stopping, transaction)
-    return _update_report(destination, repo, mark, git_push, message, stopping)
+    with PUBLISH_LOCK:
+        return _update_report(destination, repo, mark, git_push, message, stopping)
 
 
 def _update_report(destination, repo, mark, git_push=False, message=None, stopping=None, transaction=None):

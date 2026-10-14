@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 import re
 import signal
 from threading import Event
+import time
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -103,9 +104,10 @@ class Share:
 
 
 class Index:
-    def __init__(self, root, link):
+    def __init__(self, root, link, strict=True):
         self.root, self.link = Path(root), Share(link).url()
         self.share = Share(link)
+        self.strict = strict
         self.folders = {}
 
     def contains(self, data, item):
@@ -124,9 +126,14 @@ class Index:
             try:
                 self.folders[folder] = self.share.listing(folder)
             except urllib.error.HTTPError as error:
-                if error.code != 404:
-                    raise
-                self.folders[folder] = []
+                self.folders[folder] = [] if error.code==404 else error
+            except (OSError,RuntimeError,ET.ParseError) as error:
+                self.folders[folder] = error
+        if isinstance(self.folders[folder],Exception):
+            if self.strict:
+                raise self.folders[folder]
+            print('NEXTCLOUD LOOKUP UNAVAILABLE: '+folder+'; downloading from source',flush=True)
+            return False
         for row in self.folders[folder]:
             path = PurePosixPath(row['path'])
             name = re.sub(r'^\d{3,} - ', '',path.name)
@@ -157,6 +164,7 @@ class Body:
         self.stream, self.size, self.stopping, self.path = stream,size,stopping,path
         self.sent = 0
         self.digest = hashlib.sha256()
+        self.last_progress=time.monotonic()
 
     def read(self, amount=-1):
         if self.stopping.is_set():
@@ -165,6 +173,9 @@ class Body:
         data = self.stream.read(min(self.size-self.sent,1024**2 if amount<0 else amount))
         self.sent += len(data)
         self.digest.update(data)
+        if time.monotonic()-self.last_progress>=30:
+            print(f'NEXTCLOUD UPLOAD PROGRESS: {self.path.name}; {self.sent}/{self.size} bytes',flush=True)
+            self.last_progress=time.monotonic()
         return data
 
 
@@ -264,18 +275,19 @@ class Sync:
                  local=str(local),local_stat=fingerprint,payload_size=size,bytes_percent=percent,state='uploading',
                  time=datetime.now().astimezone().isoformat())
         ledger[key]=row;d.write_json(state,ledger)
-        for parent in list(PurePosixPath(target).parents)[::-1]:
-            if str(parent)=='.':
-                continue
-            try:
-                with self.share.request('MKCOL',str(parent)):
-                    pass
-            except urllib.error.HTTPError as error:
-                if error.code!=405:
-                    raise
-        print('NEXTCLOUD UPLOAD START: '+target,flush=True)
+        d.append_events(state.with_suffix('.jsonl'),[dict(row)])
         body=None
         try:
+            for parent in list(PurePosixPath(target).parents)[::-1]:
+                if str(parent)=='.':
+                    continue
+                try:
+                    with self.share.request('MKCOL',str(parent)):
+                        pass
+                except urllib.error.HTTPError as error:
+                    if error.code!=405:
+                        raise
+            print('NEXTCLOUD UPLOAD START: '+target,flush=True)
             with local.open('rb') as stream:
                 body=Body(stream,size,self.stopping,local)
                 headers={'Content-Length':str(size),'Content-Type':'application/octet-stream','If-None-Match':'*'}
@@ -298,6 +310,7 @@ class Sync:
             raise
         finally:
             row['time']=datetime.now().astimezone().isoformat();d.write_json(state,ledger)
+            d.append_events(state.with_suffix('.jsonl'),[dict(row)])
 
 
 def main():

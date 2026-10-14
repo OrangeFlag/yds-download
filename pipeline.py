@@ -509,7 +509,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
         remote_files = {}
         if nextcloud_existing:
             from nextcloud import Index
-            remote_index = Index(root, nextcloud_existing)
+            remote_index = Index(root, nextcloud_existing, strict=False)
             saved_path=state/'nextcloud-existing.json'
             saved=json.loads(saved_path.read_text()) if saved_path.exists() else {}
             if saved.get('source')==source and saved.get('share')==remote_index.link:
