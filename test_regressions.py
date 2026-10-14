@@ -81,6 +81,23 @@ class ReviewRegression(unittest.TestCase):
         self.assertEqual(progress.merge_ranges([(0, 3), (3, 4), (6, 9), (8, 10)]),
                          [[0, 4], [6, 10]])
 
+    def test_streamed_events_keep_tail_recovery_without_whole_file_reads(self):
+        path = self.state / 'events.jsonl'
+        events = [dict(self.event, attempt=i) for i in range(3)]
+        download.append_events(path, events)
+        with path.open('ab') as output:
+            output.write(b'{"path":')
+        with patch.object(Path, 'read_bytes', side_effect=AssertionError('Whole JSONL loaded')):
+            self.assertEqual(list(download.iter_events(path, repair=True)), events)
+        self.assertEqual(download.read_events(path), events)
+        download.append_events(path, [dict(self.event, attempt=3)])
+        self.assertEqual(len(download.read_events(path)), 4)
+        with path.open('wb') as output:
+            output.write(json.dumps(self.event).encode())
+        with patch.object(Path, 'read_bytes', side_effect=AssertionError('Whole JSONL loaded')):
+            self.assertEqual(list(download.iter_events(path, repair=True)), [self.event])
+        self.assertTrue(path.read_text().endswith('\\n'))
+
     def test_new_archive_without_events(self):
         (self.state / 'events.jsonl').unlink()
         (self.root / 'corrupted/old/failed.json').unlink()

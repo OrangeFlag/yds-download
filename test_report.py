@@ -50,6 +50,32 @@ class RegistryReports(unittest.TestCase):
             self.assertNotIn('Walterit', card.read_text())
             self.assertIn('Other', card.read_text())
 
+    def test_report_streams_events_instead_of_materializing_the_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / '.download'
+            state.mkdir()
+            source = 'https://disk.yandex.ru/d/test'
+            download.write_json(state/'source.json', dict(source=source))
+            repo = root/'report'
+            (repo/'courses').mkdir(parents=True)
+            card = repo/'courses/course.md'
+            card.write_text('- Год: 2026\\n- Источник: [disk](' + source + ')\\n'
+                            '- Путь: `Course`\\n**Статус:** копия есть\\n'
+                            '| Файл | Размер | Копия 1 | Копия 2 | Копия 3 |\\n'
+                            '| --- | --- | --- | --- | --- |\\n'
+                            '| `video.mp4` | 4 | Walterit | | |\\n')
+            local = root/'Course/video.mp4'
+            local.parent.mkdir()
+            local.write_bytes(b'data')
+            entry = dict(path='/Course/video.mp4', size=4, sha256=hashlib.sha256(b'data').hexdigest(),
+                         local=str(local), status='valid', mtime_ns=local.stat().st_mtime_ns,
+                         source=source, time='2026-10-14T07:00:00+03:00', attempt=1, detail='verified')
+            download.append_events(state/'events.jsonl', [entry])
+            with patch.object(download, 'read_events', side_effect=AssertionError('Bulk history loaded')):
+                report.update_report(root, repo, 'Walterit')
+            self.assertIn('Walterit', card.read_text())
+
     def test_deleted_registered_copy_removes_only_its_owner_mark(self):
         for partial in (False, True):
             with self.subTest(partial=partial), tempfile.TemporaryDirectory() as directory:
