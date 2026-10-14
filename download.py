@@ -654,10 +654,11 @@ def main():
         if args.command == 'recover':
             from recovery import recover_corrupted
             root = args.destination.resolve()
-            lock = (root / '.download/download.lock').open('a')
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            source = json.loads((root / '.download/source.json').read_text())['source']
-            recover_corrupted(root, source)
+            storage.check(root)
+            with (root / '.download/download.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                source = json.loads((root / '.download/source.json').read_text())['source']
+                recover_corrupted(root, source)
             return 0
         if args.command == 'corrupted':
             from progress import corrupted_report
