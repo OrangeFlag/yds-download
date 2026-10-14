@@ -216,6 +216,31 @@ class NextcloudChecks(unittest.TestCase):
         self.assertEqual(len(sent), 2)
         self.assertNotEqual(first_upload_id, next(iter(receipts.values()))['upload_id'])
 
+    def test_upload_journal_recovery_streams_without_caching_full_history(self):
+        sent = []
+        def request(share, method, path='', data=None, headers=None, uploads=False):
+            if method == 'PUT':
+                sent.append(path)
+                data.read()
+            return Response()
+        ledger = self.state / 'nextcloud-uploads.json'
+        with patch.object(nextcloud.Share, 'listing', return_value=[]), \
+                patch.object(nextcloud.Share, 'request', request):
+            sync = nextcloud.Sync(self.read, self.upload, Event())
+            sync.run_once([self.root])
+            rows = json.loads(ledger.read_text())
+            entry = next(iter(rows.values()))
+            entry['state'] = 'pending'
+            download.write_json(ledger, rows)
+            journal = ledger.with_suffix('.jsonl')
+            download.append_events(journal, [dict(key='unrelated', state='uploaded') for _ in range(100)])
+            with patch.object(download, 'read_events',
+                              side_effect=AssertionError('Upload journal materialized in RAM')):
+                sync.run_once([self.root])
+            self.assertEqual(next(iter(json.loads(ledger.read_text()).values()))['state'], 'uploaded')
+            self.assertEqual(len(sent), 1)
+            self.assertNotIn(journal, sync.cache)
+
     def test_old_success_journal_does_not_cancel_retry_of_new_upload_session(self):
         from datetime import datetime, timedelta, timezone
         sent = []
