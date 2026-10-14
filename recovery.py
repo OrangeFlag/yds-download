@@ -136,7 +136,7 @@ def new_recovery_body(root, event, reason):
     archive.mkdir(parents=True)
     event.setdefault('preserved_archive_paths', []).append(event['corrupted_path'])
     event['corrupted_path'] = str(local_path(archive, event['path']).relative_to(root))
-    for key in ('sha256_mismatch', 'recovery_error', 'available_seconds', 'available_time_percent', 'available_intervals', 'time_method', 'range_attempts'):
+    for key in ('sha256_mismatch', 'recovery_error', 'available_seconds', 'available_time_percent', 'available_intervals', 'time_method', 'range_attempts', 'recheck_continue', 'recheck_full_pass'):
         event.pop(key, None)
     event['restart_reason'] = reason
     event.update(progress(body_path(root, event), event['size'], sha256=event['sha256']))
@@ -193,7 +193,30 @@ def expand_probes(ranges, total, outcomes, block, limit, minimum, discoveries=No
     return planned
 
 
-def retry_ranges(root, event, item, retries, tuning=None, stopping=None, download_active=None, request_budget=None, metrics=None):
+def recheck_probe_ranges(ranges, total, small_block, large_block, limit, cursor):
+    """Sample missing byte positions without enumerating small chunks of large files."""
+    holes = missing_chunks(ranges, total, total)
+    missing = sum(end - start for start, end in holes)
+    if not missing or not limit:
+        return []
+    offset = sum(max(0, min(cursor, end) - start) for start, end in holes) % missing
+    def bounds(position, block):
+        for start, end in holes:
+            length = end - start
+            if position < length:
+                start += position
+                return start, min(end, start + block)
+            position -= length
+    probes = [bounds(offset, large_block)]
+    count = min(limit - 1, (missing + small_block - 1) // small_block)
+    for index in range(count):
+        probe = bounds((offset + index * missing // count) % missing, small_block)
+        if probe not in probes:
+            probes.append(probe)
+    return probes
+
+
+def retry_ranges(root, event, item, retries, tuning=None, stopping=None, download_active=None, request_budget=None, metrics=None, probe_requests=0):
     tuning = resolve(tuning)
     from download import OPENER, write_json, api
     if item['size'] != event['size'] or item['sha256'] != event['sha256']:
@@ -212,7 +235,11 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     write_json(journal, dict(size=event['size'], sha256=event['sha256'], ranges=additional, salvage_cursor=cursor, control_imported=True))
     total = event['size']
     missing_bytes = total - sum(end - start for start, end in ranges)
+    continuation = event.get('recheck_continue', False)
+    if probe_requests or continuation:
+        event['recheck_full_pass'] = bool(continuation)
     if not missing_bytes:
+        event.pop('recheck_continue', None)
         return ranges
     if shutil.disk_usage(root).free < missing_bytes + tuning['free_space_mib'] * 1024 ** 2:
         raise OSError(errno.ENOSPC, 'Insufficient disk space for range recovery')
@@ -415,20 +442,22 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
     item = refresh()
     failed_count = 0
     remaining_span = total
-    for attempt in range(1, max_passes + 1):
+    for attempt in range(0 if probe_requests and not continuation else 1, max_passes + 1):
         pass_refreshed = False
         pass_started = time.monotonic()
         if stopping.is_set():
             raise InterruptedError('Range interrupted')
         # Backend block geometry is unpublished; refine failed intervals by observed responses.
         minimum = tuning['range_min_block_size_kib'] * 1024
-        block = max(minimum, tuning['range_block_size_kib'] * 1024 // (2 ** (attempt - 1)))
+        block = max(minimum, tuning['range_block_size_kib'] * 1024 // (2 ** max(0, attempt - 1)))
         if attempt > 1:
             block = min(block, max(minimum, (remaining_span + 1) // 2))
         fine = attempt > 1 and (block <= minimum or failed_count > tuning['range_failure_limit'] or attempt == max_passes)
         if fine:
             block = tuning['range_linear_block_size_kib'] * 1024
-        missing = missing_chunks(ranges, total, block)
+        missing = (recheck_probe_ranges(ranges, total, tuning['range_linear_block_size_kib'] * 1024,
+                                        block, probe_requests, cursor) if attempt == 0
+                   else missing_chunks(ranges, total, block))
         if not missing:
             break
         unprobed = 0
@@ -448,7 +477,11 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
             nonlocal additional, ranges
             bounds, data, error, timing = future.result()
             save_started = time.monotonic()
-            if data is not None:
+            if data:
+                if attempt == 0 and not event.get('recheck_continue'):
+                    # Commit escalation before writing bytes so interruption cannot lose the decision.
+                    event.update(recheck_continue=True, recheck_full_pass=True)
+                    recovery_state(root, event, 'running')
                 saved = [bounds[0], bounds[0] + len(data)]
                 with path.open('r+b' if path.exists() else 'w+b') as stream:
                     stream.seek(saved[0]); stream.write(data); stream.flush(); os.fsync(stream.fileno())
@@ -461,7 +494,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                 metrics.range_request(outcomes[-1])
         def execute(batch, mode):
             # Persist each completed request before waiting for the rest of the batch.
-            workers = tuning['range_workers']
+            workers = 1 if mode == 'probe' else tuning['range_workers']
             pool = ThreadPoolExecutor(max_workers=workers)
             futures = set()
             first_outcome = len(outcomes)
@@ -481,7 +514,8 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                         save_result(future)
                         futures.remove(future)
                         rows = outcomes[first_outcome:]
-                        cutoff = (mode == 'halving' and attempt < max_passes
+                        cutoff = (mode == 'probe' and any(row['saved_bytes'] for row in rows)
+                                  or mode == 'halving' and attempt < max_passes
                                   and len(rows) > tuning['range_failure_limit']
                                   and not any(row['saved_bytes'] for row in rows))
                         bounds = None if cutoff else next(pending, None)
@@ -505,7 +539,11 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                 raise InterruptedError('Range interrupted')
             return len(batch) - submitted
 
-        if fine:
+        if attempt == 0:
+            unprobed = execute(missing, 'probe')
+            cursor = missing[min(1, len(missing) - 1)][1] % total
+            write_json(journal, dict(size=total, sha256=event['sha256'], ranges=additional, salvage_cursor=cursor, control_imported=True))
+        elif fine:
             budget = tuning['range_linear_probes']
             # Reserve at least half the budget for expansion and resumable linear coverage.
             ordered = [bounds for bounds in missing if bounds[0] >= cursor]
@@ -539,9 +577,19 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
         first_byte_p95 = first_bytes[min(len(first_bytes) - 1, int(len(first_bytes) * .95))] if first_bytes else None
         if metrics is not None:
             metrics.range_pass(outcomes,attempts[-1]['seconds'],count_requests=False)
-        print(f'RANGE PASS {attempt}/{max_passes}: {event["path"]}; chunk={block}; mode={"adaptive" if fine else "halving"}; saved={sum(row["saved_bytes"] > 0 for row in outcomes)}/{len(outcomes)}; bytes={event["downloaded_percent"]}; unprobed={unprobed}; seconds={attempts[-1]["seconds"]:.3f}; request_seconds={sum(row["request_seconds"] for row in outcomes):.3f}; io_seconds={sum(row["save_seconds"] for row in outcomes):.3f}; new_bytes={sum(row["saved_bytes"] for row in outcomes)}; first_byte_p95={first_byte_p95}', flush=True)
+        print(f'RANGE PASS {attempt}/{max_passes}: {event["path"]}; chunk={block}; mode={"probe" if attempt == 0 else "adaptive" if fine else "halving"}; saved={sum(row["saved_bytes"] > 0 for row in outcomes)}/{len(outcomes)}; bytes={event["downloaded_percent"]}; unprobed={unprobed}; seconds={attempts[-1]["seconds"]:.3f}; request_seconds={sum(row["request_seconds"] for row in outcomes):.3f}; io_seconds={sum(row["save_seconds"] for row in outcomes):.3f}; new_bytes={sum(row["saved_bytes"] for row in outcomes)}; first_byte_p95={first_byte_p95}', flush=True)
+        if attempt == 0:
+            gained = sum(row['saved_bytes'] for row in outcomes)
+            if metrics is not None:
+                metrics.add(recheck_probe_runs=1, recheck_probe_requests=len(outcomes),
+                            recheck_probe_new_bytes=gained, recheck_probe_seconds=attempts[-1]['seconds'],
+                            recheck_probe_positive=int(bool(gained)), recheck_probe_empty=int(not gained))
+            print(f'RANGE PROBE: {event["path"]}; requests={len(outcomes)}; new_bytes={gained}; escalate={bool(gained)}', flush=True)
+            if not gained:
+                break
         if fine:
             break
+    event.pop('recheck_continue', None)
     return ranges
 
 
@@ -618,15 +666,15 @@ def range_result_current(root, item, event):
     return stat.st_size == item['size'] and event.get('recovered_stat') == [stat.st_ino, stat.st_size, stat.st_mtime_ns]
 
 
-def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None, metrics=None):
+def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None, metrics=None, probe_requests=0):
     event.pop('range_recovered_complete', None)
     if event.get('sha256_rejected_paths'):
         _redownload = False
     if item is None:
-        return _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background, request_budget, metrics)
+        return _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background, request_budget, metrics, probe_requests)
     recovery_state(root, event, 'running')
     try:
-        result = _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background, request_budget, metrics)
+        result = _finish_recovery(root, event, item, retries, _redownload, tuning, stopping, download_active, background, request_budget, metrics, probe_requests)
     except ValueError:
         recovery_state(root, event, 'finished')
         raise
@@ -634,13 +682,13 @@ def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=
     return result
 
 
-def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None, metrics=None):
+def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None, metrics=None, probe_requests=0):
     from download import record, target, write_json, sha256_file, inspect
     path = body_path(root, event)
     if item:
         try:
             if background:
-                retry_ranges(root, event, item, retries, tuning, stopping, download_active, request_budget, metrics=metrics)
+                retry_ranges(root, event, item, retries, tuning, stopping, download_active, request_budget, metrics=metrics, **(dict(probe_requests=probe_requests) if probe_requests else {}))
             else:
                 retry_ranges(root, event, item, retries, tuning)
         except InterruptedError:

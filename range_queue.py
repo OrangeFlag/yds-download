@@ -284,13 +284,15 @@ def seed_legacy_tasks(background):
     if count:print('YANDEX RECHECK LEGACY QUEUED: '+str(root)+'; files='+str(count),flush=True)
 
 
-def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60, nextcloud_fallback=None, recheck_interval=0, recheck_files=8):
+def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60, nextcloud_fallback=None, recheck_interval=0, recheck_files=8, recheck_probes=16, recheck_full_interval=604800):
     if files < 1 or per_file < 1:
         raise ValueError('Range file limits must be positive')
     if not 1 <= secondary_slots <= max(1, files - 1):
         raise ValueError('Secondary slots must leave a slot for the first queue')
     if not math.isfinite(recheck_interval) or recheck_interval<0 or recheck_files<1:
         raise ValueError('Recheck interval must be nonnegative and recheck files positive')
+    if recheck_probes < 0 or not math.isfinite(recheck_full_interval) or recheck_full_interval < 0:
+        raise ValueError('Recheck probes and full interval must be nonnegative')
     if recheck_interval and len(queues)>1 and recheck_files<2:
         raise ValueError('Rechecks across queues require at least two file slots')
     stopping = stopping if stopping is not None else Event()
@@ -306,7 +308,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
     recheck_roots = {}
     recheck_limits = ([recheck_files] if len(queues)==1 else [(recheck_files+1)//2,recheck_files//2])
     with Metrics(queues[0].with_suffix('.range.metrics.jsonl'),'range-queue',interval=metrics_interval,
-                 settings=dict(files=files,per_file=per_file,requests=requests,rps=rps,secondary_slots=secondary_slots,recheck_interval=recheck_interval,recheck_files=recheck_files)) as metrics, \
+                 settings=dict(files=files,per_file=per_file,requests=requests,rps=rps,secondary_slots=secondary_slots,recheck_interval=recheck_interval,recheck_files=recheck_files,recheck_probes=recheck_probes,recheck_full_interval=recheck_full_interval)) as metrics, \
             ThreadPoolExecutor(max_workers=files+(recheck_files if recheck_interval else 0), thread_name_prefix='range-file') as pool:
         try:
             while not stopping.is_set():
@@ -366,7 +368,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 settings = cache.read(state / 'settings.json')
                                 tuning = resolve({**settings['tuning'], 'range_workers': per_file, 'range_rps': rps})
                                 background = Background(root, identity['source'], settings['retries'], tuning,
-                                                        range_pool=pool, budget=budget, range_files=files, nextcloud_fallback=link if fallback else None,retry_check=settings.get('retry_check',False))
+                                                        range_pool=pool, budget=budget, range_files=files, nextcloud_fallback=link if fallback else None,retry_check=settings.get('retry_check',False),
+                                                        recheck_probes=recheck_probes,recheck_full_interval=recheck_full_interval)
                             except BaseException:
                                 lock.close()
                                 raise
@@ -498,6 +501,8 @@ def main():
     parser.add_argument('--nextcloud-fallback',help='Also backfill completed failed course tasks from this public share')
     parser.add_argument('--recheck-interval',type=float,default=0,help='Seconds between completed Yandex rechecks; 0 disables')
     parser.add_argument('--recheck-files',type=int,default=8,help='Extra recheck file slots, split between first and later queues')
+    parser.add_argument('--recheck-probes',type=int,default=16,help='Maximum cheap availability requests before full recovery; 0 always runs full recovery')
+    parser.add_argument('--recheck-full-interval',type=float,default=604800,help='Seconds between full rechecks even after negative probes; 0 always runs full recovery')
     args = parser.parse_args()
     stopping = Event()
     for number in (signal.SIGINT, signal.SIGTERM):
@@ -505,7 +510,7 @@ def main():
     # Prevent two workers from multiplying the global limits.
     with args.queue[0].with_suffix('.range.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget, args.metrics_interval, args.nextcloud_fallback,args.recheck_interval,args.recheck_files)
+        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget, args.metrics_interval, args.nextcloud_fallback,args.recheck_interval,args.recheck_files,args.recheck_probes,args.recheck_full_interval)
 
 
 if __name__ == '__main__':

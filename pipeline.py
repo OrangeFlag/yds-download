@@ -1,6 +1,6 @@
 """Ordered course transfers with durable SHA and Range background tasks."""
 from concurrent.futures import CancelledError, ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 import fcntl
 import errno
 import hashlib
@@ -146,7 +146,7 @@ def failure_manifests_batch(root, events):
 
 
 class Background:
-    def __init__(self, root, source, retries, tuning, defer_range=False, range_pool=None, budget=None, range_files=1, nextcloud_fallback=None, retry_check=False):
+    def __init__(self, root, source, retries, tuning, defer_range=False, range_pool=None, budget=None, range_files=1, nextcloud_fallback=None, retry_check=False, recheck_probes=16, recheck_full_interval=604800):
         self.root, self.source, self.retries, self.tuning = root, source, retries, tuning
         self.state = root / '.download'
         self.directory = self.state / 'tasks'
@@ -159,6 +159,8 @@ class Background:
         self.budget = budget
         self.shared_pool = range_pool
         self.retry_check=retry_check
+        self.recheck_probes = recheck_probes
+        self.recheck_full_interval = recheck_full_interval
         if range_pool is not None:
             self.pools['range'].shutdown()
             self.pools['range'] = range_pool
@@ -243,8 +245,14 @@ class Background:
                             and saved.get('state') == 'finished' and self.range_result_current(item, proof)):
                         job.update(state='done', result=dict(event=proof))
         if not force and old.get('fallback_only'):job['fallback_only']=True
-        if not force and old.get('yandex_recheck'):job['yandex_recheck']=True
-        if old.get('yandex_checked_at'):job['yandex_checked_at']=old['yandex_checked_at']
+        if not force and old.get('yandex_recheck'):
+            job['yandex_recheck']=True
+            if old.get('state') in ('pending', 'running') and not old.get('yandex_full_recheck_at'):
+                # Rechecks interrupted on older versions already started a full workflow.
+                job['event'] = dict(job['event'], recheck_continue=True)
+
+        for key in ('yandex_checked_at', 'yandex_full_recheck_at'):
+            if old.get(key):job[key]=old[key]
         previous = old.get('timing')
         timing = dict(previous) if isinstance(previous, dict) else {}
         if timing.get('started_at') and not timing.get('stopped_at'):
@@ -308,8 +316,11 @@ class Background:
                     if ((previous.get('size'), previous.get('sha256')) == (job['item']['size'], job['item']['sha256'])
                             and r.prefer_saved_event(self.root, event, previous)):
                         event = dict(previous)
+                if job.get('yandex_recheck') and job['event'].get('recheck_continue'):
+                    event['recheck_continue'] = True
                 event.pop('range_recovered_complete', None)
                 checked_yandex = False
+                completed_yandex = False
                 try:
                     fallback=self.fallback.recover_all(job['item'],event) if self.fallback and not job.get('yandex_recheck') else None
                     if fallback and fallback['status']=='valid':
@@ -318,12 +329,24 @@ class Background:
                         if fallback:event['nextcloud_alternative']=fallback
                         saved=self.recovery_state.get(event['path'],{}) if self.fallback else {}
                         if job.get('yandex_recheck') or not (job.get('fallback_only') or not self.retry_check and saved.get('state')=='finished' and self.range_result_current(job['item'],saved.get('event',{}))):
-                            checked_yandex = True
                             if job.get('yandex_recheck') and event.get('sha256_mismatch'):
                                 r.new_recovery_body(self.root,event,'Daily Yandex recheck of SHA-rejected bytes; keep previous body')
+                            checked_yandex = True
+                            probe_requests = 0
+                            if job.get('yandex_recheck'):
+                                if not job.get('yandex_full_recheck_at'):
+                                    last = datetime.fromisoformat(job.get('yandex_checked_at') or now())
+                                    job['yandex_full_recheck_at'] = (last + timedelta(seconds=self.recheck_full_interval)).isoformat()
+                                    d.write_json(path, job)
+                                due = datetime.fromisoformat(job['yandex_full_recheck_at']).timestamp() <= time.time()
+                                if not due and self.recheck_full_interval:
+                                    probe_requests = self.recheck_probes
+                                event['recheck_full_pass'] = not probe_requests or bool(event.get('recheck_continue'))
                             r.finish_recovery(self.root, event, job['item'], self.retries, tuning=self.tuning,
                                               stopping=self.stopping, download_active=self.download_active if self.budget is None else None,
-                                              background=True, request_budget=self.budget, metrics=self.metrics)
+                                              background=True, request_budget=self.budget, metrics=self.metrics,
+                                              **(dict(probe_requests=probe_requests) if probe_requests else {}))
+                            completed_yandex = True
                 except InterruptedError:
                     raise
                 except (ValueError, FileExistsError) as error:
@@ -332,6 +355,9 @@ class Background:
                     r.recovery_state(self.root, event, 'finished')
                 if checked_yandex:
                     job['yandex_checked_at'] = now()
+                    if completed_yandex and job.get('yandex_recheck') and event.get('recheck_full_pass'):
+                        job['yandex_full_recheck_at'] = (datetime.now().astimezone() + timedelta(seconds=self.recheck_full_interval)).isoformat()
+                        self.metrics.add(recheck_full_attempts=1)
                 if job.get('yandex_recheck'):
                     self.metrics.add(yandex_rechecks=1, yandex_recheck_full_files=int(event.get('range_recovered_complete',False)))
                     print('YANDEX RECHECK FINISHED: ' + event['path'] + '; full=' + str(bool(event.get('range_recovered_complete'))) + '; checked_at=' + job.get('yandex_checked_at',''), flush=True)
