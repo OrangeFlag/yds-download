@@ -64,13 +64,33 @@ class JsonCache:
 
     def tasks(self, directory):
         if not directory.exists():
+            self.directories.pop(directory, None)
             return []
         stamp = Background.stat(directory)
         saved = self.directories.get(directory)
-        if saved is None or saved[0] != stamp:
-            saved = stamp, [(path, self.read(path)) for path in sorted(directory.glob('*.json'))]
-            self.directories[directory] = saved
-        return saved[1]
+        if saved is not None and saved[0] == stamp:
+            return saved[2]
+        previous = saved[1] if saved else {}
+        current = {}
+        for path in sorted(directory.glob('*.json')):
+            file_stamp = Background.stat(path)
+            if path in previous and previous[path][0] == file_stamp:
+                summary = previous[path][1]
+            else:
+                job = json.loads(path.read_text())
+                summary = None
+                if job['kind'] == 'range':
+                    item = job['item']
+                    summary = dict(kind='range', state=job['state'], course=job['course'],
+                                   source=job['source'], attempt=job['attempt'],
+                                   item={key: item[key] for key in ('path', 'size', 'sha256')},
+                                   superseded_by_manifest=job.get('superseded_by_manifest', False),
+                                   result={'event': {'range_recovered_complete':
+                                       job.get('result', {}).get('event', {}).get('range_recovered_complete', False)}})
+            current[path] = file_stamp, summary
+        tasks = [(path, row) for path, (_, row) in current.items() if row is not None]
+        self.directories[directory] = stamp, current, tasks
+        return tasks
 
 
 def retire_cached_copy(background, path, job, proofs):
@@ -249,6 +269,10 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         background = roots[root][0]
                         retired = set()
                         external = cache.read(state / 'local-copies.json', [])
+                        external_by_path = {}
+                        for copy in external:
+                            if copy.get('source', '').rstrip('/') == background.source.rstrip('/'):
+                                external_by_path.setdefault(copy['path'], []).append(copy)
                         for path, job in tasks:
                             if path in background.futures:
                                 continue
@@ -261,20 +285,22 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 settings=cache.read(state/'settings.json')
                                 if not fallback and remote_saved(state,item,settings.get('nextcloud_existing')):
                                     background.checkpoint(item,job['course'],job['attempt'],'remote')
-                                    job.update(state='applied',time=now(),superseded_by_nextcloud=True)
-                                    d.write_json(path,job)
+                                    saved = json.loads(path.read_text())
+                                    saved.update(state='applied',time=now(),superseded_by_nextcloud=True)
+                                    d.write_json(path,saved)
                                     retired.add(job['course'])
                                     continue
                                 if background.manifest_items.get((job['course'], item['path'])) != (item['size'], item['sha256']):
-                                    job.update(state='applied', time=now(), superseded_by_manifest=True)
-                                    d.write_json(path, job)
+                                    saved = json.loads(path.read_text())
+                                    saved.update(state='applied', time=now(), superseded_by_manifest=True)
+                                    d.write_json(path, saved)
                                     continue
-                                proofs = [background.cached_events.get(job['item']['path'], {})]
-                                proofs.extend(row for row in external if row.get('source', '').rstrip('/') == background.source.rstrip('/') and row.get('path') == job['item']['path'])
-                                if retire_cached_copy(background, path, job, proofs):
-                                    retired.add(job['course'])
-                                    continue
-                                eligible.append((priority, background, job))
+                                proofs = [background.cached_events.get(item['path'], {}), *external_by_path.get(item['path'], [])]
+                                if any(proof.get('status') == 'valid' for proof in proofs):
+                                    if retire_cached_copy(background, path, json.loads(path.read_text()), proofs):
+                                        retired.add(job['course'])
+                                        continue
+                                eligible.append((priority, background, path))
                         if retired:
                             finish_courses(background, config, retired)
                 active = sum(len(background.futures) for background, _, _ in roots.values())
@@ -286,7 +312,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                            if priorities[bg.root] == 0)
                         if first_active >= max(1, files - secondary_slots):
                             chosen = next(i for i, row in enumerate(eligible) if row[0] > 0)
-                    _, background, job = eligible.pop(chosen)
+                    _, background, path = eligible.pop(chosen)
+                    job = json.loads(path.read_text())
                     print('RANGE START: ' + str(background.root) + job['item']['path'], flush=True)
                     background.submit('range', job['item'], job['course'], job['attempt'], job['event'],force=job['state']=='applied',fallback_only=job['state']=='applied')
                     active += 1
