@@ -174,6 +174,25 @@ class NextcloudChecks(unittest.TestCase):
             sync.run_once([self.root]);sync.run_once([self.root])
         self.assertEqual(sent,[self.content,self.content])
 
+    def test_durable_success_journal_prevents_reupload_after_ledger_write_failure(self):
+        import errno
+        sent=[]
+        def request(share,method,path='',data=None,headers=None):
+            if method=='PUT':sent.append(data.read())
+            return Response()
+        original=download.write_json
+        def write_json(path,value):
+            if path.name=='nextcloud-uploads.json' and any(r.get('state')=='uploaded' for r in value.values()):
+                raise OSError(errno.EIO,'disk disconnected after server confirmation')
+            return original(path,value)
+        with patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
+            with patch.object(download,'write_json',write_json),self.assertRaises(OSError):
+                nextcloud.Sync(self.read,self.upload,Event()).run_once([self.root])
+            nextcloud.Sync(self.read,self.upload,Event()).run_once([self.root])
+        self.assertEqual(sent,[self.content])
+        rows=json.loads((self.state/'nextcloud-uploads.json').read_text())
+        self.assertEqual(next(iter(rows.values()))['state'],'uploaded')
+
     def test_stale_remote_proof_is_removed_before_failed_transfer_handoff(self):
         self.local.unlink();(self.state/'events.jsonl').unlink()
         download.write_json(self.state/'nextcloud-existing.json',dict(source=self.data['source'],

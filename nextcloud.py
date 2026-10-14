@@ -119,6 +119,8 @@ class Index:
             for row in json.loads(receipts.read_text()).values():
                 if (row.get('state')=='uploaded' and row.get('variant')=='original'
                         and row.get('read_share')==self.link and row.get('source')==data['source']
+                        and row.get('http_status')==201 and row.get('sent_bytes')==item['size']
+                        and row.get('payload_sha256')==item['sha256']
                         and (row.get('path'),row.get('size'),row.get('sha256'))==(item['path'],item['size'],item['sha256'])):
                     return True
         folder = str(PurePosixPath(relative).parent)
@@ -268,9 +270,15 @@ class Sync:
         key=hashlib.sha256(json.dumps([self.share.url(),data['source'],item['path'],item['sha256'],variant,
                                     fingerprint if variant=='partial' else None]).encode()).hexdigest()
         old=ledger.get(key,{})
+        journal=state.with_suffix('.jsonl')
+        if old and old.get('state')!='uploaded' and journal.exists():
+            completed=next((e for e in reversed(self.read(journal,[])) if e.get('key')==key and e.get('state')=='uploaded'),None)
+            if completed:
+                ledger[key]=completed;d.write_json(state,ledger)
+                return
         if old.get('state') in ('uploaded','unconfirmed'):
             return
-        row=dict(source=data['source'],path=item['path'],size=item['size'],sha256=item['sha256'],variant=variant,
+        row=dict(key=key,source=data['source'],path=item['path'],size=item['size'],sha256=item['sha256'],variant=variant,
                  target=target,upload_share=self.share.url(),read_share=Share(self.existing).url() if self.existing else None,
                  local=str(local),local_stat=fingerprint,payload_size=size,bytes_percent=percent,state='uploading',
                  time=datetime.now().astimezone().isoformat())
@@ -309,8 +317,9 @@ class Sync:
                        error_type=type(error).__name__,http_status=getattr(error,'code',None),sent_bytes=body.sent if body else 0)
             raise
         finally:
-            row['time']=datetime.now().astimezone().isoformat();d.write_json(state,ledger)
-            d.append_events(state.with_suffix('.jsonl'),[dict(row)])
+            row['time']=datetime.now().astimezone().isoformat()
+            d.append_events(journal,[dict(row)])
+            d.write_json(state,ledger)
 
 
 def main():
