@@ -47,9 +47,12 @@ class NextcloudChecks(unittest.TestCase):
         index = nextcloud.Index(self.root, self.read)
         rows = [dict(path='2023-fall/Course/001 - 2023-09-15 Лекция.mp4', size=7, directory=False, checksums=[])]
         with patch.object(nextcloud.Share, 'listing', return_value=rows):
-            self.assertTrue(index.contains(self.data, self.item))
+            self.assertFalse(index.contains(self.data, self.item))
             self.assertFalse(index.contains(self.data, dict(self.item, size=8)))
             self.assertFalse(index.contains(self.data, dict(self.item, path='/Other/2023-09-15 Лекция.mp4')))
+        rows[0]['checksums'] = ['SHA256:'+self.item['sha256']]
+        with patch.object(nextcloud.Share, 'listing', return_value=rows):
+            self.assertTrue(nextcloud.Index(self.root, self.read).contains(self.data, self.item))
         rows[0]['checksums'] = ['SHA256:'+'0'*64]
         with patch.object(nextcloud.Share, 'listing', return_value=rows):
             self.assertFalse(nextcloud.Index(self.root, self.read).contains(self.data, self.item))
@@ -67,7 +70,8 @@ class NextcloudChecks(unittest.TestCase):
         (self.state / 'events.jsonl').unlink()
         with patch.object(download, 'list_course', return_value=[self.item]), \
                 patch.object(nextcloud.Share, 'listing', return_value=[dict(
-                    path='2023-fall/Course/001 - 2023-09-15 Лекция.mp4', size=7, directory=False, checksums=[])]), \
+                    path='2023-fall/Course/001 - 2023-09-15 Лекция.mp4', size=7, directory=False,
+                    checksums=['SHA256:'+self.item['sha256']])]), \
                 patch('pipeline.transfer_process', side_effect=AssertionError('downloaded existing remote copy')):
             self.assertEqual(download.download(self.data, ['Course'], self.root, retries=0,
                                                nextcloud_existing=self.read), 0)
@@ -76,6 +80,27 @@ class NextcloudChecks(unittest.TestCase):
         self.assertEqual(history['remote_available'], 1)
         self.assertFalse(self.local.exists())
         self.assertFalse(any(e.get('status')=='valid' for e in download.read_events(self.state/'events.jsonl')))
+
+    def test_same_size_unverified_nextcloud_copy_does_not_skip_download(self):
+        self.local.unlink()
+        (self.state / 'events.jsonl').unlink()
+        transfers = []
+
+        def transfer(*args, **kwargs):
+            transfers.append(True)
+            self.local.write_bytes(self.content)
+            return 0
+
+        with patch.object(download, 'list_course', return_value=[self.item]), \
+                patch.object(nextcloud.Share, 'listing', return_value=[dict(
+                    path='2023-fall/Course/001 - 2023-09-15 Лекция.mp4', size=7,
+                    directory=False, checksums=[])]), \
+                patch('pipeline.transfer_process', side_effect=transfer):
+            self.assertEqual(download.download(self.data, ['Course'], self.root, retries=0,
+                                               nextcloud_existing=self.read), 0)
+        self.assertEqual(len(transfers), 1)
+        status = json.loads((self.state / 'course-history.json').read_text())['Course']
+        self.assertEqual((status['verified'], status['remote_available']), (1, 0))
 
     def test_successful_upload_is_not_repeated_before_public_listing_catches_up(self):
         sent = []
