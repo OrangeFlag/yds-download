@@ -185,30 +185,51 @@ def append_events(path, rows):
         storage.sync_directory(path.parent)
 
 
-def read_events(path, repair=False):
+def scan_events(path, repair=False, start=0):
+    """Iterate JSONL rows and their end offsets without loading the entire journal."""
     if not path.exists():
-        return []
-    data = path.read_bytes()
-    lines = data.splitlines(keepends=True)
-    events = []
-    offset = 0
-    for index, line in enumerate(lines):
-        if line.strip():
-            try:
-                events.append(json.loads(line))
-            except (ValueError, UnicodeDecodeError):
-                if index != len(lines) - 1 or line.endswith(b'\n'):
-                    raise
-                if repair:
-                    with path.open('r+b') as stream:
-                        stream.truncate(offset)
+        return
+    with path.open('rb') as stream:
+        limit = os.fstat(stream.fileno()).st_size
+        stream.seek(start)
+        offset = start
+        while offset < limit:
+            line = stream.readline(limit - offset)
+            if not line:
                 break
-        offset += len(line)
-    # A complete last JSON object may still lack the separator for the next append.
-    if repair and data and not data.endswith(b'\n') and offset == len(data):
-        with path.open('ab') as stream:
-            stream.write(b'\n')
-    return events
+            end = offset + len(line)
+            row = None
+            if line.strip():
+                try:
+                    row = json.loads(line)
+                except (ValueError, UnicodeDecodeError):
+                    if end != limit or line.endswith(b'\n'):
+                        raise
+                    if repair:
+                        with path.open('r+b') as output:
+                            output.truncate(offset)
+                            output.flush()
+                            os.fsync(output.fileno())
+                    return
+            # A complete final JSON object still needs a separator before append.
+            if repair and end == limit and not line.endswith(b'\n'):
+                with path.open('ab') as output:
+                    output.write(b'\n')
+                    output.flush()
+                    os.fsync(output.fileno())
+                end += 1
+            yield end, row
+            offset = end
+
+
+def iter_events(path, repair=False):
+    for _, row in scan_events(path, repair):
+        if row is not None:
+            yield row
+
+
+def read_events(path, repair=False):
+    return list(iter_events(path, repair))
 
 
 def inspect(root, item, course, path=None, stopping=None):

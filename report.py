@@ -173,7 +173,7 @@ def update_report(destination, repo, mark, git_push=False, message=None, stoppin
 
 
 def _update_report(destination, repo, mark, git_push=False, message=None, stopping=None, transaction=None):
-    from download import read_events
+    from download import iter_events
     if not mark or any(c in mark for c in '|\n\r'):
         raise ValueError('Mark must be nonempty and contain no pipes or line breaks')
     repo = repo.resolve()
@@ -189,7 +189,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
     source = json.loads((state / 'source.json').read_text(encoding='utf-8'))['source'].rstrip('/')
     events = {}
     observations = {}
-    for event in read_events(state / 'events.jsonl'):
+    for event in iter_events(state / 'events.jsonl'):
         key = normalized(event['path'])
         events[key] = event
         if event.get('source_current'):
