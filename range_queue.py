@@ -106,7 +106,7 @@ class EventIndex:
         self.offset = 0
 
     def refresh(self):
-        # record() and append_events() share this lock with the tail reader.
+        # The writer and reader share STATE_LOCK; a crash-torn final row is repaired.
         with d.STATE_LOCK:
             try:
                 stat = self.path.stat()
@@ -119,33 +119,11 @@ class EventIndex:
                 self.events.clear()
                 self.offset = 0
             self.inode = stat.st_ino
-            if stat.st_size == self.offset:
-                return self.events
-            with self.path.open('rb') as stream:
-                stream.seek(self.offset)
-                while line := stream.readline():
-                    end = stream.tell()
-                    try:
-                        row = json.loads(line)
-                    except (ValueError, UnicodeDecodeError):
-                        if line.endswith(b'\n') or end != stat.st_size:
-                            raise
-                        # A crash may leave a final, unterminated JSON object.
-                        with self.path.open('r+b') as output:
-                            output.truncate(self.offset)
-                            output.flush()
-                            os.fsync(output.fileno())
-                        return self.events
+            for offset, row in d.scan_events(self.path, repair=True, start=self.offset):
+                self.offset = offset
+                if row is not None:
                     self.events[row['path']] = {key: row[key] for key in self.FIELDS if key in row}
-                    self.offset = end
-                    if not line.endswith(b'\n'):
-                        with self.path.open('ab') as output:
-                            output.write(b'\n')
-                            output.flush()
-                            os.fsync(output.fileno())
-                        self.offset += 1
         return self.events
-
 
 def retire_cached_copy(background, path, job, proofs):
     item = job['item']
