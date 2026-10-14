@@ -200,6 +200,12 @@ def finish_courses(background, config, changed_courses=()):
     jobs = ([job for _, job in background.task_cache.tasks(background.directory)]
             if hasattr(background, 'task_cache')
             else [json.loads(path.read_text()) for path in background.directory.glob('*.json')])
+    from nextcloud import saved_remote_files
+    settings = json.loads((state/'settings.json').read_text())
+    link = None if getattr(background, 'fallback', None) else settings.get('nextcloud_existing')
+    remote_path = state/'nextcloud-existing.json'
+    saved = json.loads(remote_path.read_text()) if link and remote_path.exists() else {}
+    remote_files = saved_remote_files(state, link, source=background.source, saved=saved)
     for index, course in enumerate(courses, 1):
         pending = any(job['kind'] == 'range' and job['course'] == course and job['state'] != 'applied' for job in jobs)
         if history.get(course, {}).get('state') == 'finished' and not pending and course not in changed_courses:
@@ -218,10 +224,9 @@ def finish_courses(background, config, changed_courses=()):
                     valid += 1
                     verified_paths.add(item['path'])
                     break
-        from nextcloud import remote_saved
-        settings=json.loads((state/'settings.json').read_text())
-        remote=sum(remote_saved(state,item,None if getattr(background,'fallback',None) else settings.get('nextcloud_existing')) for item in entries
-                   if item['path'] not in verified_paths)
+        remote=sum((remote_files.get(item['path'], {}).get('size'),
+                    remote_files.get(item['path'], {}).get('sha256')) == (item['size'], item['sha256'])
+                   for item in entries if item['path'] not in verified_paths)
         status = dict(course=course, source=background.source, state='recovering' if pending else 'finished',
                       complete=not pending and valid + remote == len(entries), total=len(entries), verified=valid, remote_available=remote,
                       failed=0 if pending else len(entries) - valid - remote, pending=len(entries) - valid - remote if pending else 0, time=now())
@@ -327,6 +332,10 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 for item in cache.read(state / f'{index:02d}-manifest.json')}
                         background = roots[root][0]
                         background.cached_events = background.event_index.refresh()
+                        from nextcloud import saved_remote_files
+                        remote_link = None if fallback else settings.get('nextcloud_existing')
+                        remote_files = saved_remote_files(state, remote_link, source=background.source,
+                            saved=cache.read(state/'nextcloud-existing.json', {}) if remote_link else {})
                         retired = set()
                         external = cache.read(state / 'local-copies.json', [])
                         external_by_path = {}
@@ -341,9 +350,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                     raise ValueError('Range task source mismatch')
                                 d.target(root, job['item'], job['course'])
                                 item = job['item']
-                                from nextcloud import remote_saved
-                                settings=cache.read(state/'settings.json')
-                                if not fallback and remote_saved(state,item,settings.get('nextcloud_existing')):
+                                remote = remote_files.get(item['path'], {})
+                                if (remote.get('size'), remote.get('sha256')) == (item['size'], item['sha256']):
                                     background.checkpoint(item,job['course'],job['attempt'],'remote')
                                     saved = json.loads(path.read_text())
                                     saved.update(state='applied',time=now(),superseded_by_nextcloud=True)
