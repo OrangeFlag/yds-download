@@ -49,6 +49,33 @@ class SharedRangeChecks(unittest.TestCase):
             d.write_json(path, {'value': 2})
             self.assertEqual(cache.read(path), {'value': 2})
 
+    def test_task_cache_retains_only_compact_summaries_and_reloads_changed_tasks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder) / 'tasks'
+            directory.mkdir()
+            for index in range(40):
+                d.write_json(directory / f'{index}.json', dict(
+                    kind='range', state='applied' if index else 'pending',
+                    course='Course', source='test', attempt=1,
+                    item=dict(path=f'/Course/{index}.mp4', size=4, sha256='a'*64),
+                    event=dict(path=f'/Course/{index}.mp4', range_attempts=['x'*4096]*10),
+                    result=dict(event=dict(range_recovered_complete=False,
+                                           range_attempts=['y'*4096]*10))))
+            cache = q.JsonCache()
+            tasks = cache.tasks(directory)
+            self.assertEqual(len(tasks), 40)
+            self.assertTrue(all('event' not in job for _, job in tasks))
+            self.assertTrue(all('range_attempts' not in str(job) for _, job in tasks))
+            self.assertLess(len(str(tasks)), 30000)
+            self.assertFalse(any(path.parent == directory for path in cache.entries))
+            with patch.object(Path, 'read_text', wraps=None, side_effect=AssertionError('Unchanged tasks reread')):
+                self.assertEqual(len(cache.tasks(directory)), 40)
+            path = directory / '0.json'
+            changed = json.loads(path.read_text())
+            changed['state'] = 'done'
+            d.write_json(path, changed)
+            self.assertEqual(next(job for name, job in cache.tasks(directory) if name == path)['state'], 'done')
+
     def test_semester_queue_advances_without_waiting_for_range(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
