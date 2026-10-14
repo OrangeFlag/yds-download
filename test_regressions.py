@@ -96,7 +96,7 @@ class ReviewRegression(unittest.TestCase):
             output.write(json.dumps(self.event).encode())
         with patch.object(Path, 'read_bytes', side_effect=AssertionError('Whole JSONL loaded')):
             self.assertEqual(list(download.iter_events(path, repair=True)), [self.event])
-        self.assertTrue(path.read_text().endswith('\\n'))
+        self.assertTrue(path.read_text().endswith('\n'))
 
     def test_new_archive_without_events(self):
         (self.state / 'events.jsonl').unlink()

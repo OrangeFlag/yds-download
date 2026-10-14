@@ -60,11 +60,11 @@ class RegistryReports(unittest.TestCase):
             repo = root/'report'
             (repo/'courses').mkdir(parents=True)
             card = repo/'courses/course.md'
-            card.write_text('- Год: 2026\\n- Источник: [disk](' + source + ')\\n'
-                            '- Путь: `Course`\\n**Статус:** копия есть\\n'
-                            '| Файл | Размер | Копия 1 | Копия 2 | Копия 3 |\\n'
-                            '| --- | --- | --- | --- | --- |\\n'
-                            '| `video.mp4` | 4 | Walterit | | |\\n')
+            card.write_text('- Год: 2026\n- Источник: [disk](' + source + ')\n'
+                            '- Путь: `Course`\n**Статус:** копия есть\n'
+                            '| Файл | Размер | Копия 1 | Копия 2 | Копия 3 |\n'
+                            '| --- | --- | --- | --- | --- |\n'
+                            '| `video.mp4` | 4 | Walterit | | |\n')
             local = root/'Course/video.mp4'
             local.parent.mkdir()
             local.write_bytes(b'data')
