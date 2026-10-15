@@ -1033,5 +1033,168 @@ class AdaptiveUploadIntegrationChecks(unittest.TestCase):
         self.assertEqual(len(finished),5)
 
 
+class ListingRetryChecks(unittest.TestCase):
+    setUp = NextcloudChecks.setUp
+
+    def index(self, strict=True):
+        stopping=Event()
+        waiter=patch.object(stopping,'wait',return_value=False)
+        wait=waiter.start();self.addCleanup(waiter.stop)
+        jitter=patch.object(nextcloud.random,'uniform',return_value=1)
+        jitter.start();self.addCleanup(jitter.stop)
+        return nextcloud.Index(self.root,self.read,strict=strict,stopping=stopping),wait
+
+    def test_tls_failure_retries_and_caches_only_successful_listing(self):
+        index,wait=self.index()
+        error=urllib.error.URLError(ssl.SSLEOFError(8,'TLS EOF'))
+        with patch.object(nextcloud.Share,'listing',side_effect=[error,error,[]]) as listing:
+            self.assertEqual(index.candidates(self.data,self.item),[])
+            self.assertEqual(index.candidates(self.data,self.item),[])
+        self.assertEqual(listing.call_count,3)
+        self.assertEqual([call.args[0] for call in wait.call_args_list],[1,2])
+
+    def test_failed_folder_can_be_read_again_after_cooldown(self):
+        index,wait=self.index()
+        with patch.object(nextcloud.time,'monotonic',return_value=100) as clock, \
+                patch.object(nextcloud.Share,'listing',side_effect=TimeoutError()) as listing:
+            with self.assertRaises(TimeoutError):index.candidates(self.data,self.item)
+            self.assertEqual(listing.call_count,3)
+            with self.assertRaises(TimeoutError):index.candidates(self.data,self.item)
+            self.assertEqual(listing.call_count,3)
+            clock.return_value=161
+            listing.side_effect=None;listing.return_value=[]
+            self.assertEqual(index.candidates(self.data,self.item),[])
+            self.assertEqual(listing.call_count,4)
+
+    def test_backoff_has_jitter_and_honors_short_retry_after(self):
+        index,wait=self.index()
+        with patch.object(nextcloud.random,'uniform',side_effect=[.75,1.25]), \
+                patch.object(nextcloud.Share,'listing',side_effect=[TimeoutError(),TimeoutError(),[]]):
+            index.candidates(self.data,self.item)
+        self.assertEqual([call.args[0] for call in wait.call_args_list],[.75,2.5])
+        index,wait=self.index()
+        error=urllib.error.HTTPError('hidden',503,'Unavailable',{'Retry-After':'3'},None)
+        with patch.object(nextcloud.Share,'listing',side_effect=[error,[]]):
+            index.candidates(self.data,self.item)
+        self.assertEqual(wait.call_args.args[0],3)
+
+    def test_uploader_retries_only_the_read_share_and_then_uploads(self):
+        stopping=Event()
+        error=urllib.error.URLError(ssl.SSLEOFError(8,'TLS EOF'))
+        seen=[]
+        def listing(share,folder):
+            self.assertEqual(share.url(),nextcloud.Share(self.read).url())
+            seen.append(folder)
+            if len(seen)==1:raise error
+            return []
+        def request(share,method,path='',data=None,headers=None,uploads=False):
+            self.assertEqual(share.url(),nextcloud.Share(self.upload).url())
+            if method=='PUT':data.read()
+            return Response()
+        with patch.object(stopping,'wait',return_value=False), \
+                patch.object(nextcloud.Share,'listing',listing),patch.object(nextcloud.Share,'request',request):
+            nextcloud.Sync(self.read,self.upload,stopping,transfers=1).run_once([self.root])
+        self.assertEqual(seen,['2023-fall/Course']*2)
+        rows=json.loads((self.state/'nextcloud-uploads.json').read_text())
+        self.assertEqual(next(iter(rows.values()))['state'],'uploaded')
+
+    def test_uploader_keeps_retry_after_between_passes(self):
+        stopping=Event();sync=nextcloud.Sync(self.read,self.upload,stopping,transfers=1)
+        error=urllib.error.HTTPError('hidden',429,'Slow down',{'Retry-After':'120'},None)
+        with patch.object(nextcloud.time,'monotonic',return_value=100) as clock, \
+                patch.object(nextcloud.Share,'listing',side_effect=error) as listing, \
+                patch.object(sync,'upload') as upload:
+            sync.run_once([self.root])
+            clock.return_value=130
+            sync.run_once([self.root])
+            self.assertEqual(listing.call_count,1)
+            upload.assert_not_called()
+            clock.return_value=221;listing.side_effect=None;listing.return_value=[]
+            sync.run_once([self.root])
+            self.assertEqual(listing.call_count,2)
+            upload.assert_called_once()
+
+    def test_successful_catalog_is_refreshed_on_next_uploader_pass(self):
+        sync=nextcloud.Sync(self.read,self.upload,Event(),transfers=1)
+        rows=[dict(path='2023-fall/Course/001 - 2023-09-15 Лекция.mp4',size=7,
+                   directory=False,checksums=['SHA256:'+self.item['sha256']])]
+        with patch.object(nextcloud.Share,'listing',side_effect=[rows,[]]) as listing,patch.object(sync,'upload') as upload:
+            sync.run_once([self.root]);upload.assert_not_called()
+            sync.run_once([self.root]);upload.assert_called_once()
+        self.assertEqual(listing.call_count,2)
+
+    def test_malformed_catalog_does_not_stop_other_course_uploads(self):
+        other=dict(self.item,path='/Other/video.mp4')
+        local=download.target(self.root,other,'Other');local.parent.mkdir();local.write_bytes(self.content)
+        download.write_json(self.state/'01-manifest.json',[self.item,other])
+        download.append_events(self.state/'events.jsonl',[dict(self.proof,**other,local=str(local),mtime_ns=local.stat().st_mtime_ns)])
+        stopping=Event();sync=nextcloud.Sync(self.read,self.upload,stopping,transfers=1)
+        def listing(share,folder):
+            if folder.endswith('/Course'):raise nextcloud.ET.ParseError('truncated XML')
+            return []
+        with patch.object(stopping,'wait',return_value=False),patch.object(nextcloud.Share,'listing',listing), \
+                patch.object(sync,'upload') as upload:
+            sync.run_once([self.root])
+        self.assertFalse(stopping.is_set())
+        upload.assert_called_once()
+        self.assertEqual(upload.call_args.args[2]['path'],other['path'])
+
+    def test_retry_covers_truncated_response_and_transient_http_errors(self):
+        import http.client
+        for error in (http.client.IncompleteRead(b'partial'),nextcloud.ET.ParseError('truncated XML'),
+                      urllib.error.HTTPError('hidden',500,'Server error',{},None)):
+            index,wait=self.index()
+            with patch.object(nextcloud.Share,'listing',side_effect=[error,[]]) as listing:
+                self.assertEqual(index.candidates(self.data,self.item),[])
+            self.assertEqual(listing.call_count,2)
+            self.assertEqual(wait.call_count,1)
+
+    def test_forbidden_and_missing_folders_are_not_retried(self):
+        for status in (401,403,404):
+            index,wait=self.index()
+            with patch.object(nextcloud.Share,'listing',side_effect=urllib.error.HTTPError('hidden',status,'error',{},None)) as listing:
+                for _ in range(2):
+                    if status==404:self.assertEqual(index.candidates(self.data,self.item),[])
+                    else:
+                        with self.assertRaises(urllib.error.HTTPError):index.candidates(self.data,self.item)
+            self.assertEqual(listing.call_count,1)
+            self.assertEqual(wait.call_count,0)
+
+    def test_retry_after_defers_long_wait_without_blocking_other_folders(self):
+        index,wait=self.index()
+        error=urllib.error.HTTPError('hidden',429,'Slow down',{'Retry-After':'120'},None)
+        with patch.object(nextcloud.time,'monotonic',return_value=100), \
+                patch.object(nextcloud.Share,'listing',side_effect=[error,[]]) as listing:
+            with self.assertRaises(urllib.error.HTTPError):index.candidates(self.data,self.item)
+            self.assertEqual(index.retry_at['2023-fall/Course'],220)
+            self.assertEqual(index.candidates(self.data,dict(self.item,path='/Other/video.mp4')),[])
+        self.assertEqual(wait.call_count,0)
+        self.assertEqual(listing.call_count,2)
+
+    def test_permission_error_also_honors_retry_after(self):
+        index,wait=self.index()
+        error=urllib.error.HTTPError('hidden',403,'Forbidden',{'Retry-After':'120'},None)
+        with patch.object(nextcloud.time,'monotonic',return_value=100), \
+                patch.object(nextcloud.Share,'listing',side_effect=error) as listing:
+            with self.assertRaises(urllib.error.HTTPError):index.candidates(self.data,self.item)
+        self.assertEqual(index.retry_at['2023-fall/Course'],220)
+        self.assertEqual(listing.call_count,1)
+        wait.assert_not_called()
+
+    def test_shutdown_interrupts_retry_and_disk_error_is_not_cached(self):
+        import errno
+        index,wait=self.index()
+        wait.side_effect=lambda _: index.stopping.set() or True
+        with patch.object(nextcloud.Share,'listing',side_effect=TimeoutError()) as listing:
+            with self.assertRaises(InterruptedError):index.candidates(self.data,self.item)
+        self.assertEqual(listing.call_count,1)
+        self.assertNotIn('2023-fall/Course',index.folders)
+        index.stopping.clear();wait.side_effect=None
+        with patch.object(nextcloud.Share,'listing',side_effect=OSError(errno.EIO,'disk failed')) as listing:
+            with self.assertRaises(OSError):index.candidates(self.data,self.item)
+        self.assertEqual(listing.call_count,1)
+        self.assertNotIn('2023-fall/Course',index.folders)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -26,7 +26,7 @@ TRANSFERS=BoundedSemaphore(2)
 class Fallback:
     def __init__(self, root, link, stopping):
         self.root,self.link,self.stopping=Path(root),link,stopping
-        self.index=Index(root,link)
+        self.index=Index(root,link,stopping=stopping)
         self.index.share.timeout=60
         self.device=self.root.stat().st_dev
         self.lookup_lock=Lock()
@@ -127,7 +127,7 @@ class Fallback:
             except ValueError:
                 row['state']='unmapped';self.save(item,row);return None
             with self.lookup_lock:
-                if row.get('state')=='not_found' or row.get('http_status')==404 or isinstance(self.index.folders.get(folder),Exception):
+                if (row.get('state')=='not_found' or row.get('http_status')==404) and not isinstance(self.index.folders.get(folder),Exception):
                     self.index.folders.pop(folder,None)
                 candidates=self.index.candidates(self.source,item)
             if not candidates:

@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 from pathlib import Path, PurePosixPath
+import random
 import re
 import signal
 from threading import Event, Lock
@@ -124,12 +125,14 @@ class Share:
 
 
 class Index:
-    def __init__(self, root, link, strict=True):
+    def __init__(self, root, link, strict=True, stopping=None):
         self.root = Path(root)
         self.share = Share(link,timeout=30)
         self.link = self.share.url()
         self.strict = strict
+        self.stopping = stopping if stopping is not None else Event()
         self.folders = {}
+        self.retry_at = {}
         self.receipts_stamp = None
         self.receipts = {}
 
@@ -176,16 +179,51 @@ class Index:
     def candidates(self, data, item):
         relative=remote_path(data,item)
         folder=str(PurePosixPath(relative).parent)
+        if folder in self.retry_at and time.monotonic()>=self.retry_at[folder]:
+            self.folders.pop(folder,None)
+            self.retry_at.pop(folder)
         if folder not in self.folders:
-            try:
-                self.folders[folder]=self.share.listing(folder)
-            except urllib.error.HTTPError as error:
-                self.folders[folder]=[] if error.code==404 else error
-            except (OSError,RuntimeError,ET.ParseError) as error:
-                self.folders[folder]=error
+            for attempt in range(3):
+                if self.stopping.is_set():
+                    raise InterruptedError('Nextcloud catalog lookup interrupted')
+                try:
+                    self.folders[folder]=self.share.listing(folder)
+                    break
+                except (OSError,http.client.HTTPException,RuntimeError,ET.ParseError) as error:
+                    if storage.disk_error(error):
+                        raise
+                    if self.stopping.is_set():
+                        raise InterruptedError('Nextcloud catalog lookup interrupted') from error
+                    code=getattr(error,'code',None)
+                    retry_after=network.retry_after(getattr(error,'headers',None))
+                    if isinstance(error,urllib.error.HTTPError):
+                        error.close()
+                    if code==404:
+                        self.folders[folder]=[]
+                        break
+                    transient=(code in (429,500,502,503,504)
+                               or network.failure(error)['category'] in ('routing','ambiguous')
+                               or isinstance(error,ET.ParseError))
+                    if not transient:
+                        self.folders[folder]=error
+                        self.retry_at[folder]=time.monotonic()+max(60,retry_after)
+                        break
+                    delay=max(2**attempt*random.uniform(.75,1.25),retry_after)
+                    # Long Retry-After waits must not hold the shared lookup lock.
+                    if attempt==2 or delay>5:
+                        self.folders[folder]=error
+                        cooldown=max(60,delay)
+                        self.retry_at[folder]=time.monotonic()+cooldown
+                        print(f'NEXTCLOUD LOOKUP DEFERRED: {folder}; retry_after_seconds={cooldown:g}; '
+                              f'HTTP={code}; reason={str(error)!r}',flush=True)
+                        break
+                    print(f'NEXTCLOUD LOOKUP RETRY: {folder}; retry={attempt+1}/2; pause={delay:.2f}s; '
+                          f'HTTP={code}; reason={str(error)!r}',flush=True)
+                    if self.stopping.wait(delay):
+                        raise InterruptedError('Nextcloud catalog lookup interrupted') from error
         if isinstance(self.folders[folder],Exception):
             if self.strict:
-                raise self.folders[folder]
+                raise self.folders[folder].with_traceback(None)
             print('NEXTCLOUD LOOKUP UNAVAILABLE: '+folder+'; downloading from source',flush=True)
             return []
         return [row for row in self.folders[folder] if not row['directory']
@@ -324,6 +362,7 @@ class Sync:
             print(f'NEXTCLOUD AUTO TRANSFERS: minimum={min_transfers}; maximum={transfers}; '
                   'sample_seconds=90; probe_interval_seconds=300',flush=True)
         self.index_lock=Lock()
+        self.indexes={}
         self.cache = {}
 
     def read(self, path, default=None):
@@ -348,7 +387,17 @@ class Sync:
             if self.read(state/'catalog.json',{}).get('root'):
                 print('NEXTCLOUD ARCHIVE SKIPPED: personal/root catalog',flush=True)
                 continue
-            index = Index(root,self.existing) if self.existing else None
+            index=None
+            if self.existing:
+                index=self.indexes.get(root)
+                if index is None:
+                    index=Index(root,self.existing,stopping=self.stopping)
+                    self.indexes[root]=index
+                else:
+                    current=time.monotonic()
+                    index.retry_at={folder:deadline for folder,deadline in index.retry_at.items() if deadline>current}
+                    # Refresh successful listings, retaining only active failure cooldowns.
+                    index.folders={folder:error for folder,error in index.folders.items() if folder in index.retry_at}
             started = {row['path'] for row in self.read(state/'nextcloud-uploads.json', {}).values()
                        if row.get('state')!='uploaded' and row.get('next_chunk',0)>0
                        and row.get('source')==data['source'] and row.get('upload_share')==self.share.url()
@@ -439,7 +488,7 @@ class Sync:
             name=local_path(Path('/'),f'/{ordinal:03} - {stem}{relative.suffix}').name
             target=str(relative.with_name(name))
             self.upload(root,data,item,local,variant,target,expected_size,percent)
-        except (OSError,http.client.HTTPException,RuntimeError,ValueError) as error:
+        except (OSError,http.client.HTTPException,RuntimeError,ValueError,ET.ParseError) as error:
             if storage.disk_error(error):
                 self.stopping.set()
                 raise

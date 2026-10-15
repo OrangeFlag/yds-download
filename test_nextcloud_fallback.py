@@ -39,7 +39,8 @@ class FallbackChecks(unittest.TestCase):
         self.assertIn('DNS temporarily unavailable', output.getvalue())
         self.assertIn(f'errno={socket.EAI_AGAIN}', output.getvalue())
         with patch.object(nextcloud.Share, 'listing', return_value=[self.row]), \
-                patch.object(nextcloud.Share, 'request', return_value=Response(self.content)):
+                patch.object(nextcloud.Share, 'request', return_value=Response(self.content)), \
+                patch.object(nextcloud.time,'monotonic',return_value=fallback.index.retry_at['2023-fall/Course']+1):
             self.assertEqual(fallback.recover(self.item, self.event)['status'], 'valid')
         row = fallback.read(self.item)
         self.assertIsNone(row['error_reason'])
@@ -195,7 +196,7 @@ class FallbackChecks(unittest.TestCase):
         self.assertLessEqual(len(destination.name.encode()),230)
         self.assertIn('(SHA mismatch, drive.oleja.dev)',destination.name)
 
-    def test_metadata_outage_is_retried_with_a_fresh_listing(self):
+    def test_metadata_outage_is_retried_before_deferring_file(self):
         calls=[]
         def listing(*args):
             calls.append(1)
@@ -203,9 +204,34 @@ class FallbackChecks(unittest.TestCase):
             return [self.row]
         with patch.object(nextcloud.Share,'listing',listing),patch.object(nextcloud.Share,'request',return_value=Response(self.content)):
             fallback=Fallback(self.root,self.link,Event())
-            self.assertIsNone(fallback.recover(self.item,self.event))
             self.assertEqual(fallback.recover(self.item,self.event)['status'],'valid')
         self.assertEqual(len(calls),2)
+
+    def test_catalog_cooldown_is_shared_across_fallback_files(self):
+        stopping=Event();fallback=Fallback(self.root,self.link,stopping)
+        with patch.object(stopping,'wait',return_value=False), \
+                patch.object(nextcloud.Share,'listing',side_effect=TimeoutError()) as listing:
+            self.assertIsNone(fallback.recover(self.item,self.event))
+            other=dict(self.item,path='/Course/another.mp4')
+            self.assertIsNone(fallback.recover(other,self.event))
+        self.assertEqual(listing.call_count,3)
+        with patch.object(nextcloud.time,'monotonic',return_value=fallback.index.retry_at['2023-fall/Course']+1), \
+                patch.object(nextcloud.Share,'listing',return_value=[self.row]), \
+                patch.object(nextcloud.Share,'request',return_value=Response(self.content)):
+            self.assertEqual(fallback.recover(self.item,self.event)['status'],'valid')
+
+    def test_permission_failure_can_recover_after_catalog_cooldown(self):
+        fallback=Fallback(self.root,self.link,Event())
+        error=urllib.error.HTTPError('hidden',403,'Forbidden',{},None)
+        with patch.object(nextcloud.time,'monotonic',return_value=100) as clock, \
+                patch.object(nextcloud.Share,'listing',side_effect=error) as listing, \
+                patch.object(nextcloud.Share,'request',return_value=Response(self.content)):
+            self.assertIsNone(fallback.recover(self.item,self.event))
+            self.assertIsNone(fallback.recover(self.item,self.event))
+            self.assertEqual(listing.call_count,1)
+            clock.return_value=161;listing.side_effect=None;listing.return_value=[self.row]
+            self.assertEqual(fallback.recover(self.item,self.event)['status'],'valid')
+            self.assertEqual(listing.call_count,2)
 
     def test_malformed_listing_is_retried_instead_of_crashing_worker(self):
         import xml.etree.ElementTree as ET
