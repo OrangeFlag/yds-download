@@ -26,6 +26,28 @@ class StorageChecks(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.env = dict(YDS_DISK_ROOT=str(self.root), YDS_DISK_DEVICE=str(self.root.stat().st_dev))
 
+    def test_overlapping_archive_uploaders_share_the_same_nonblocking_lock(self):
+        for name in ('opencloud.lock', 'nextcloud.lock'):
+            root = self.root / name
+            (root / '.download').mkdir(parents=True)
+            with storage.lock_archives([root], name):
+                with self.assertRaises(BlockingIOError):
+                    with storage.lock_archives([root, root.resolve()], name):
+                        pass
+            with storage.lock_archives([root], name):
+                pass
+
+    def test_archive_locks_release_all_roots_on_partial_acquisition_failure(self):
+        roots = [self.root / 'a', self.root / 'b']
+        for root in roots:
+            (root / '.download').mkdir(parents=True)
+        with storage.lock_archives([roots[1]], 'opencloud.lock'):
+            with self.assertRaises(BlockingIOError):
+                with storage.lock_archives(roots, 'opencloud.lock'):
+                    pass
+        with storage.lock_archives([roots[0]], 'opencloud.lock'):
+            pass
+
     def test_missing_mount_is_not_a_missing_video(self):
         item = dict(path='/Course/video.mp4', size=7, sha256='1' * 64, file='https://example.invalid/video')
         with patch.dict(os.environ, dict(self.env, YDS_DISK_DEVICE='-1')):
