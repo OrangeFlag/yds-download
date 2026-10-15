@@ -693,7 +693,7 @@ class NextcloudChecks(unittest.TestCase):
         self.assertEqual((row['verified'],row['remote_available'],row['failed']),(0,1,0))
 
 
-if __name__=='__main__':unittest.main()
+
 
 
 class ParallelUploadChecks(unittest.TestCase):
@@ -798,3 +798,80 @@ class ParallelUploadChecks(unittest.TestCase):
             return SimpleNamespace(done=set()) if calls==1 else result
         with patch.object(sync, 'transfer', side_effect=fail), patch.object(nextcloud, 'wait', wait), self.assertRaises(OSError):
             sync.run_once([self.root])
+
+
+class ExpiredMetadataChecks(unittest.TestCase):
+    setUp = NextcloudChecks.setUp
+
+    def error(self, message='Missing metadata for chunked upload. The distributed cache does not hold the information of previous requests.'):
+        xml=('<d:error xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">'
+             '<s:exception>Sabre\\DAV\\Exception\\PreconditionFailed</s:exception>'
+             '<s:message>'+message+'</s:message></d:error>').encode()
+        return urllib.error.HTTPError('https://example.invalid',412,'Precondition failed',{},io.BytesIO(xml))
+
+    def test_missing_metadata_restarts_only_the_failed_upload(self):
+        sent, sessions = [], []
+        def request(share, method, path='', data=None, headers=None, uploads=False):
+            if method=='MKCOL':sessions.append(path)
+            if method=='PUT':
+                sent.append((path,data.read()))
+                if len(sent)==2:raise self.error()
+            return Response()
+        with patch.object(nextcloud.Share,'request',request):
+            nextcloud.Sync(None,self.upload,Event(),chunk_size=4,transfers=1).run_once([self.root])
+        self.assertEqual([b for _,b in sent],[b'lect',b'ure',b'lect',b'ure'])
+        self.assertEqual(len(sessions),2)
+        self.assertNotEqual(sessions[0],sessions[1])
+        rows=json.loads((self.state/'nextcloud-uploads.json').read_text())
+        self.assertEqual(len(rows),1)
+        self.assertEqual(next(iter(rows.values()))['state'],'uploaded')
+        self.assertEqual(next(iter(rows.values()))['payload_sha256'],self.item['sha256'])
+
+    def test_unrelated_412_does_not_reset_the_session(self):
+        methods=[]
+        def request(share, method, path='', data=None, headers=None, uploads=False):
+            methods.append(method)
+            if method=='PUT':
+                data.read();raise self.error('Checksum mismatch')
+            return Response()
+        with patch.object(nextcloud.Share,'request',request):
+            nextcloud.Sync(None,self.upload,Event(),transfers=1).run_once([self.root])
+        self.assertEqual(methods.count('MKCOL'),1)
+        self.assertEqual(methods.count('PUT'),1)
+        row=next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+        self.assertEqual(row['state'],'pending')
+        self.assertEqual(row['error_reason'],'Checksum mismatch')
+
+    def test_412_during_move_never_restarts_the_payload(self):
+        methods=[]
+        def request(share, method, path='', data=None, headers=None, uploads=False):
+            methods.append(method)
+            if method=='PUT':data.read()
+            if method=='MOVE':raise self.error()
+            return Response()
+        with patch.object(nextcloud.Share,'request',request):
+            nextcloud.Sync(None,self.upload,Event(),transfers=1).run_once([self.root])
+        self.assertEqual(methods.count('MKCOL'),1)
+        self.assertEqual(methods.count('PUT'),1)
+        row=next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+        self.assertEqual(row['state'],'unconfirmed')
+        self.assertEqual(row['sent_bytes'],7)
+
+    def test_repeated_metadata_loss_is_bounded(self):
+        methods=[]
+        def request(share, method, path='', data=None, headers=None, uploads=False):
+            methods.append(method)
+            if method=='PUT':
+                data.read();raise self.error()
+            return Response()
+        with patch.object(nextcloud.Share,'request',request):
+            nextcloud.Sync(None,self.upload,Event(),transfers=1).run_once([self.root])
+        self.assertEqual(methods.count('MKCOL'),2)
+        self.assertEqual(methods.count('PUT'),2)
+        row=next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+        self.assertEqual(row['state'],'pending')
+        self.assertEqual(row['next_chunk'],0)
+
+
+if __name__ == '__main__':
+    unittest.main()

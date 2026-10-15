@@ -30,7 +30,8 @@ PROPERTIES = b'<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:p
 
 def error_details(error):
     return dict(error_type=type(error).__name__, http_status=getattr(error, 'code', None),
-                error_reason=str(getattr(error, 'reason', error)), error_errno=network.failure(error)['errno'])
+                error_reason=getattr(error, 'dav_message', None) or str(getattr(error, 'reason', error)),
+                error_errno=network.failure(error)['errno'])
 
 
 def normalized(value):
@@ -380,6 +381,13 @@ class Sync:
                 network.GUARD.observe(path)
                 return response
             except (OSError, http.client.HTTPException) as error:
+                if isinstance(error, urllib.error.HTTPError) and error.code==412:
+                    error.request_method=method
+                    try:
+                        tree=ET.fromstring(error.read(8192))
+                        error.dav_message=tree.findtext('{DAV:}message') or tree.findtext('{http://sabredav.org/ns}message') or ''
+                    except (OSError,http.client.HTTPException,ET.ParseError):
+                        pass
                 if storage.disk_error(error) or not retry.retry(network.failure(error, 'body' if method=='PUT' else 'connect')):
                     raise
                 if isinstance(data, Body):
@@ -391,7 +399,7 @@ class Sync:
                       f'{type(error).__name__}; HTTP={details["http_status"]}; '
                       f'reason={details["error_reason"]!r}; errno={details["error_errno"]}',flush=True)
 
-    def upload(self, root, data, item, local, variant, target, size, percent):
+    def upload(self, root, data, item, local, variant, target, size, percent, allow_session_restart=True):
         state=root/'.download/nextcloud-uploads.json'
         with d.STATE_LOCK:
             ledger=json.loads(state.read_text()) if state.exists() else {}
@@ -423,6 +431,7 @@ class Sync:
         count=(size+row['chunk_size']-1)//row['chunk_size']
         if count>10000:
             raise ValueError('Nextcloud upload needs larger chunks for this video')
+        restart=False
         try:
             if row['next_chunk']<count:
                 collection_exists=False
@@ -508,10 +517,23 @@ class Sync:
         except BaseException as error:
             row.update(state=row['state'] if row['state'] in ('creating_collection','assembling','unconfirmed') else 'pending',
                        **error_details(error))
-            raise
+            if (allow_session_restart and isinstance(error,urllib.error.HTTPError) and error.code==412
+                    and getattr(error,'request_method',None)=='PUT'
+                    and getattr(error,'dav_message','').startswith('Missing metadata for chunked upload.')):
+                self.save(state,row,record=True)
+                previous_id,previous_bytes=row['upload_id'],row['sent_bytes']
+                row.update(state='pending',upload_id=uuid.uuid4().hex,next_chunk=0,sent_bytes=0)
+                print(f'NEXTCLOUD SESSION RESET: {target}; missing server metadata; '
+                      f'previous_session={previous_id}; previous_confirmed_bytes={previous_bytes}; '
+                      f'new_session={row["upload_id"]}',flush=True)
+                restart=True
+            else:
+                raise
         finally:
             row['time']=datetime.now().astimezone().isoformat()
             self.save(state,row,record=True)
+        if restart:
+            self.upload(root,data,item,local,variant,target,size,percent,allow_session_restart=False)
 
 
 def main():
