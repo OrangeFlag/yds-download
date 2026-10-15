@@ -347,9 +347,11 @@ class UploadConcurrency:
 
 
 class Sync:
+    ledger_name = 'nextcloud-uploads'
+
     def __init__(self, existing, upload, stopping, timeout=120, nickname=None, chunk_size=16*1024**2, transfers=4,
-                 auto_transfers=False, min_transfers=2):
-        self.existing, self.share, self.stopping = existing,Share(upload,timeout),stopping
+                 auto_transfers=False, min_transfers=2, share=None):
+        self.existing, self.share, self.stopping = existing,share if share is not None else Share(upload,timeout),stopping
         if nickname and (nickname.startswith('.') or any(ord(c)<32 or c in '/\\' for c in nickname)):
             raise ValueError('Invalid Nextcloud nickname')
         self.share.nickname=nickname
@@ -374,7 +376,7 @@ class Sync:
             self.cache[path] = stamp,value
         return self.cache[path][1]
 
-    def run_once(self, roots):
+    def jobs(self, roots):
         jobs = []
         for root in roots:
             if self.stopping.is_set():
@@ -398,7 +400,7 @@ class Sync:
                     index.retry_at={folder:deadline for folder,deadline in index.retry_at.items() if deadline>current}
                     # Refresh successful listings, retaining only active failure cooldowns.
                     index.folders={folder:error for folder,error in index.folders.items() if folder in index.retry_at}
-            started = {row['path'] for row in self.read(state/'nextcloud-uploads.json', {}).values()
+            started = {row['path'] for row in self.read(state/(self.ledger_name+'.json'), {}).values()
                        if row.get('state')!='uploaded' and row.get('next_chunk',0)>0
                        and row.get('source')==data['source'] and row.get('upload_share')==self.share.url()
                        and row.get('nickname')==self.share.nickname}
@@ -445,6 +447,12 @@ class Sync:
                         percent=100*event['downloaded_bytes']/item['size']
                     jobs.append((item['path'] in started,root,data,item,local,variant,expected_size,percent,index,ordinal,event['mtime_ns']))
         jobs.sort(key=lambda job:not job[0])
+        return jobs
+
+    def run_once(self, roots):
+        jobs = self.jobs(roots)
+        if jobs is None:
+            return
         with ThreadPoolExecutor(max_workers=self.transfers, thread_name_prefix='nextcloud-upload') as pool:
             pending=iter(jobs)
             futures=set()

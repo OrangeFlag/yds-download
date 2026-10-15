@@ -707,7 +707,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                 for manifest in sorted(state.glob('*-manifest.json'), key=lambda path: path.stat().st_mtime_ns):
                     old_entries.update({row['path']: row for row in json.loads(manifest.read_text())})
                 d.bind_resume(root, entries, old_entries, events, False)
-                d.write_json(state / f'{index:02d}-manifest.json', [{key: item[key] for key in ('path', 'size', 'sha256')} for item in entries])
+                d.write_json(state / f'{index:02d}-manifest.json', [{key: item[key] for key in ('path', 'size', 'sha256', 'md5') if key in item} for item in entries])
                 active[course] = index, entries
                 pending = []
                 for item in entries:

@@ -484,7 +484,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
             bind_resume(root, entries, previous_entries, events, deep and not retry_check)
             if not preserve_queue:
                 write_json(state / f'{index:02d}-manifest.json', [
-                    {k: item[k] for k in ('path', 'size', 'sha256')} for item in entries])
+                    {k: item[k] for k in ('path', 'size', 'sha256', 'md5') if k in item} for item in entries])
             print(f"FILES {len(entries)}; SIZE {sum(x['size'] for x in entries)/1024**3:.2f} GiB", flush=True)
             pending = []
             course_failed = []
