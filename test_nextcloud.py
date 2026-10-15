@@ -374,7 +374,7 @@ class NextcloudChecks(unittest.TestCase):
                 patch.object(nextcloud.Share,'request',side_effect=AssertionError('blind upload')):
             nextcloud.Sync(self.read,self.upload,Event()).run_once([self.root])
 
-    def test_http_503_after_sending_body_is_retried_on_next_cycle(self):
+    def test_http_503_after_sending_body_is_retried_immediately(self):
         sent=[]
         def request(share,method,path='',data=None,headers=None,uploads=False):
             if method=='PUT':
@@ -383,8 +383,91 @@ class NextcloudChecks(unittest.TestCase):
             return Response()
         with patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
             sync=nextcloud.Sync(self.read,self.upload,Event())
-            sync.run_once([self.root]);sync.run_once([self.root])
+            sync.run_once([self.root])
         self.assertEqual(sent,[self.content,self.content])
+        self.assertEqual(next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))['state'],'uploaded')
+
+    def test_tls_eof_retries_current_block_before_next_file(self):
+        second = dict(self.item, path='/Course/Z-last.mp4')
+        local = download.target(self.root, second, 'Course')
+        local.write_bytes(self.content)
+        download.write_json(self.state/'01-manifest.json', [self.item, second])
+        download.append_events(self.state/'events.jsonl', [dict(self.proof, **second, local=str(local), mtime_ns=local.stat().st_mtime_ns)])
+        sent = []
+        def request(share, method, path='', data=None, headers=None, uploads=False):
+            if method == 'PUT':
+                sent.append((path, data.read()))
+                if len(sent) == 2:
+                    raise urllib.error.URLError(ssl.SSLEOFError(8, 'TLS EOF'))
+            return Response()
+        with patch.object(nextcloud.Share, 'request', request):
+            nextcloud.Sync(None, self.upload, Event(), chunk_size=4).run_once([self.root])
+        self.assertEqual([body for _, body in sent], [b'lect', b'ure', b'ure', b'lect', b'ure'])
+        self.assertEqual(sent[1][0], sent[2][0])
+        self.assertTrue(all(r['state']=='uploaded' for r in json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+
+    def test_started_upload_in_later_archive_precedes_new_files(self):
+        other = self.root/'other-archive'
+        state = other/'.download'
+        state.mkdir(parents=True)
+        source = dict(self.data, source='https://disk.yandex.ru/d/other', title='ШАД осень 2024')
+        local = download.target(other, self.item, 'Course')
+        local.parent.mkdir(); local.write_bytes(self.content)
+        download.write_json(state/'source.json', source)
+        download.write_json(state/'01-manifest.json', [self.item])
+        download.append_events(state/'events.jsonl', [dict(self.proof, local=str(local), mtime_ns=local.stat().st_mtime_ns)])
+        sent = []
+        fail = True
+        def request(share, method, path='', data=None, headers=None, uploads=False):
+            nonlocal fail
+            if method == 'PROPFIND':
+                response = Response(b'<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>')
+                response.status = 207
+                return response
+            if method == 'PUT':
+                sent.append(data.read())
+                if len(sent)==2 and fail:
+                    fail=False
+                    raise TimeoutError()
+            return Response()
+        with patch.object(nextcloud.Share, 'request', request):
+            with patch.object(nextcloud.network.RequestRetry, 'retry', return_value=False):
+                nextcloud.Sync(None, self.upload, Event(), chunk_size=4).run_once([other])
+            sent.clear()
+            nextcloud.Sync(None, self.upload, Event(), chunk_size=4).run_once([self.root, other])
+        self.assertEqual(sent, [b'ure', b'lect', b'ure'])
+
+    def test_chunk_retry_is_bounded_and_preserves_progress(self):
+        for error in (urllib.error.URLError(ssl.SSLEOFError(8, 'TLS EOF')),
+                      nextcloud.http.client.BadStatusLine('broken status')):
+            calls = []
+            def request(share, method, path='', data=None, headers=None, uploads=False):
+                if method == 'PUT':
+                    calls.append(data.read())
+                    raise error
+                return Response()
+            with self.subTest(error=type(error).__name__), patch.object(nextcloud.Share, 'request', request):
+                nextcloud.Sync(None, self.upload, Event()).run_once([self.root])
+                self.assertEqual(calls, [self.content]*3)
+                row = next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+                self.assertEqual(row['state'], 'pending')
+                self.assertEqual(row['next_chunk'], 0)
+
+    def test_shutdown_interrupts_chunk_retry_without_losing_state(self):
+        stopping = Event()
+        sent = []
+        def request(share, method, path='', data=None, headers=None, uploads=False):
+            if method == 'PUT':
+                sent.append(data.read())
+                stopping.set()
+                raise urllib.error.URLError(ssl.SSLEOFError(8, 'TLS EOF'))
+            return Response()
+        with patch.object(nextcloud.Share, 'request', request):
+            nextcloud.Sync(None, self.upload, stopping).run_once([self.root])
+        self.assertEqual(sent, [self.content])
+        row = next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+        self.assertEqual(row['state'], 'pending')
+        self.assertEqual(row['next_chunk'], 0)
 
     def test_confirmed_chunks_are_not_sent_again_after_restart(self):
         sent=[]
@@ -435,14 +518,15 @@ class NextcloudChecks(unittest.TestCase):
                     raise TimeoutError('Interrupt second chunk')
             return Response()
         with patch.object(nextcloud.Share, 'listing', return_value=[]), patch.object(nextcloud.Share, 'request', request):
-            for _ in range(3):
+            with patch.object(nextcloud.network.RequestRetry, 'retry', return_value=False):
                 nextcloud.Sync(self.read, self.upload, Event(), chunk_size=4).run_once([self.root])
-                if len(sent) == 2:
-                    row = next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
-                    self.assertEqual(row['next_chunk'],1)
+            row = next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+            self.assertEqual(row['next_chunk'],1)
+            self.assertEqual(row['sent_bytes'],4)
+            nextcloud.Sync(self.read, self.upload, Event(), chunk_size=4).run_once([self.root])
         self.assertEqual([body for _,body in sent], [b'lect',b'ure',b'ure'])
         self.assertEqual(sent[1][0],sent[2][0])
-        self.assertEqual(row['sent_bytes'],4)
+        self.assertEqual(checks,2)
         row = next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
         self.assertEqual(row['state'],'uploaded')
 
@@ -462,7 +546,7 @@ class NextcloudChecks(unittest.TestCase):
                 sent.append(data.read())
                 if len(sent)==2:raise TimeoutError('Second chunk interrupted')
             return Response()
-        with patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
+        with patch.object(nextcloud.network.RequestRetry,'retry',return_value=False), patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
             nextcloud.Sync(self.read,self.upload,Event(),chunk_size=4).run_once([self.root])
             created=False;expire=True
             nextcloud.Sync(self.read,self.upload,Event(),chunk_size=4).run_once([self.root])
@@ -516,7 +600,7 @@ class NextcloudChecks(unittest.TestCase):
                     r.get('state')=='uploading' and r.get('next_chunk')==0 for r in value.values()):
                 raise OSError(errno.EIO,'disk disconnected after MKCOL')
             return original(path,value)
-        with patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
+        with patch.object(nextcloud.network.RequestRetry,'retry',return_value=False), patch.object(nextcloud.Share,'listing',return_value=[]),patch.object(nextcloud.Share,'request',request):
             nextcloud.Sync(self.read,self.upload,Event(),chunk_size=4).run_once([self.root])
             created=False;crash=True
             with patch.object(download,'write_json',write_json),self.assertRaises(OSError):

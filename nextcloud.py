@@ -3,6 +3,7 @@ import argparse
 from datetime import datetime
 import fcntl
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -249,6 +250,7 @@ class Sync:
         return self.cache[path][1]
 
     def run_once(self, roots):
+        jobs = []
         for root in roots:
             if self.stopping.is_set():
                 return
@@ -261,6 +263,10 @@ class Sync:
                 print('NEXTCLOUD ARCHIVE SKIPPED: personal/root catalog',flush=True)
                 continue
             index = Index(root,self.existing) if self.existing else None
+            started = {row['path'] for row in self.read(state/'nextcloud-uploads.json', {}).values()
+                       if row.get('state')!='uploaded' and row.get('next_chunk',0)>0
+                       and row.get('source')==data['source'] and row.get('upload_share')==self.share.url()
+                       and row.get('nickname')==self.share.nickname}
             events = {e['path']:e for e in d.iter_events(state/'events.jsonl')}
             for e in self.read(state/'local-copies.json',[]):
                 if e.get('source')==data['source'] and e.get('status')=='valid':
@@ -302,20 +308,49 @@ class Sync:
                             continue
                         variant='partial'
                         percent=100*event['downloaded_bytes']/item['size']
-                    try:
-                        if index and index.contains(data,item):
-                            print('NEXTCLOUD EXISTS: '+item['path'],flush=True)
-                            continue
-                        relative=PurePosixPath(remote_path(data,item))
-                        stem=relative.stem+(f' (partially available {percent:.2f}%)' if percent is not None else '')
-                        name=local_path(Path('/'),f'/{ordinal:03} - {stem}{relative.suffix}').name
-                        target=str(relative.with_name(name))
-                        self.upload(root,data,item,local,variant,target,expected_size,percent)
-                    except (OSError,RuntimeError,ValueError) as error:
-                        if storage.disk_error(error):
-                            raise
-                        details = error_details(error)
-                        print(f'NEXTCLOUD ERROR: {item["path"]}; {type(error).__name__}; HTTP={details["http_status"]}; reason={details["error_reason"]!r}; errno={details["error_errno"]}',flush=True)
+                    jobs.append((item['path'] in started,root,data,item,local,variant,expected_size,percent,index,ordinal,event['mtime_ns']))
+        jobs.sort(key=lambda job:not job[0])
+        for _,root,data,item,local,variant,expected_size,percent,index,ordinal,expected_mtime in jobs:
+            if self.stopping.is_set():
+                return
+            try:
+                storage.check(local)
+                if not local.is_file() or (local.stat().st_size,local.stat().st_mtime_ns)!=(expected_size,expected_mtime):
+                    continue
+                if index and index.contains(data,item):
+                    print('NEXTCLOUD EXISTS: '+item['path'],flush=True)
+                    continue
+                relative=PurePosixPath(remote_path(data,item))
+                stem=relative.stem+(f' (partially available {percent:.2f}%)' if percent is not None else '')
+                name=local_path(Path('/'),f'/{ordinal:03} - {stem}{relative.suffix}').name
+                target=str(relative.with_name(name))
+                self.upload(root,data,item,local,variant,target,expected_size,percent)
+            except (OSError,http.client.HTTPException,RuntimeError,ValueError) as error:
+                if storage.disk_error(error):
+                    raise
+                details = error_details(error)
+                print(f'NEXTCLOUD ERROR: {item["path"]}; {type(error).__name__}; HTTP={details["http_status"]}; reason={details["error_reason"]!r}; errno={details["error_errno"]}',flush=True)
+
+    def request(self, method, path, data=None, **kwargs):
+        retry = network.RequestRetry(path, self.stopping)
+        while True:
+            if self.stopping.is_set():
+                raise InterruptedError('Nextcloud request interrupted')
+            try:
+                response = self.share.request(method, path, data=data, **kwargs)
+                network.GUARD.observe(path)
+                return response
+            except (OSError, http.client.HTTPException) as error:
+                if storage.disk_error(error) or not retry.retry(network.failure(error, 'body' if method=='PUT' else 'connect')):
+                    raise
+                if isinstance(data, Body):
+                    data.stream.seek(0)
+                    data.sent = 0
+                    data.digest = hashlib.sha256()
+                details = error_details(error)
+                print(f'NEXTCLOUD REQUEST RETRY: {method}; session={path}; '
+                      f'{type(error).__name__}; HTTP={details["http_status"]}; '
+                      f'reason={details["error_reason"]!r}; errno={details["error_errno"]}',flush=True)
 
     def upload(self, root, data, item, local, variant, target, size, percent):
         state=root/'.download/nextcloud-uploads.json'
@@ -355,7 +390,7 @@ class Sync:
                 if row['next_chunk']:
                     try:
                         # Check existence without creating a new empty session after a lost response.
-                        with self.share.request('PROPFIND',row['upload_id'],data=PROPERTIES,
+                        with self.request('PROPFIND',row['upload_id'],data=PROPERTIES,
                                 headers={'Depth':'0','Content-Type':'application/xml'},uploads=True) as response:
                             if response.status!=207:
                                 raise RuntimeError('Nextcloud did not confirm the upload session')
@@ -377,7 +412,7 @@ class Sync:
                     d.write_json(state,ledger)
                     try:
                         # Chunking v2 checks the cached parent before file-drop creates course folders.
-                        with self.share.request('MKCOL',row['upload_id'],
+                        with self.request('MKCOL',row['upload_id'],
                             headers={**headers,'Destination':self.share.url(row['upload_id']+'.upload')},uploads=True):
                             row['next_chunk']=0
                             row['sent_bytes']=0
@@ -403,7 +438,7 @@ class Sync:
                     body=Body(io.BytesIO(chunk),len(chunk),self.stopping,local)
                     chunk_headers={**headers,'Content-Length':str(len(chunk)),
                         'OC-Checksum':'SHA256:'+hashlib.sha256(chunk).hexdigest()}
-                    with self.share.request('PUT',row['upload_id']+f'/{number+1:05}',data=body,
+                    with self.request('PUT',row['upload_id']+f'/{number+1:05}',data=body,
                                             headers=chunk_headers,uploads=True) as response:
                         if response.status not in (200,201,204) or body.sent!=len(chunk):
                             raise RuntimeError('Nextcloud did not confirm the complete chunk')
@@ -421,7 +456,7 @@ class Sync:
             row.update(state='assembling',payload_sha256=digest.hexdigest())
             d.write_json(state,ledger)
             try:
-                with self.share.request('MOVE',row['upload_id']+'/.file',
+                with self.request('MOVE',row['upload_id']+'/.file',
                     headers={**headers,'Overwrite':'F','OC-Checksum':'SHA256:'+digest.hexdigest()},uploads=True) as response:
                     if response.status!=201:
                         raise RuntimeError('Nextcloud did not confirm creation of the assembled video')
