@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import ssl
-from threading import Event
+from threading import Barrier, Event, Lock
 from types import SimpleNamespace
 import unittest
 import urllib.error
@@ -401,7 +401,7 @@ class NextcloudChecks(unittest.TestCase):
                     raise urllib.error.URLError(ssl.SSLEOFError(8, 'TLS EOF'))
             return Response()
         with patch.object(nextcloud.Share, 'request', request):
-            nextcloud.Sync(None, self.upload, Event(), chunk_size=4).run_once([self.root])
+            nextcloud.Sync(None, self.upload, Event(), chunk_size=4, transfers=1).run_once([self.root])
         self.assertEqual([body for _, body in sent], [b'lect', b'ure', b'ure', b'lect', b'ure'])
         self.assertEqual(sent[1][0], sent[2][0])
         self.assertTrue(all(r['state']=='uploaded' for r in json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
@@ -432,9 +432,9 @@ class NextcloudChecks(unittest.TestCase):
             return Response()
         with patch.object(nextcloud.Share, 'request', request):
             with patch.object(nextcloud.network.RequestRetry, 'retry', return_value=False):
-                nextcloud.Sync(None, self.upload, Event(), chunk_size=4).run_once([other])
+                nextcloud.Sync(None, self.upload, Event(), chunk_size=4, transfers=1).run_once([other])
             sent.clear()
-            nextcloud.Sync(None, self.upload, Event(), chunk_size=4).run_once([self.root, other])
+            nextcloud.Sync(None, self.upload, Event(), chunk_size=4, transfers=1).run_once([self.root, other])
         self.assertEqual(sent, [b'ure', b'lect', b'ure'])
 
     def test_chunk_retry_is_bounded_and_preserves_progress(self):
@@ -694,3 +694,107 @@ class NextcloudChecks(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+class ParallelUploadChecks(unittest.TestCase):
+    setUp = NextcloudChecks.setUp
+
+    def videos(self, count):
+        items = [dict(self.item, path=f'/Course/{n:02}.mp4') for n in range(count)]
+        for item in items:
+            local = download.target(self.root, item, 'Course')
+            local.write_bytes(self.content)
+            download.append_events(self.state/'events.jsonl', [dict(self.proof, **item,
+                local=str(local), mtime_ns=local.stat().st_mtime_ns)])
+        download.write_json(self.state/'01-manifest.json', items)
+        return items
+
+    def test_four_uploads_overlap_without_losing_ledger_rows(self):
+        self.videos(5)
+        gate, lock = Barrier(4), Lock()
+        sessions, active, peak = set(), 0, 0
+        def request(share, method, path='', data=None, headers=None, uploads=False):
+            nonlocal active, peak
+            if method == 'PUT':
+                with lock:
+                    active += 1; peak = max(peak, active)
+                    sessions.add(path.split('/')[0])
+                    first_wave = len(sessions)<=4 and path.endswith('/00001')
+                try:
+                    data.read()
+                    if first_wave: gate.wait(3)
+                finally:
+                    with lock: active -= 1
+            return Response()
+        with patch.object(nextcloud.Share, 'request', request):
+            nextcloud.Sync(None, self.upload, Event(), chunk_size=4, transfers=4).run_once([self.root])
+        self.assertEqual(peak, 4)
+        rows = json.loads((self.state/'nextcloud-uploads.json').read_text())
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(all(r['state']=='uploaded' and r['next_chunk']==2 for r in rows.values()))
+        successes = [r for r in download.iter_events(self.state/'nextcloud-uploads.jsonl') if r['state']=='uploaded']
+        self.assertEqual({r['key'] for r in successes}, set(rows))
+
+    def test_started_files_fill_the_first_slots_and_keep_original_numbers(self):
+        items = self.videos(6)
+        started = items[2:]
+        sync = nextcloud.Sync(None, self.upload, Event(), transfers=4)
+        download.write_json(self.state/'nextcloud-uploads.json', {str(n):dict(
+            item, state='pending', next_chunk=1, source=self.data['source'],
+            upload_share=sync.share.url(), nickname=None) for n,item in enumerate(started)})
+        gate, lock = Barrier(4), Lock()
+        seen = []
+        def upload(root, data, item, local, variant, target, size, percent):
+            with lock:
+                seen.append((item['path'],target)); first_wave=len(seen)<=4
+            if first_wave:gate.wait(3)
+        with patch.object(sync, 'upload', side_effect=upload):
+            sync.run_once([self.root])
+        self.assertEqual({path for path,_ in seen[:4]}, {item['path'] for item in started})
+        for path,target in seen:
+            number=int(Path(path).stem)+1
+            self.assertTrue(Path(target).name.startswith(f'{number:03} - '))
+
+    def test_disk_failure_stops_active_and_queued_uploads(self):
+        import errno
+        self.videos(3)
+        stopping, gate, lock = Event(), Barrier(2), Lock()
+        calls = []
+        def request(share, method, path='', data=None, headers=None, uploads=False):
+            if method == 'PUT':
+                data.read()
+                with lock:
+                    calls.append(path); first=len(calls)==1
+                gate.wait(3)
+                if first:raise OSError(errno.EIO, 'disk disconnected')
+                if not stopping.wait(3):raise AssertionError('Other worker was not stopped')
+                raise InterruptedError('Stopped')
+            return Response()
+        with patch.object(nextcloud.Share, 'request', request), self.assertRaises(OSError):
+            nextcloud.Sync(None, self.upload, stopping, transfers=2).run_once([self.root])
+        self.assertTrue(stopping.is_set())
+        self.assertEqual(len(calls), 2)
+        rows = json.loads((self.state/'nextcloud-uploads.json').read_text())
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r['next_chunk']==0 for r in rows.values()))
+
+    def test_invalid_concurrency_is_rejected(self):
+        with self.assertRaises(ValueError):
+            nextcloud.Sync(None, self.upload, Event(), transfers=0)
+
+    def test_disk_error_is_not_hidden_by_a_simultaneous_stop(self):
+        import errno
+        stopping = Event()
+        sync = nextcloud.Sync(None, self.upload, stopping)
+        real_wait = nextcloud.wait
+        calls = 0
+        def fail(job):
+            stopping.set()
+            raise OSError(errno.EIO, 'disk disconnected')
+        def wait(futures, **kwargs):
+            nonlocal calls
+            result = real_wait(futures, **kwargs)
+            calls += 1
+            return SimpleNamespace(done=set()) if calls==1 else result
+        with patch.object(sync, 'transfer', side_effect=fail), patch.object(nextcloud, 'wait', wait), self.assertRaises(OSError):
+            sync.run_once([self.root])

@@ -1,5 +1,6 @@
 """Public Nextcloud listings and a separate, durable video upload worker."""
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 import fcntl
 import hashlib
@@ -9,7 +10,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import signal
-from threading import Event
+from threading import Event, Lock
 import time
 import unicodedata
 import urllib.error
@@ -232,12 +233,16 @@ class Body:
 
 
 class Sync:
-    def __init__(self, existing, upload, stopping, timeout=120, nickname=None, chunk_size=16*1024**2):
+    def __init__(self, existing, upload, stopping, timeout=120, nickname=None, chunk_size=16*1024**2, transfers=4):
         self.existing, self.share, self.stopping = existing,Share(upload,timeout),stopping
         if nickname and (nickname.startswith('.') or any(ord(c)<32 or c in '/\\' for c in nickname)):
             raise ValueError('Invalid Nextcloud nickname')
         self.share.nickname=nickname
+        if transfers<1:
+            raise ValueError('Upload concurrency must be positive')
         self.chunk_size=chunk_size
+        self.transfers=transfers
+        self.index_lock=Lock()
         self.cache = {}
 
     def read(self, path, default=None):
@@ -310,26 +315,60 @@ class Sync:
                         percent=100*event['downloaded_bytes']/item['size']
                     jobs.append((item['path'] in started,root,data,item,local,variant,expected_size,percent,index,ordinal,event['mtime_ns']))
         jobs.sort(key=lambda job:not job[0])
-        for _,root,data,item,local,variant,expected_size,percent,index,ordinal,expected_mtime in jobs:
-            if self.stopping.is_set():
-                return
+        with ThreadPoolExecutor(max_workers=self.transfers, thread_name_prefix='nextcloud-upload') as pool:
+            pending=iter(jobs)
+            futures=set()
             try:
-                storage.check(local)
-                if not local.is_file() or (local.stat().st_size,local.stat().st_mtime_ns)!=(expected_size,expected_mtime):
-                    continue
-                if index and index.contains(data,item):
+                while futures or not self.stopping.is_set():
+                    while len(futures)<self.transfers and not self.stopping.is_set():
+                        job=next(pending,None)
+                        if job is None:
+                            break
+                        futures.add(pool.submit(self.transfer,job))
+                    if not futures:
+                        break
+                    for future in wait(futures,timeout=.25,return_when=FIRST_COMPLETED).done:
+                        futures.remove(future)
+                        future.result()
+            except BaseException:
+                self.stopping.set()
+                for future in futures:
+                    future.cancel()
+                raise
+
+    def transfer(self, job):
+        _,root,data,item,local,variant,expected_size,percent,index,ordinal,expected_mtime=job
+        if self.stopping.is_set():
+            return
+        try:
+            storage.check(local)
+            if not local.is_file() or (local.stat().st_size,local.stat().st_mtime_ns)!=(expected_size,expected_mtime):
+                return
+            if index:
+                with self.index_lock:
+                    exists=index.contains(data,item)
+                if exists:
                     print('NEXTCLOUD EXISTS: '+item['path'],flush=True)
-                    continue
-                relative=PurePosixPath(remote_path(data,item))
-                stem=relative.stem+(f' (partially available {percent:.2f}%)' if percent is not None else '')
-                name=local_path(Path('/'),f'/{ordinal:03} - {stem}{relative.suffix}').name
-                target=str(relative.with_name(name))
-                self.upload(root,data,item,local,variant,target,expected_size,percent)
-            except (OSError,http.client.HTTPException,RuntimeError,ValueError) as error:
-                if storage.disk_error(error):
-                    raise
-                details = error_details(error)
-                print(f'NEXTCLOUD ERROR: {item["path"]}; {type(error).__name__}; HTTP={details["http_status"]}; reason={details["error_reason"]!r}; errno={details["error_errno"]}',flush=True)
+                    return
+            relative=PurePosixPath(remote_path(data,item))
+            stem=relative.stem+(f' (partially available {percent:.2f}%)' if percent is not None else '')
+            name=local_path(Path('/'),f'/{ordinal:03} - {stem}{relative.suffix}').name
+            target=str(relative.with_name(name))
+            self.upload(root,data,item,local,variant,target,expected_size,percent)
+        except (OSError,http.client.HTTPException,RuntimeError,ValueError) as error:
+            if storage.disk_error(error):
+                self.stopping.set()
+                raise
+            details = error_details(error)
+            print(f'NEXTCLOUD ERROR: {item["path"]}; {type(error).__name__}; HTTP={details["http_status"]}; reason={details["error_reason"]!r}; errno={details["error_errno"]}',flush=True)
+
+    def save(self, state, row, record=False):
+        with d.STATE_LOCK:
+            ledger=json.loads(state.read_text()) if state.exists() else {}
+            ledger[row['key']]=dict(row)
+            if record:
+                d.append_events(state.with_suffix('.jsonl'),[dict(row)])
+            d.write_json(state,ledger)
 
     def request(self, method, path, data=None, **kwargs):
         retry = network.RequestRetry(path, self.stopping)
@@ -354,32 +393,32 @@ class Sync:
 
     def upload(self, root, data, item, local, variant, target, size, percent):
         state=root/'.download/nextcloud-uploads.json'
-        ledger=json.loads(state.read_text()) if state.exists() else {}
-        stamp=local.stat();fingerprint=[stamp.st_ino,stamp.st_size,stamp.st_mtime_ns]
-        key=hashlib.sha256(json.dumps([self.share.url(),self.share.nickname,data['source'],item['path'],item['sha256'],variant,
-                                    fingerprint if variant=='partial' else None]).encode()).hexdigest()
-        old=ledger.get(key,{})
-        journal=state.with_suffix('.jsonl')
-        if old and old.get('state')!='uploaded' and journal.exists():
-            completed = None
-            for entry in d.iter_events(journal):
-                if entry.get('key') == key and entry.get('state') == 'uploaded':
-                    completed = entry
-            if completed:
-                ledger[key]=completed;d.write_json(state,ledger)
+        with d.STATE_LOCK:
+            ledger=json.loads(state.read_text()) if state.exists() else {}
+            stamp=local.stat();fingerprint=[stamp.st_ino,stamp.st_size,stamp.st_mtime_ns]
+            key=hashlib.sha256(json.dumps([self.share.url(),self.share.nickname,data['source'],item['path'],item['sha256'],variant,
+                                        fingerprint if variant=='partial' else None]).encode()).hexdigest()
+            old=ledger.get(key,{})
+            journal=state.with_suffix('.jsonl')
+            if old and old.get('state')!='uploaded' and journal.exists():
+                completed = None
+                for entry in d.iter_events(journal):
+                    if entry.get('key') == key and entry.get('state') == 'uploaded':
+                        completed = entry
+                if completed:
+                    self.save(state,completed)
+                    return
+            if old.get('state')=='uploaded':
                 return
-        if old.get('state')=='uploaded':
-            return
-        row=dict(key=key,source=data['source'],path=item['path'],size=item['size'],sha256=item['sha256'],variant=variant,
-                 target=target,upload_share=self.share.url(),read_share=Share(self.existing).url() if self.existing else None,
-                 local=str(local),local_stat=fingerprint,payload_size=size,bytes_percent=percent,state='uploading',
-                 time=datetime.now().astimezone().isoformat(),nickname=self.share.nickname,
-                 upload_id=old.get('upload_id') or uuid.uuid4().hex,
-                 chunk_size=old.get('chunk_size',self.chunk_size),
-                 next_chunk=0 if old.get('state')=='creating_collection' else old.get('next_chunk',0))
-        row['sent_bytes']=min(size,row['next_chunk']*row['chunk_size'])
-        ledger[key]=row;d.write_json(state,ledger)
-        d.append_events(state.with_suffix('.jsonl'),[dict(row)])
+            row=dict(key=key,source=data['source'],path=item['path'],size=item['size'],sha256=item['sha256'],variant=variant,
+                     target=target,upload_share=self.share.url(),read_share=Share(self.existing).url() if self.existing else None,
+                     local=str(local),local_stat=fingerprint,payload_size=size,bytes_percent=percent,state='uploading',
+                     time=datetime.now().astimezone().isoformat(),nickname=self.share.nickname,
+                     upload_id=old.get('upload_id') or uuid.uuid4().hex,
+                     chunk_size=old.get('chunk_size',self.chunk_size),
+                     next_chunk=0 if old.get('state')=='creating_collection' else old.get('next_chunk',0))
+            row['sent_bytes']=min(size,row['next_chunk']*row['chunk_size'])
+            self.save(state,row,record=True)
         headers={'Destination':self.share.url(target),'OC-Total-Length':str(size)}
         count=(size+row['chunk_size']-1)//row['chunk_size']
         if count>10000:
@@ -409,7 +448,7 @@ class Sync:
                         row.update(next_chunk=0,sent_bytes=0)
                 if not collection_exists:
                     row['state']='creating_collection'
-                    d.write_json(state,ledger)
+                    self.save(state,row)
                     try:
                         # Chunking v2 checks the cached parent before file-drop creates course folders.
                         with self.request('MKCOL',row['upload_id'],
@@ -420,7 +459,7 @@ class Sync:
                         if error.code!=405:
                             raise
                     row['state']='uploading'
-                    d.write_json(state,ledger)
+                    self.save(state,row)
             print('NEXTCLOUD UPLOAD START: '+target,flush=True)
             digest=hashlib.sha256()
             with local.open('rb') as stream:
@@ -446,15 +485,14 @@ class Sync:
                     if [after.st_ino,after.st_size,after.st_mtime_ns]!=fingerprint:
                         raise RuntimeError('Video changed during upload')
                     row.update(next_chunk=number+1,sent_bytes=min(size,(number+1)*row['chunk_size']))
-                    d.write_json(state,ledger)
-                    d.append_events(journal,[dict(row)])
+                    self.save(state,row,record=True)
                     print(f'NEXTCLOUD UPLOAD PROGRESS: {target}; {row["sent_bytes"]}/{size} bytes',flush=True)
             after=local.stat()
             if ([after.st_ino,after.st_size,after.st_mtime_ns]!=fingerprint
                     or variant=='original' and digest.hexdigest()!=item['sha256']):
                 raise RuntimeError('Video changed during upload or was not sent completely')
             row.update(state='assembling',payload_sha256=digest.hexdigest())
-            d.write_json(state,ledger)
+            self.save(state,row)
             try:
                 with self.request('MOVE',row['upload_id']+'/.file',
                     headers={**headers,'Overwrite':'F','OC-Checksum':'SHA256:'+digest.hexdigest()},uploads=True) as response:
@@ -473,8 +511,7 @@ class Sync:
             raise
         finally:
             row['time']=datetime.now().astimezone().isoformat()
-            d.append_events(journal,[dict(row)])
-            d.write_json(state,ledger)
+            self.save(state,row,record=True)
 
 
 def main():
@@ -488,10 +525,11 @@ def main():
     parser.add_argument('--timeout',type=float,default=120,help='WebDAV socket timeout, seconds')
     parser.add_argument('--nickname',help='File-request sender nickname; defaults to queue mark or yds-download')
     parser.add_argument('--chunk-size-mib',type=int,default=16,help='Resumable upload chunk size, MiB (minimum 5)')
+    parser.add_argument('--transfers',type=int,default=4,help='Maximum simultaneous file uploads (default: 4)')
     parser.add_argument('--once',action='store_true',help='Process currently available local videos once')
     args=parser.parse_args()
-    if args.poll_interval<=0 or args.timeout<=0 or args.chunk_size_mib<5:
-        parser.error('Intervals must be positive')
+    if args.poll_interval<=0 or args.timeout<=0 or args.chunk_size_mib<5 or args.transfers<1:
+        parser.error('Intervals and concurrency must be positive; chunk size must be at least 5 MiB')
     os.umask(0o077)
     stopping=Event()
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:stopping.set())
@@ -500,7 +538,7 @@ def main():
     with lockpath.open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         nickname=args.nickname or (json.loads(args.queue.read_text()).get('mark') if args.queue else None) or 'yds-download'
-        sync=Sync(args.nextcloud_existing,args.nextcloud_upload,stopping,args.timeout,nickname,args.chunk_size_mib*1024**2)
+        sync=Sync(args.nextcloud_existing,args.nextcloud_upload,stopping,args.timeout,nickname,args.chunk_size_mib*1024**2,transfers=args.transfers)
         while not stopping.is_set():
             storage.check(control)
             roots=[Path(a['destination']) for a in json.loads(args.queue.read_text())['archives'] if a.get('enabled',True)] if args.queue else [args.destination.resolve()]
