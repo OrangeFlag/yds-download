@@ -171,15 +171,11 @@ class Uploader(nextcloud.Sync):
         return any(hashes(row).get('sha256')==digest or sha1 is not None and hashes(row).get('sha1')==sha1
                    for row in self.index)
 
-    def name_exists(self, name, size, known=None):
+    def name_exists(self, name, size):
         def plain(value):
             return nextcloud.normalized(re.sub(r'^\d+\s*-\s*','',PurePosixPath(value).name))
-        known=known or {}
-        for row in self.index:
-            if row['size']!=size or plain(row['path'])!=plain(name):continue
-            comparable={key:value for key,value in hashes(row).items() if key in known}
-            if not comparable:return True
-        return False
+        return any(row['size']==size and plain(row['path'])==plain(name) and not hashes(row)
+                   for row in self.index)
 
     def original_exists(self, item, root=None, source=None):
         if self.exists(item['sha256']):return True
@@ -191,11 +187,10 @@ class Uploader(nextcloud.Sync):
             path=root/'.download/opencloud-source-hashes'/(key+'.json')
             cached=self.read(path,{})
             if not md5 and all(cached.get(k)==v for k,v in identity.items()):md5=cached.get('md5')
-        known=dict(sha256=item['sha256'])
         if md5:
-            known['md5']=md5.lower();item['md5']=md5.lower()
+            item['md5']=md5.lower()
         if md5 and any(hashes(row).get('md5')==md5.lower() for row in self.index):return True
-        if self.name_exists(item['path'],item['size'],known):return True
+        if self.name_exists(item['path'],item['size']):return True
         candidates=[row for row in self.index if hashes(row).get('md5')]
         if not candidates:return False
         if not md5 and path is not None:
@@ -283,9 +278,7 @@ class Uploader(nextcloud.Sync):
         name=d.local_path(Path('/'),f'/{ordinal:03} - {relative.stem}{suffix}{local.suffix}').name
         target=self.folder+'/'+str(relative.with_name(name))
         original_exists=self.original_exists(item,root,data['source'])
-        known=dict(sha256=item['sha256']) if variant=='original' else {}
-        if variant=='original' and item.get('md5'):known['md5']=item['md5'].lower()
-        if original_exists or self.name_exists(name,size,known):
+        if original_exists or self.name_exists(name,size):
             if row:
                 row.update(state='existing',error_type=None,http_status=None,error_reason=None,error_errno=None)
                 self.save_record(job,row)

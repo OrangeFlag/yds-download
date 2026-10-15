@@ -134,6 +134,13 @@ class UploadChecks(unittest.TestCase):
         self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
         self.assertEqual(sum(m=='POST' for m,p,h in self.server.calls),1)
 
+    def test_different_algorithm_checksum_does_not_prove_same_name_and_size(self):
+        # A remote SHA1 is not proof of the local SHA256: hash the local file first.
+        self.uploader.index=[dict(path='other/Lecture.mp4',size=len(self.content),
+                                  checksums=['SHA1:'+'0'*40],directory=False)]
+        self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(sum(method=='POST' for method,_,_ in self.server.calls),1)
+
     def test_known_md5_matches_without_name_or_size_filters(self):
         item=dict(self.item,md5=hashlib.md5(self.content).hexdigest())
         self.uploader.index=[dict(path='other/unrelated.mp4',size=1,checksums=['MD5:'+item['md5']],directory=False)]
