@@ -304,6 +304,24 @@ class AdaptiveRangeTest(unittest.TestCase):
         self.assertNotIn('HIDDEN',json.dumps(rows))
         self.assertNotIn('range_eof_retry_details',json.dumps(self.event))
 
+    def test_metrics_failure_after_connect_eof_does_not_break_recovery(self):
+        import ssl
+        from unittest.mock import Mock
+        requests = []
+        metrics = Mock()
+        metrics.eof_retry.side_effect = OSError('Metrics unavailable')
+        def serve(request, **kwargs):
+            requests.append(request.get_header('Range'))
+            if len(requests) == 1:
+                raise urllib.error.URLError(ssl.SSLEOFError(ssl.SSL_ERROR_EOF, 'TLS closed'))
+            return Response(0, len(self.content), len(self.content), self.content)
+        self.tuning.update(range_block_size_kib=128, range_max_passes=1)
+        with patch('network.RequestRetry.retry', return_value=True), patch.object(download, 'api', return_value=self.item), patch.object(download.OPENER, 'open', side_effect=serve):
+            ranges = recovery.retry_ranges(self.root, self.event, self.item, 2, self.tuning, metrics=metrics)
+        self.assertEqual(ranges, [[0, len(self.content)]])
+        self.assertEqual(self.body.read_bytes(), self.content)
+        metrics.warning.assert_called_once()
+
     def test_request_measurements_distinguish_wait_network_and_save(self):
         def serve(request, timeout):
             start, end = map(int, request.get_header('Range')[6:].split('-'))

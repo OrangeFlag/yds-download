@@ -304,20 +304,25 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
             before_attempt = timing['request_attempts']
             before_seconds = timing['request_seconds']
             request_start = bounds[0] + len(data)
-            result = fetch_limited((request_start, bounds[1]), timing)
+            _, chunk, error = fetch_limited((request_start, bounds[1]), timing)
             if after_eof and timing['request_attempts'] > before_attempt and metrics is not None:
                 try:
                     metrics.eof_retry(dict(path=event['path'], sha256=event['sha256'],
                         attempt=timing['request_attempts'], start=request_start, end=bounds[1],
-                        accepted_bytes=len(result[1]) if result[1] else 0,
+                        accepted_bytes=len(chunk) if chunk else 0,
                         request_seconds=timing['request_seconds']-before_seconds,
-                        previous_eof_bytes=previous_eof_bytes, error=result[2]))
-                except (OSError, ValueError, TypeError, AttributeError) as error:
-                    metrics.warning(error)
-            data.extend(result[1] or b'')
+                        previous_eof_bytes=previous_eof_bytes, error=error))
+                except (OSError, ValueError, TypeError, AttributeError) as metric_error:
+                    metrics.warning(metric_error)
+            received = len(chunk) if chunk else 0
+            if not data:
+                data = chunk if chunk is not None else bytearray()
+            elif chunk:
+                data.extend(chunk)
+            del chunk
             failed_url = timing.pop('_request_url', None)
             details = timing['last_failure']
-            eof = (result[2] == 'Incomplete response' or details is not None
+            eof = (error == 'Incomplete response' or details is not None
                    and details['error_type'] in ('SSLEOFError', 'IncompleteRead', 'RemoteDisconnected'))
             if details:
                 key = f'{details["phase"]}:{details["category"]}:{details["errno"]}:{details["http_status"]}'
@@ -344,17 +349,17 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                     after_eof = False
                     timing['retry_reasons']['link_expired'] = 1
                     continue
-                again = (not refresh_errors and len(data) < bounds[1] - bounds[0] and result[2] is not None
+                again = (not refresh_errors and len(data) < bounds[1] - bounds[0] and error is not None
                          and details is not None and not (eof and details['phase'] == 'body')
                          and retry.retry(details))
             except InterruptedError:
                 result = bounds, data or None, 'Interrupted'
                 break
             if not again:
-                result = bounds, data or None, result[2]
+                result = bounds, data or None, error
                 break
             after_eof = eof
-            previous_eof_bytes = len(result[1]) if result[1] else 0
+            previous_eof_bytes = received
             reason = details['category']
             timing['retry_reasons'][reason] = timing['retry_reasons'].get(reason, 0) + 1
         timing['seconds'] = time.monotonic() - started
@@ -545,10 +550,12 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
                         futures.add(pool.submit(fetch, bounds))
                         submitted += 1
                 while futures:
-                    completed, _ = wait(futures, return_when=FIRST_COMPLETED)
-                    for future in completed:
+                    completed = wait(futures, return_when=FIRST_COMPLETED).done
+                    while completed:
+                        future = completed.pop()
                         save_result(future)
                         futures.remove(future)
+                        del future
                         rows = outcomes[first_outcome:]
                         cutoff = (mode == 'probe' and any(row['saved_bytes'] for row in rows)
                                   or mode == 'halving' and attempt < max_passes

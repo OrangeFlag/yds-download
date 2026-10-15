@@ -1,5 +1,8 @@
 """Range planning and failure summaries must not scale with every remote block."""
 import json
+import hashlib
+from contextlib import redirect_stdout
+import io
 from pathlib import Path
 import tempfile
 import tracemalloc
@@ -79,3 +82,42 @@ class CompactResumeChecks(unittest.TestCase):
             code=download.download(dict(source=self.source,title='test'),['Course'],self.root,retries=0)
         self.assertEqual(code,1)
         self.assertEqual(FileState(self.state,'recovery-state').get(self.item['path'])['state'],'finished')
+
+
+class RangeBufferChecks(unittest.TestCase):
+    def test_saved_blocks_are_released_before_next_request(self):
+        block = 2 * 1024 ** 2
+        total = 4 * block
+        class StreamingResponse:
+            status = 206
+            def __init__(self, start, end):
+                self.headers = {'Content-Range': f'bytes {start}-{end-1}/{total}',
+                                'Content-Length': str(end-start)}
+                self.remaining = end-start
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read1(self, size):
+                size = min(size, self.remaining)
+                self.remaining -= size
+                return b'x' * size
+        def serve(request, **kwargs):
+            start, end = map(int, request.get_header('Range')[6:].split('-'))
+            return StreamingResponse(start, end+1)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root/'.download').mkdir()
+            download.write_json(root/'.download/source.json', {'source': 'https://example.invalid/source'})
+            item = dict(path='/Course/video.mp4', size=total, sha256='a'*64, file='https://example.invalid/video')
+            event = dict(item, course='Course', corrupted_path='corrupted/video.mp4')
+            with patch.object(download, 'api', return_value=item), patch.object(download.OPENER, 'open', side_effect=serve), redirect_stdout(io.StringIO()):
+                tracemalloc.start()
+                try:
+                    ranges = recovery.retry_ranges(root, event, item, 0,
+                        dict(range_workers=1, range_max_passes=1, range_block_size_kib=block//1024, range_rps=100000))
+                    peak = tracemalloc.get_traced_memory()[1]
+                finally:
+                    tracemalloc.stop()
+            self.assertEqual(ranges, [[0,total]])
+            self.assertEqual(hashlib.sha256((root/'corrupted/video.mp4').read_bytes()).digest(),
+                             hashlib.sha256(b'x'*total).digest())
+            self.assertLess(peak, 2*block, f'Previous or duplicate block buffers retained: {peak}')
