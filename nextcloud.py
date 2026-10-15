@@ -711,7 +711,8 @@ def main():
         while not stopping.is_set():
             storage.check(control)
             roots=[Path(a['destination']) for a in json.loads(args.queue.read_text())['archives'] if a.get('enabled',True)] if args.queue else [args.destination.resolve()]
-            sync.run_once(roots)
+            with storage.lock_archives(roots, 'nextcloud.lock'):
+                sync.run_once(roots)
             if args.once:
                 break
             stopping.wait(args.poll_interval)

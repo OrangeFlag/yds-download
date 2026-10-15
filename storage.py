@@ -1,5 +1,6 @@
 """Supervise downloads across loss, readonly remounts and reattachment of one disk."""
 import argparse
+from contextlib import contextmanager, ExitStack
 import errno
 import fcntl
 import json
@@ -44,6 +45,20 @@ def check(path):
     if root and device and (str(path) == root or str(path).startswith(root.rstrip('/') + '/')):
         if not mounted_ok(Path(root), int(device)):
             raise StorageUnavailable(root)
+
+
+@contextmanager
+def lock_archives(roots, filename):
+    """Prevent overlapping uploader scopes from mutating the same archive."""
+    with ExitStack() as stack:
+        for root in sorted({Path(root).resolve() for root in roots}):
+            check(root)
+            state = root / '.download'
+            if not state.is_dir():
+                continue
+            lock = stack.enter_context((state / filename).open('a'))
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
 
 
 def mounts():
