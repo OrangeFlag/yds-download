@@ -180,7 +180,7 @@ class NextcloudChecks(unittest.TestCase):
             self.assertFalse(index.contains(self.data, self.item))
             self.assertEqual(len(reads), 2)
 
-    def test_old_upload_receipt_is_not_permanent_proof_of_remote_file(self):
+    def test_old_upload_receipt_survives_absent_remote_listing(self):
         from datetime import datetime, timedelta, timezone
         receipt = dict(state='uploaded', variant='original',
                        read_share=nextcloud.Share(self.read).url(),
@@ -190,32 +190,27 @@ class NextcloudChecks(unittest.TestCase):
                        time=(datetime.now(timezone.utc)-timedelta(days=7)).isoformat())
         download.write_json(self.state / 'nextcloud-uploads.json', {'old': receipt})
         with patch.object(nextcloud.Share, 'listing', return_value=[]):
-            self.assertFalse(nextcloud.Index(self.root, self.read).contains(self.data, self.item))
-        receipt['time'] = datetime.now(timezone.utc).isoformat()
-        download.write_json(self.state / 'nextcloud-uploads.json', {'recent': receipt})
-        with patch.object(nextcloud.Share, 'listing', return_value=[]):
             self.assertTrue(nextcloud.Index(self.root, self.read).contains(self.data, self.item))
 
-    def test_expired_upload_receipt_retries_with_new_upload_session(self):
+    def test_old_upload_receipt_does_not_start_a_new_session(self):
         from datetime import datetime, timedelta, timezone
         sent = []
         def request(share, method, path='', data=None, headers=None, uploads=False):
             if method == 'PUT':
                 sent.append((path, data.read()))
             return Response()
-        with patch.object(nextcloud.Share, 'listing', return_value=[]), \
-                patch.object(nextcloud.Share, 'request', request):
-            nextcloud.Sync(self.read, self.upload, Event()).run_once([self.root])
+        with patch.object(nextcloud.Share, 'request', request):
+            nextcloud.Sync(None, self.upload, Event()).run_once([self.root])
             ledger = self.state / 'nextcloud-uploads.json'
             rows = json.loads(ledger.read_text())
             first_upload_id = next(iter(rows.values()))['upload_id']
             for row in rows.values():
                 row['time'] = (datetime.now(timezone.utc)-timedelta(days=7)).isoformat()
             download.write_json(ledger, rows)
-            nextcloud.Sync(self.read, self.upload, Event()).run_once([self.root])
+            nextcloud.Sync(None, self.upload, Event()).run_once([self.root])
         receipts = json.loads(ledger.read_text())
-        self.assertEqual(len(sent), 2)
-        self.assertNotEqual(first_upload_id, next(iter(receipts.values()))['upload_id'])
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(first_upload_id, next(iter(receipts.values()))['upload_id'])
 
     def test_sync_streams_source_events_without_retaining_bulk_jsonl_history(self):
         sync = nextcloud.Sync(self.read, self.upload, Event())
@@ -253,30 +248,24 @@ class NextcloudChecks(unittest.TestCase):
             self.assertEqual(len(sent), 1)
             self.assertNotIn(journal, sync.cache)
 
-    def test_old_success_journal_does_not_cancel_retry_of_new_upload_session(self):
-        from datetime import datetime, timedelta, timezone
-        sent = []
+    def test_success_journal_cancels_an_accidental_duplicate_session(self):
         def request(share, method, path='', data=None, headers=None, uploads=False):
             if method == 'PUT':
-                sent.append((path, data.read()))
-                if len(sent) == 2:
-                    raise TimeoutError('new upload session interrupted')
+                data.read()
             return Response()
         ledger = self.state / 'nextcloud-uploads.json'
-        with patch.object(nextcloud.Share, 'listing', return_value=[]), \
-                patch.object(nextcloud.Share, 'request', request):
-            nextcloud.Sync(self.read, self.upload, Event()).run_once([self.root])
-            rows = json.loads(ledger.read_text())
-            for row in rows.values():
-                row['time'] = (datetime.now(timezone.utc)-timedelta(days=7)).isoformat()
-            download.write_json(ledger, rows)
-            nextcloud.Sync(self.read, self.upload, Event()).run_once([self.root])
-            pending = next(iter(json.loads(ledger.read_text()).values()))
-            self.assertEqual(pending['state'], 'pending')
-            nextcloud.Sync(self.read, self.upload, Event()).run_once([self.root])
-        self.assertEqual(len(sent), 3)
-        self.assertEqual(sent[1][0], sent[2][0])
-        self.assertEqual(next(iter(json.loads(ledger.read_text()).values()))['state'], 'uploaded')
+        with patch.object(nextcloud.Share, 'request', request):
+            nextcloud.Sync(None, self.upload, Event()).run_once([self.root])
+        rows = json.loads(ledger.read_text())
+        original_id = next(iter(rows.values()))['upload_id']
+        for row in rows.values():
+            row.update(state='pending', upload_id='accidental-duplicate-session', next_chunk=0, sent_bytes=0)
+        download.write_json(ledger, rows)
+        with patch.object(nextcloud.Share, 'request', side_effect=AssertionError('Repeated a completed upload')):
+            nextcloud.Sync(None, self.upload, Event()).run_once([self.root])
+        restored = next(iter(json.loads(ledger.read_text()).values()))
+        self.assertEqual(restored['state'], 'uploaded')
+        self.assertEqual(restored['upload_id'], original_id)
 
     def test_failed_or_ambiguous_upload_is_not_a_success_receipt(self):
         def request(share, method, path='', data=None, headers=None,uploads=False):

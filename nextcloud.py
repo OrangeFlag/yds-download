@@ -31,16 +31,6 @@ def error_details(error):
                 error_reason=str(getattr(error, 'reason', error)), error_errno=network.failure(error)['errno'])
 
 
-def recent_receipt(row):
-    # Allow delayed public indexing, but not indefinite trust after remote deletion.
-    try:
-        written = datetime.fromisoformat(row['time'])
-    except (KeyError, TypeError, ValueError):
-        return False
-    age = (datetime.now().astimezone() - written).total_seconds() if written.tzinfo else -1
-    return 0 <= age < 24 * 60 * 60
-
-
 def normalized(value):
     return unicodedata.normalize('NFC', value).strip()
 
@@ -177,8 +167,8 @@ class Index:
                 return True
             # An old upload receipt must not override newer, conflicting WebDAV evidence.
             conflicting |= row['size'] != item['size'] or bool(hashes)
-        # A receipt without a visible file is a short-lived eventual-consistency hint.
-        return bool(uploaded) and not conflicting and (bool(candidates) or any(map(recent_receipt, uploaded)))
+        # File-drop uploads can remain absent from the public listing indefinitely.
+        return bool(uploaded) and not conflicting
 
     def candidates(self, data, item):
         relative=remote_path(data,item)
@@ -338,17 +328,13 @@ class Sync:
         if old and old.get('state')!='uploaded' and journal.exists():
             completed = None
             for entry in d.iter_events(journal):
-                if (entry.get('key') == key and entry.get('state') == 'uploaded'
-                        and entry.get('upload_id') == old.get('upload_id')):
+                if entry.get('key') == key and entry.get('state') == 'uploaded':
                     completed = entry
             if completed:
                 ledger[key]=completed;d.write_json(state,ledger)
                 return
         if old.get('state')=='uploaded':
-            if recent_receipt(old):
-                return
-            # Remote file is no longer confirmed; a fresh upload needs a new session.
-            old = {}
+            return
         row=dict(key=key,source=data['source'],path=item['path'],size=item['size'],sha256=item['sha256'],variant=variant,
                  target=target,upload_share=self.share.url(),read_share=Share(self.existing).url() if self.existing else None,
                  local=str(local),local_stat=fingerprint,payload_size=size,bytes_percent=percent,state='uploading',
