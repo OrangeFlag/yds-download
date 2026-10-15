@@ -3,7 +3,6 @@ import argparse
 import base64
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
-import fcntl
 import hashlib
 import http.client
 import json
@@ -408,8 +407,7 @@ def main():
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:stopping.set())
     control=args.queue.parent if args.queue else roots[0]/'.download'
     storage.check(control)
-    with (control/'opencloud.lock').open('a') as lock:
-        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    with storage.lock_archives(roots, 'opencloud.lock'):
         client=Client(args.server,args.username,args.password_file.expanduser().read_text().rstrip('\r\n'),args.timeout)
         if args.upload:client.discover()
         else:client.base=client.server+'/dav/spaces/not-connected/'
