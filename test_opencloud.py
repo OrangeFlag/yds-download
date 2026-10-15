@@ -4,7 +4,7 @@ import io
 import json
 from pathlib import Path
 import tempfile
-from threading import Event
+from threading import Barrier, Event, Lock
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -104,6 +104,40 @@ class UploadChecks(unittest.TestCase):
         offsets=[int(h['Upload-Offset']) for m,p,h in self.server.calls if m=='PATCH']
         self.assertEqual(offsets,[0,7,14,21])
         self.assertEqual(sum(m=='POST' for m,p,h in self.server.calls),1)
+        self.assertEqual(sum(m=='HEAD' for m,p,h in self.server.calls),2)
+
+    def test_successful_patch_offsets_need_only_one_head(self):
+        self.uploader.run_once([self.root],upload=True)
+        self.assertEqual(sum(m=='HEAD' for m,p,h in self.server.calls),1)
+        self.assertEqual(sum(m=='PATCH' for m,p,h in self.server.calls),4)
+
+    def test_two_upload_slots_overlap_and_limit_never_exceeds_budget(self):
+        uploader=oc.Uploader(self.server,Event(),transfers=2)
+        uploader.index=[];barrier=Barrier(2);lock=Lock();calls=[]
+        def transfer(job):
+            with lock:calls.append(job)
+            barrier.wait(timeout=3)
+            return True
+        with patch.object(uploader,'jobs',return_value=[self.job()]*4),patch.object(uploader,'transfer',side_effect=transfer):
+            self.assertEqual(uploader.run_once([self.root],upload=True,limit=2),0)
+        self.assertEqual(len(calls),2)
+
+    def test_parallel_identical_payloads_are_uploaded_only_once(self):
+        uploader=oc.Uploader(self.server,Event(),transfers=2)
+        with patch.object(uploader,'jobs',return_value=[self.job()]*2):
+            self.assertEqual(uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(sum(m=='POST' for m,p,h in self.server.calls),1)
+
+    def test_conflicting_known_hash_does_not_fall_back_to_name_and_size(self):
+        self.uploader.index=[dict(path='other/Lecture.mp4',size=len(self.content),
+                                 checksums=['SHA256:'+'0'*64],directory=False)]
+        self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(sum(m=='POST' for m,p,h in self.server.calls),1)
+
+    def test_known_md5_matches_without_name_or_size_filters(self):
+        item=dict(self.item,md5=hashlib.md5(self.content).hexdigest())
+        self.uploader.index=[dict(path='other/unrelated.mp4',size=1,checksums=['MD5:'+item['md5']],directory=False)]
+        self.assertTrue(self.uploader.original_exists(item))
 
     def test_restart_retains_confirmed_session_and_move_conflict(self):
         self.server.fail_move=True

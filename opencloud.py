@@ -1,6 +1,7 @@
 """Explicit, resumable OpenCloud uploads; no background worker is enabled."""
 import argparse
 import base64
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 import fcntl
 import hashlib
@@ -73,8 +74,8 @@ def hashes(row):
 class Uploader(nextcloud.Sync):
     ledger_name='opencloud-uploads'
 
-    def __init__(self, client, stopping, chunk_size=10_000_000, retries=2):
-        super().__init__(None,None,stopping,nickname=client.nickname,transfers=1,share=client)
+    def __init__(self, client, stopping, chunk_size=10_000_000, retries=2, transfers=1):
+        super().__init__(None,None,stopping,nickname=client.nickname,transfers=transfers,share=client)
         if not client.nickname or client.nickname in ('.','..') or any(c in client.nickname for c in '/\\'):
             raise ValueError('Invalid OpenCloud folder name')
         if chunk_size<1 or retries<0:
@@ -82,6 +83,8 @@ class Uploader(nextcloud.Sync):
         self.chunk_size,self.retries=chunk_size,retries
         self.folder='ingest/'+client.nickname
         self.index=None
+        self.active_hashes=set()
+        self.known_folders=set()
 
     def jobs(self, roots):
         jobs=super().jobs(roots) or []
@@ -144,6 +147,7 @@ class Uploader(nextcloud.Sync):
             folder=folders.pop()
             if folder in seen:continue
             seen.add(folder)
+            self.known_folders.add(folder)
             for row in self.share.listing(folder):
                 path=row['path']
                 if row['directory']:
@@ -167,23 +171,35 @@ class Uploader(nextcloud.Sync):
         return any(hashes(row).get('sha256')==digest or sha1 is not None and hashes(row).get('sha1')==sha1
                    for row in self.index)
 
-    def name_exists(self, name, size):
+    def name_exists(self, name, size, known=None):
         def plain(value):
             return nextcloud.normalized(re.sub(r'^\d+\s*-\s*','',PurePosixPath(value).name))
-        return any(row['size']==size and plain(row['path'])==plain(name) for row in self.index)
+        known=known or {}
+        for row in self.index:
+            if row['size']!=size or plain(row['path'])!=plain(name):continue
+            comparable={key:value for key,value in hashes(row).items() if key in known}
+            if not comparable:return True
+        return False
 
     def original_exists(self, item, root=None, source=None):
-        if self.exists(item['sha256']) or self.name_exists(item['path'],item['size']):return True
-        candidates=[row for row in self.index if row['size']==item['size'] and hashes(row).get('md5')]
-        if not candidates:return False
+        if self.exists(item['sha256']):return True
         md5=item.get('md5')
-        if not md5 and root is not None and source:
+        path=None
+        if root is not None and source:
             identity=dict(source=source,path=item['path'],size=item['size'],sha256=item['sha256'])
             key=hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest()
             path=root/'.download/opencloud-source-hashes'/(key+'.json')
             cached=self.read(path,{})
-            if all(cached.get(k)==v for k,v in identity.items()):md5=cached.get('md5')
-            if not md5:
+            if not md5 and all(cached.get(k)==v for k,v in identity.items()):md5=cached.get('md5')
+        known=dict(sha256=item['sha256'])
+        if md5:
+            known['md5']=md5.lower();item['md5']=md5.lower()
+        if md5 and any(hashes(row).get('md5')==md5.lower() for row in self.index):return True
+        if self.name_exists(item['path'],item['size'],known):return True
+        candidates=[row for row in self.index if hashes(row).get('md5')]
+        if not candidates:return False
+        if not md5 and path is not None:
+            if not md5 and any(row['size']==item['size'] for row in candidates):
                 try:
                     metadata=d.api(source,item['path'],stopping=self.stopping)
                     if (metadata.get('size'),metadata.get('sha256'))==(item['size'],item['sha256']):
@@ -195,6 +211,7 @@ class Uploader(nextcloud.Sync):
                     if isinstance(error,InterruptedError) or storage.disk_error(error):raise
                     print(f'OPENCLOUD METADATA WARNING: {item["path"]}; {type(error).__name__}; HTTP={getattr(error,"code",None)}',flush=True)
         if md5 and re.fullmatch('[0-9a-fA-F]{32}',md5):
+            item['md5']=md5.lower()
             return any(hashes(row)['md5']==md5.lower() for row in candidates)
         return False
 
@@ -229,16 +246,29 @@ class Uploader(nextcloud.Sync):
         if isinstance(self.share,Client) and self.share.base is None:self.share.discover()
         if self.index is None:self.index=self.scan()
         jobs.sort(key=lambda job:not bool(self.record(job).get('session_url')))
-        errors=0;uploaded=0
-        for job in jobs:
-            if self.stopping.is_set():break
-            if limit is not None and uploaded>=limit:break
+        errors=0;uploaded=0;pending=iter(jobs)
+        with ThreadPoolExecutor(max_workers=self.transfers,thread_name_prefix='opencloud-upload') as pool:
+            futures={}
             try:
-                uploaded+=bool(self.transfer(job))
-            except (OSError,http.client.HTTPException,RuntimeError,ValueError) as error:
-                if storage.disk_error(error):raise
-                errors+=1
-                print(f'OPENCLOUD ERROR: {job[3]["path"]}; {type(error).__name__}; HTTP={getattr(error,"code",None)}',flush=True)
+                while True:
+                    while (len(futures)<self.transfers and not self.stopping.is_set()
+                           and (limit is None or uploaded+len(futures)<limit)):
+                        job=next(pending,None)
+                        if job is None:break
+                        futures[pool.submit(self.transfer,job)]=job
+                    if not futures:break
+                    for future in wait(futures,timeout=.25,return_when=FIRST_COMPLETED).done:
+                        job=futures.pop(future)
+                        try:
+                            uploaded+=bool(future.result())
+                        except (OSError,http.client.HTTPException,RuntimeError,ValueError) as error:
+                            if storage.disk_error(error):raise
+                            errors+=1
+                            print(f'OPENCLOUD ERROR: {job[3]["path"]}; {type(error).__name__}; HTTP={getattr(error,"code",None)}',flush=True)
+            except BaseException:
+                self.stopping.set()
+                for future in futures:future.cancel()
+                raise
         return 1 if errors else 0
 
     def transfer(self, job):
@@ -252,7 +282,10 @@ class Uploader(nextcloud.Sync):
         suffix=(f' (partially available {percent:.2f}%)' if variant=='partial' else ' (CamRip, completeness unverified)' if variant=='camrip' else '')
         name=d.local_path(Path('/'),f'/{ordinal:03} - {relative.stem}{suffix}{local.suffix}').name
         target=self.folder+'/'+str(relative.with_name(name))
-        if self.original_exists(item,root,data['source']) or self.name_exists(name,size):
+        original_exists=self.original_exists(item,root,data['source'])
+        known=dict(sha256=item['sha256']) if variant=='original' else {}
+        if variant=='original' and item.get('md5'):known['md5']=item['md5'].lower()
+        if original_exists or self.name_exists(name,size,known):
             if row:
                 row.update(state='existing',error_type=None,http_status=None,error_reason=None,error_errno=None)
                 self.save_record(job,row)
@@ -276,13 +309,20 @@ class Uploader(nextcloud.Sync):
         row=row or dict(source=data['source'],path=item['path'],variant=variant,target=target,
                         payload_sha256=actual,size=size,sent_bytes=0,state='pending')
         row['payload_md5']=md5.hexdigest()
+        with self.index_lock:
+            if actual in self.active_hashes or self.exists(actual,sha1):
+                print('OPENCLOUD DUPLICATE ACTIVE/EXISTS: '+item['path'],flush=True);return False
+            self.active_hashes.add(actual)
         try:
-            for folder in reversed(PurePosixPath(target).parents):
-                if str(folder)=='.':continue
-                try:
-                    with self.share.request('MKCOL',str(folder)):pass
-                except urllib.error.HTTPError as error:
-                    if error.code!=405:raise
+            with self.index_lock:
+                for folder in reversed(PurePosixPath(target).parents):
+                    folder=str(folder)
+                    if folder=='.' or folder in self.known_folders:continue
+                    try:
+                        with self.share.request('MKCOL',folder):pass
+                    except urllib.error.HTTPError as error:
+                        if error.code!=405:raise
+                    self.known_folders.add(folder)
             if not row.get('session_url'):
                 metadata={'filename':PurePosixPath(stage).name,'checksum':'SHA1 '+sha1,'mtime':str(mtime//10**9)}
                 headers={'Tus-Resumable':'1.0.0','Upload-Length':str(size),'Content-Length':'0',
@@ -293,7 +333,7 @@ class Uploader(nextcloud.Sync):
                     row['session_url']=self.share.safe_url(response.headers['Location'])
                 row['state']='uploading';self.save_record(job,row)
             print('OPENCLOUD UPLOAD START: '+target,flush=True)
-            failures=0
+            failures=0;offset=None
             with local.open('rb') as stream:
                 while row['sent_bytes']<size:
                     if self.stopping.is_set():raise InterruptedError('OpenCloud upload interrupted')
@@ -301,16 +341,17 @@ class Uploader(nextcloud.Sync):
                     after=local.stat()
                     if (after.st_ino,after.st_size,after.st_mtime_ns)!=fingerprint:raise RuntimeError('Local video changed')
                     try:
-                        try:
-                            with self.share.request('HEAD',row['session_url'],headers={'Tus-Resumable':'1.0.0'}) as response:
-                                offset=int(response.headers['Upload-Offset'])
-                                if int(response.headers.get('Upload-Length',size))!=size or not 0<=offset<=size:
-                                    raise RuntimeError('Invalid OpenCloud upload offset/length')
-                        except urllib.error.HTTPError as error:
-                            if error.code not in (404,410):raise
-                            self.confirm_publication(row,stage,sha1)
-                            offset=size
-                        row['sent_bytes']=offset;self.save_record(job,row)
+                        if offset is None:
+                            try:
+                                with self.share.request('HEAD',row['session_url'],headers={'Tus-Resumable':'1.0.0'}) as response:
+                                    offset=int(response.headers['Upload-Offset'])
+                                    if int(response.headers.get('Upload-Length',size))!=size or not 0<=offset<=size:
+                                        raise RuntimeError('Invalid OpenCloud upload offset/length')
+                            except urllib.error.HTTPError as error:
+                                if error.code not in (404,410):raise
+                                self.confirm_publication(row,stage,sha1)
+                                offset=size
+                            row.update(sent_bytes=offset,state='uploading');self.save_record(job,row)
                         if offset==size:break
                         stream.seek(offset);chunk=stream.read(min(self.chunk_size,size-offset))
                         if len(chunk)!=min(self.chunk_size,size-offset):raise RuntimeError('Local video truncated')
@@ -318,10 +359,12 @@ class Uploader(nextcloud.Sync):
                             'Tus-Resumable':'1.0.0','Upload-Offset':str(offset),'Content-Type':'application/offset+octet-stream'}) as response:
                             if response.status!=204 or int(response.headers['Upload-Offset'])!=offset+len(chunk):
                                 raise RuntimeError('OpenCloud did not confirm the complete chunk')
-                        row.update(sent_bytes=offset+len(chunk),state='uploading');self.save_record(job,row)
+                        offset+=len(chunk)
+                        row.update(sent_bytes=offset,state='uploading');self.save_record(job,row)
                         print(f'OPENCLOUD UPLOAD PROGRESS: {target}; {row["sent_bytes"]}/{size} bytes',flush=True)
                         failures=0
                     except (OSError,http.client.HTTPException) as error:
+                        offset=None
                         if storage.disk_error(error) or isinstance(error,urllib.error.HTTPError) and error.code not in (408,409,429,500,502,503,504):raise
                         failures+=1
                         if failures>self.retries:raise
@@ -341,6 +384,8 @@ class Uploader(nextcloud.Sync):
             return True
         except BaseException as error:
             row.update(state='pending',**nextcloud.error_details(error));self.save_record(job,row);raise
+        finally:
+            with self.index_lock:self.active_hashes.discard(actual)
 
 
 def main():
@@ -355,9 +400,12 @@ def main():
     parser.add_argument('--chunk-size',type=int,default=10_000_000,help='TUS chunk bytes, default 10000000')
     parser.add_argument('--timeout',type=float,default=120)
     parser.add_argument('--retries',type=int,default=2)
+    parser.add_argument('--transfers',type=int,default=1,help='Simultaneous file uploads, default 1')
+    parser.add_argument('--poll-interval',type=float,help='Repeat upload passes after this many seconds; requires --upload')
     args=parser.parse_args()
     if (not args.queue and not args.destination or args.limit is not None and args.limit<1
-            or args.chunk_size<1 or args.retries<0 or not math.isfinite(args.timeout) or args.timeout<=0):
+            or args.chunk_size<1 or args.retries<0 or args.transfers<1 or not math.isfinite(args.timeout) or args.timeout<=0
+            or args.poll_interval is not None and (not args.upload or not math.isfinite(args.poll_interval) or args.poll_interval<=0)):
         parser.error('Specify archives and positive limit/chunk-size/timeout, non-negative retries')
     roots=[Path(x['destination']).resolve() for x in json.loads(args.queue.read_text())['archives'] if x.get('enabled',True)] if args.queue else []
     roots=list(dict.fromkeys(roots+[p.resolve() for p in args.destination]))
@@ -372,7 +420,12 @@ def main():
         client=Client(args.server,args.username,args.password_file.expanduser().read_text().rstrip('\r\n'),args.timeout)
         if args.upload:client.discover()
         else:client.base=client.server+'/dav/spaces/not-connected/'
-        result=Uploader(client,stopping,args.chunk_size,args.retries).run_once(roots,args.upload,args.limit)
+        uploader=Uploader(client,stopping,args.chunk_size,args.retries,args.transfers)
+        while not stopping.is_set():
+            result=uploader.run_once(roots,args.upload,args.limit)
+            if args.poll_interval is None:break
+            if stopping.wait(args.poll_interval):break
+            uploader.index=None;uploader.known_folders.clear()
         return 130 if stopping.is_set() else result
 
 
