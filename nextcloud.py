@@ -233,8 +233,84 @@ class Body:
         return data
 
 
+class UploadConcurrency:
+    def __init__(self, minimum, maximum):
+        if not 1<=minimum<=maximum:
+            raise ValueError('Expected 1 <= minimum uploads <= maximum uploads')
+        self.minimum, self.maximum, self.limit = minimum, maximum, minimum
+        self.lock = Lock()
+        self.total = 0
+        self.window = None
+        self.trial = None
+        self.direction = 1
+        self.next_probe = 0
+
+    def confirmed(self, size):
+        with self.lock:
+            self.total += size
+
+    def update(self, active):
+        now = time.monotonic()
+        with self.lock:
+            total = self.total
+        # An unfinished experiment cannot be compared across a workload gap.
+        if active<self.limit:
+            if self.trial is not None:
+                self.limit = self.trial[0]
+                self.trial = None
+                self.next_probe = now+300
+            self.window = None
+            return self.limit
+        draining = active>self.limit
+        if draining and (self.trial is None or active!=self.trial[0]):
+            self.window = None
+            return self.limit
+        if self.window is None or self.window[2]!=active:
+            self.window = now,total,active
+            return self.limit
+        started, previous, _ = self.window
+        if now-started<90:
+            return self.limit
+        rate = (total-previous)/(now-started)
+        self.window = now,total,active
+        if draining:
+            self.trial = active,rate
+            print(f'NEXTCLOUD CONCURRENCY: active={active}; next_limit={self.limit}; '
+                  f'confirmed_mbit_s={rate*8/1_000_000:.2f}; draining',flush=True)
+            return self.limit
+        old_limit = self.limit
+        reason = 'hold'
+        if self.trial is not None:
+            old, baseline = self.trial
+            self.trial = None
+            threshold = 11 if self.limit>old else 9
+            if rate*10<baseline*threshold:
+                self.direction = -1 if self.limit>old else 1
+                self.limit = old
+                self.next_probe = now+300
+                reason = 'rollback'
+            elif self.limit in (self.minimum,self.maximum):
+                self.direction *= -1
+                self.next_probe = now+300
+        if self.limit==old_limit and rate>0 and now>=self.next_probe:
+            candidate = self.limit+self.direction
+            if not self.minimum<=candidate<=self.maximum:
+                self.direction *= -1
+                candidate = self.limit+self.direction
+            if self.minimum<=candidate<=self.maximum:
+                self.trial = self.limit,rate
+                self.limit = candidate
+                reason = 'probe'
+        if self.limit!=old_limit:
+            self.window = None
+        print(f'NEXTCLOUD CONCURRENCY: active={active}; limit={old_limit}; '
+              f'confirmed_mbit_s={rate*8/1_000_000:.2f}; next_limit={self.limit}; {reason}',flush=True)
+        return self.limit
+
+
 class Sync:
-    def __init__(self, existing, upload, stopping, timeout=120, nickname=None, chunk_size=16*1024**2, transfers=4):
+    def __init__(self, existing, upload, stopping, timeout=120, nickname=None, chunk_size=16*1024**2, transfers=4,
+                 auto_transfers=False, min_transfers=2):
         self.existing, self.share, self.stopping = existing,Share(upload,timeout),stopping
         if nickname and (nickname.startswith('.') or any(ord(c)<32 or c in '/\\' for c in nickname)):
             raise ValueError('Invalid Nextcloud nickname')
@@ -243,6 +319,10 @@ class Sync:
             raise ValueError('Upload concurrency must be positive')
         self.chunk_size=chunk_size
         self.transfers=transfers
+        self.concurrency=UploadConcurrency(min_transfers,transfers) if auto_transfers else None
+        if self.concurrency:
+            print(f'NEXTCLOUD AUTO TRANSFERS: minimum={min_transfers}; maximum={transfers}; '
+                  'sample_seconds=90; probe_interval_seconds=300',flush=True)
         self.index_lock=Lock()
         self.cache = {}
 
@@ -321,11 +401,14 @@ class Sync:
             futures=set()
             try:
                 while futures or not self.stopping.is_set():
-                    while len(futures)<self.transfers and not self.stopping.is_set():
+                    limit=self.concurrency.limit if self.concurrency else self.transfers
+                    while len(futures)<limit and not self.stopping.is_set():
                         job=next(pending,None)
                         if job is None:
                             break
                         futures.add(pool.submit(self.transfer,job))
+                    if self.concurrency:
+                        self.concurrency.update(len(futures))
                     if not futures:
                         break
                     for future in wait(futures,timeout=.25,return_when=FIRST_COMPLETED).done:
@@ -495,6 +578,8 @@ class Sync:
                         raise RuntimeError('Video changed during upload')
                     row.update(next_chunk=number+1,sent_bytes=min(size,(number+1)*row['chunk_size']))
                     self.save(state,row,record=True)
+                    if self.concurrency:
+                        self.concurrency.confirmed(len(chunk))
                     print(f'NEXTCLOUD UPLOAD PROGRESS: {target}; {row["sent_bytes"]}/{size} bytes',flush=True)
             after=local.stat()
             if ([after.st_ino,after.st_size,after.st_mtime_ns]!=fingerprint
@@ -548,10 +633,14 @@ def main():
     parser.add_argument('--nickname',help='File-request sender nickname; defaults to queue mark or yds-download')
     parser.add_argument('--chunk-size-mib',type=int,default=16,help='Resumable upload chunk size, MiB (minimum 5)')
     parser.add_argument('--transfers',type=int,default=4,help='Maximum simultaneous file uploads (default: 4)')
+    parser.add_argument('--auto-transfers',action='store_true',help='Adjust file concurrency using confirmed upload speed')
+    parser.add_argument('--min-transfers',type=int,default=2,help='Minimum concurrency with --auto-transfers (default: 2)')
     parser.add_argument('--once',action='store_true',help='Process currently available local videos once')
     args=parser.parse_args()
     if args.poll_interval<=0 or args.timeout<=0 or args.chunk_size_mib<5 or args.transfers<1:
         parser.error('Intervals and concurrency must be positive; chunk size must be at least 5 MiB')
+    if args.auto_transfers and not 1<=args.min_transfers<=args.transfers:
+        parser.error('Auto uploads require 1 <= --min-transfers <= --transfers')
     os.umask(0o077)
     stopping=Event()
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:stopping.set())
@@ -560,7 +649,8 @@ def main():
     with lockpath.open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         nickname=args.nickname or (json.loads(args.queue.read_text()).get('mark') if args.queue else None) or 'yds-download'
-        sync=Sync(args.nextcloud_existing,args.nextcloud_upload,stopping,args.timeout,nickname,args.chunk_size_mib*1024**2,transfers=args.transfers)
+        sync=Sync(args.nextcloud_existing,args.nextcloud_upload,stopping,args.timeout,nickname,args.chunk_size_mib*1024**2,
+                  transfers=args.transfers,auto_transfers=args.auto_transfers,min_transfers=args.min_transfers)
         while not stopping.is_set():
             storage.check(control)
             roots=[Path(a['destination']) for a in json.loads(args.queue.read_text())['archives'] if a.get('enabled',True)] if args.queue else [args.destination.resolve()]

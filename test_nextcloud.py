@@ -873,5 +873,165 @@ class ExpiredMetadataChecks(unittest.TestCase):
         self.assertEqual(row['next_chunk'],0)
 
 
+class AdaptiveUploadChecks(unittest.TestCase):
+    def setUp(self):
+        clock = patch.object(nextcloud.time, 'monotonic', return_value=0)
+        self.clock = clock.start()
+        self.addCleanup(clock.stop)
+        self.control = nextcloud.UploadConcurrency(2, 8)
+
+    def sample(self, rate, active=None):
+        active = self.control.limit if active is None else active
+        self.control.update(active)
+        self.clock.return_value += 90
+        self.control.confirmed(int(rate*90))
+        return self.control.update(active)
+
+    def test_grows_only_with_measured_gain_and_never_above_eight(self):
+        self.assertEqual(self.control.limit, 2)
+        self.assertEqual(self.sample(100), 3)
+        for limit in range(4, 9):
+            self.assertEqual(self.sample(100*2**(limit-3)), limit)
+        self.assertEqual(self.sample(6400), 8)
+
+    def test_failed_increase_rolls_back_and_later_tries_fewer_files(self):
+        self.sample(100)
+        self.assertEqual(self.sample(105), 2)
+        self.assertEqual(self.sample(100), 2)
+        self.clock.return_value += 300
+        self.assertEqual(self.sample(100), 3)
+        self.assertEqual(self.sample(200), 4)
+        self.assertEqual(self.sample(200), 3)
+        self.clock.return_value += 300
+        self.assertEqual(self.sample(200), 2)
+        self.assertEqual(self.sample(200), 2)
+
+    def test_insufficient_work_and_draining_do_not_change_the_limit(self):
+        self.assertEqual(self.sample(100, active=1), 2)
+        self.sample(100)
+        self.sample(100)
+        self.assertEqual(self.control.limit, 2)
+        self.assertEqual(self.sample(0, active=3), 2)
+        self.assertIsNone(self.control.window)
+
+    def test_idle_time_is_excluded_and_zero_speed_never_adds_connections(self):
+        self.assertEqual(self.sample(0), 2)
+        self.control.update(0)
+        self.clock.return_value += 3600
+        self.assertEqual(self.sample(100), 3)
+
+    def test_bad_limits_are_rejected(self):
+        for bounds in ((0,8),(3,2)):
+            with self.assertRaises(ValueError):
+                nextcloud.UploadConcurrency(*bounds)
+
+    def test_incomplete_trial_is_abandoned_when_work_runs_out(self):
+        self.sample(100)
+        self.assertEqual(self.control.trial,(2,100))
+        self.assertEqual(self.control.update(0),2)
+        self.assertIsNone(self.control.trial)
+        self.clock.return_value += 3600
+        self.assertEqual(self.sample(20),3)
+        self.assertEqual(self.control.trial,(2,20))
+
+    def test_exact_ten_percent_gain_is_accepted(self):
+        self.sample(100)
+        self.assertEqual(self.sample(110),4)
+
+    def test_downward_trial_refreshes_baseline_while_old_files_drain(self):
+        self.control.limit=2
+        self.control.trial=(3,100)
+        self.control.direction=-1
+        self.assertEqual(self.sample(200,active=3),2)
+        self.assertEqual(self.control.trial,(3,200))
+        self.assertEqual(self.sample(190),2)
+        self.assertIsNone(self.control.trial)
+
+
+class AdaptiveUploadIntegrationChecks(unittest.TestCase):
+    setUp = NextcloudChecks.setUp
+    videos = ParallelUploadChecks.videos
+
+    def test_freed_slots_are_refilled_before_sampling(self):
+        self.videos(8)
+        sync = nextcloud.Sync(None,self.upload,Event(),transfers=8,auto_transfers=True)
+        observed=[]
+        real_update=sync.concurrency.update
+        def update(active):
+            observed.append(active)
+            return real_update(active)
+        real_wait=nextcloud.wait
+        def wait(futures, **kwargs):
+            return real_wait(futures)
+        with patch.object(sync,'transfer'),patch.object(sync.concurrency,'update',update),patch.object(nextcloud,'wait',wait):
+            sync.run_once([self.root])
+        self.assertEqual(observed[:4],[2,2,2,2])
+        self.assertEqual(observed[-1],0)
+
+    def test_auto_starts_at_two_and_counts_only_confirmed_blocks(self):
+        self.videos(5)
+        sync = nextcloud.Sync(None,self.upload,Event(),chunk_size=4,transfers=8,auto_transfers=True)
+        gate, lock = Barrier(2), Lock()
+        sessions, failed, active, peak = set(), False, 0, 0
+        def request(share, method, path='', data=None, headers=None, uploads=False):
+            nonlocal failed, active, peak
+            if method=='PUT':
+                with lock:
+                    active += 1; peak = max(peak,active)
+                    first = path.split('/')[0] not in sessions and len(sessions)<2
+                    sessions.add(path.split('/')[0])
+                try:
+                    data.read()
+                    if first:gate.wait(3)
+                    with lock:
+                        if not failed:
+                            failed=True
+                            raise urllib.error.URLError(ssl.SSLEOFError(8,'TLS EOF'))
+                finally:
+                    with lock:active -= 1
+            return Response()
+        with patch.object(nextcloud.Share,'request',request):
+            sync.run_once([self.root])
+        self.assertEqual(peak,2)
+        self.assertEqual(sync.concurrency.total,35)
+        # Permanent receipts and resumed prefixes add no newly confirmed bytes.
+        with patch.object(nextcloud.Share,'request',side_effect=AssertionError('Duplicate upload')):
+            sync.run_once([self.root])
+        self.assertEqual(sync.concurrency.total,35)
+
+    def test_lower_limit_drains_started_files_without_starting_extras(self):
+        self.videos(5)
+        sync = nextcloud.Sync(None,self.upload,Event(),transfers=8,auto_transfers=True)
+        sync.concurrency.limit=3
+        gate, release, lock = Barrier(3), Event(), Lock()
+        started, finished = [], []
+        def transfer(job):
+            with lock:
+                started.append(job[3]['path']); number=len(started)
+            if number<=3:
+                gate.wait(3)
+                if number<3 and not release.wait(3):
+                    raise AssertionError('Scheduler did not drain active uploads')
+            with lock:finished.append(job[3]['path'])
+        real_wait = nextcloud.wait
+        reduced = False
+        def wait(futures, **kwargs):
+            nonlocal reduced
+            if reduced and not release.is_set():
+                self.assertEqual(len(started),3)
+                self.assertEqual(len(futures),2)
+                release.set()
+            result=real_wait(futures,**kwargs)
+            if result.done and not reduced:
+                sync.concurrency.limit=2
+                reduced=True
+            return result
+        with patch.object(sync,'transfer',side_effect=transfer),patch.object(nextcloud,'wait',wait):
+            sync.run_once([self.root])
+        self.assertTrue(reduced)
+        self.assertCountEqual(started,finished)
+        self.assertEqual(len(finished),5)
+
+
 if __name__ == '__main__':
     unittest.main()
