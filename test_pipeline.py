@@ -115,6 +115,20 @@ class PipelineChecks(unittest.TestCase):
         self.assertTrue(events)
         self.assertTrue(all(event['status'] == 'valid' for event in events))
 
+    def test_pipeline_uses_compact_index_for_range_history_and_avoids_full_rescans(self):
+        (self.root / '.download').mkdir()
+        event=dict(self.items['First'],status='invalid',course='First',time='2026-10-01',
+                   range_attempts=['X'*4096]*200)
+        download.append_events(self.root/'.download/events.jsonl',[event])
+        with patch.object(download,'iter_events',side_effect=AssertionError('Full event dictionary rebuilt')):
+            self.assertEqual(self.run_download(),0)
+        index=download.EventIndex(self.root/'.download/events.jsonl')
+        proofs=index.refresh()
+        self.assertNotIn('range_attempts',proofs[event['path']])
+        self.assertEqual(proofs[event['path']]['sha256'],event['sha256'])
+        self.assertEqual(proofs[event['path']]['status'],'valid')
+        self.assertLess(len(str(proofs[event['path']])),500)
+
     def test_foreground_shared_budget_uses_configured_rps(self):
         from request_budget import ProcessRangeBudget
         budget = self.root / 'http-budget'
