@@ -1,0 +1,180 @@
+{
+  "repo": "/home/geerkics/gitRepos/yds-download",
+  "state_dir": "/home/geerkics/.local/state/yds-download",
+  "mount_root": "/run/media/geerkics/088d300e-87f5-4293-999d-80726a0b22502",
+  "disk_uuid": "088d300e-87f5-4293-999d-80726a0b2250",
+  "previous_mounts": [
+    "/run/media/geerkics/088d300e-87f5-4293-999d-80726a0b2250",
+    "/run/media/geerkics/088d300e-87f5-4293-999d-80726a0b22501"
+  ],
+  "course_queue": "$mount_root/YandexDisk/.download/semester-queue/queue.json",
+  "queue_tuning": {
+    "auto_concurrency": false,
+    "download_concurrency": 4,
+    "connections": 4,
+    "split": 4,
+    "range_retry_delay": 3,
+    "range_workers": 2,
+    "range_rps": 5,
+    "timeout": 30,
+    "rpc_timeout": 30.0,
+    "rpc_status_retries": 2
+  },
+  "environment": {
+    "ALL_PROXY": "socks://127.0.0.1:7890",
+    "HTTPS_PROXY": "http://127.0.0.1:7890",
+    "HTTP_PROXY": "http://127.0.0.1:7890",
+    "NO_PROXY": "localhost,127.0.0.0/8,::1",
+    "all_proxy": "socks://127.0.0.1:7890",
+    "http_proxy": "http://127.0.0.1:7890",
+    "https_proxy": "http://127.0.0.1:7890",
+    "no_proxy": "localhost,127.0.0.0/8,::1"
+  },
+  "properties": {
+    "MemoryMax": "infinity",
+    "MemoryHigh": "infinity",
+    "MemorySwapMax": "infinity",
+    "TasksMax": "18321"
+  },
+  "services": {
+    "queue": {
+      "command": [
+        "python3",
+        "$repo/semester_queue.py",
+        "$mount_root/YandexDisk/.download/semester-queue/queue.json",
+        "--defer-range",
+        "--range-budget",
+        "$mount_root/YandexDisk/.download/http-budget",
+        "--range-files",
+        "16",
+        "--nextcloud-fallback",
+        "https://NEXTCLOUD/index.php/s/READ_SHARE",
+        "--opencloud-fallback",
+        "https://ysda-recover-dsk.jumpingcrab.com",
+        "--opencloud-username",
+        "Walterit",
+        "--opencloud-password-file",
+        "$home/.jumpingcrub.apptoken",
+        "--download-budget",
+        "$state_dir/download-budget",
+        "--download-min-files",
+        "2",
+        "--download-max-files",
+        "8"
+      ],
+      "environment": {
+        "FTP_PROXY": "ftp://127.0.0.1:2334",
+        "ftp_proxy": "ftp://127.0.0.1:2334"
+      }
+    },
+    "range": {
+      "command": [
+        "python3",
+        "$repo/range_queue.py",
+        "--queue",
+        "$mount_root/YandexDisk/Личный Яндекс Диск/.download/personal-queue.json",
+        "--queue",
+        "$mount_root/YandexDisk/.download/semester-queue/queue.json",
+        "--files",
+        "16",
+        "--secondary-slots",
+        "8",
+        "--requests-per-file",
+        "2",
+        "--requests",
+        "12",
+        "--rps",
+        "5",
+        "--budget",
+        "$mount_root/YandexDisk/.download/http-budget",
+        "--nextcloud-fallback",
+        "https://NEXTCLOUD/index.php/s/READ_SHARE",
+        "--recheck-interval",
+        "86400",
+        "--recheck-files",
+        "8",
+        "--recheck-probes",
+        "16",
+        "--recheck-full-interval",
+        "604800",
+        "--opencloud-fallback",
+        "https://ysda-recover-dsk.jumpingcrab.com",
+        "--opencloud-username",
+        "Walterit",
+        "--opencloud-password-file",
+        "$home/.jumpingcrub.apptoken",
+        "--download-budget",
+        "$state_dir/download-budget",
+        "--download-min-files",
+        "2",
+        "--download-max-files",
+        "8"
+      ],
+      "properties": {
+        "MemoryMax": "3221225472",
+        "MemoryHigh": "2684354560",
+        "MemoryAccounting": "yes"
+      },
+      "environment": {
+        "FTP_PROXY": "ftp://127.0.0.1:2334",
+        "ftp_proxy": "ftp://127.0.0.1:2334",
+        "MALLOC_ARENA_MAX": "2"
+      }
+    },
+    "nextcloud": {
+      "command": [
+        "/usr/bin/python3",
+        "$repo/nextcloud.py",
+        "--queue",
+        "$mount_root/YandexDisk/.download/semester-queue/queue.json",
+        "--nextcloud-existing",
+        "https://NEXTCLOUD/index.php/s/READ_SHARE",
+        "--nextcloud-upload",
+        "https://NEXTCLOUD/index.php/s/UPLOAD_SHARE",
+        "--nickname",
+        "Walterit",
+        "--transfers",
+        "8",
+        "--min-transfers",
+        "2",
+        "--upload-budget",
+        "$state_dir/upload-budget"
+      ],
+      "environment": {
+        "MALLOC_ARENA_MAX": "2"
+      }
+    },
+    "opencloud": {
+      "command": [
+        "/usr/bin/python3",
+        "$repo/opencloud.py",
+        "--queue",
+        "$mount_root/YandexDisk/.download/semester-queue/queue.json",
+        "--destination",
+        "$mount_root/YandexDisk/ШАД весна 2026",
+        "--server",
+        "https://ysda-recover-dsk.jumpingcrab.com",
+        "--username",
+        "Walterit",
+        "--password-file",
+        "$home/.jumpingcrub.apptoken",
+        "--upload",
+        "--transfers",
+        "8",
+        "--poll-interval",
+        "300",
+        "--min-transfers",
+        "2",
+        "--upload-budget",
+        "$state_dir/upload-budget"
+      ],
+      "environment": {
+        "MALLOC_ARENA_MAX": "2"
+      }
+    }
+  },
+  "speed_targets_mbit_s": {
+    "download": 90,
+    "upload": 90
+  }
+}

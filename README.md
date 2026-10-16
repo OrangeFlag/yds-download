@@ -89,6 +89,12 @@ python3 -u download.py download --catalog catalog.json --destination "$YDS_DEST"
 
 ### Все фоновые сервисы: один конфиг
 
+Рабочие параметры машины Walterit сохранены в
+[`deploy/services.walterit.json`](deploy/services.walterit.json): цели 90 Мбит/с
+в обе стороны, актуальная точка монтирования, прокси и лимиты. Ссылки доступа к
+Nextcloud заменены на `READ_SHARE`/`UPLOAD_SHARE`; действующие ссылки находятся
+только в приватном `~/.config/yds-download/services.json`.
+
 `services.py` управляет очередью скачивания, Range и отправкой в Nextcloud/OpenCloud.
 Нужен пользовательский systemd; `sudo` не требуется.
 
