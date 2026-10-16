@@ -293,6 +293,7 @@ class Sync:
                   'sample_seconds=90; probe_interval_seconds=300',flush=True)
         self.index_lock=Lock()
         self.indexes={}
+        self.event_indexes={}
         self.cache = {}
 
     def read(self, path, default=None):
@@ -332,7 +333,11 @@ class Sync:
                        if row.get('state')!='uploaded' and row.get('next_chunk',0)>0
                        and row.get('source')==data['source'] and row.get('upload_share')==self.share.url()
                        and row.get('nickname')==self.share.nickname}
-            events = {e['path']:e for e in d.iter_events(state/'events.jsonl')}
+            proof_index=self.event_indexes.get(root)
+            if proof_index is None:
+                proof_index=d.EventIndex(state/'events.jsonl')
+                self.event_indexes[root]=proof_index
+            events=dict(proof_index.refresh())
             for e in self.read(state/'local-copies.json',[]):
                 if e.get('source')==data['source'] and e.get('status')=='valid':
                     events[e['path']] = e
