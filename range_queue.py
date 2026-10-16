@@ -115,7 +115,7 @@ def retire_cached_copy(background, path, job, proofs):
                 or (proof.get('size'), proof.get('sha256')) != (item['size'], item['sha256'])
                 or proof.get('mtime_ns') is None):
             continue
-        local = storage.saved_local(root, proof['local']) if proof.get('local') else destination
+        local = storage.saved_local(background.root, proof['local']) if proof.get('local') else destination
         try:
             stat = local.stat()
         except FileNotFoundError:
