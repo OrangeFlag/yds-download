@@ -109,9 +109,12 @@ class Uploader(nextcloud.Sync):
                 item=dict(path=path,size=row['original_size'],sha256=row['original_sha256'],payload_sha256=row['actual_sha256'])
                 paths=set()
                 for manifest in (owner/'.download').glob('*-manifest.json'):
-                    paths.update(x['path'] for x in self.read(manifest,[])
-                                 if PurePosixPath(x['path']).parent==PurePosixPath(path).parent
-                                 and PurePosixPath(x['path']).suffix.casefold() in nextcloud.VIDEO)
+                    for original in self.read(manifest,[]):
+                        if (original['path'],original.get('size'),original.get('sha256'))==(path,item['size'],item['sha256']):
+                            item.update({kind:original[kind] for kind in ('sha1','md5') if original.get(kind)})
+                        if (PurePosixPath(original['path']).parent==PurePosixPath(path).parent
+                                and PurePosixPath(original['path']).suffix.casefold() in nextcloud.VIDEO):
+                            paths.add(original['path'])
                 ordinal=next((i for i,p in enumerate(sorted(paths,key=nextcloud.normalized),1) if p==path),None)
                 if ordinal is None:
                     continue
@@ -166,8 +169,9 @@ class Uploader(nextcloud.Sync):
         row.setdefault('checksums',[]).append('SHA256:'+result)
         return result
 
-    def exists(self, digest, sha1=None):
+    def exists(self, digest, sha1=None, md5=None):
         return any(hashes(row).get('sha256')==digest or sha1 is not None and hashes(row).get('sha1')==sha1
+                   or md5 is not None and hashes(row).get('md5')==md5
                    for row in self.index)
 
     def name_exists(self, name, size):
@@ -177,7 +181,7 @@ class Uploader(nextcloud.Sync):
                    for row in self.index)
 
     def original_exists(self, item, root=None, source=None):
-        if self.exists(item['sha256']):return True
+        if self.exists(item['sha256'],item.get('sha1')):return True
         md5=item.get('md5')
         path=None
         if root is not None and source:
@@ -290,7 +294,7 @@ class Uploader(nextcloud.Sync):
         actual=digest.hexdigest();sha1=sha1.hexdigest()
         if variant=='original' and actual!=item['sha256'] or variant=='camrip' and actual!=item['payload_sha256']:
             raise RuntimeError('Local SHA-256 mismatch')
-        if self.exists(actual,sha1):
+        if self.exists(actual,sha1,md5.hexdigest()):
             if row:
                 row.update(state='existing',error_type=None,http_status=None,error_reason=None,error_errno=None)
                 self.save_record(job,row)
@@ -302,7 +306,7 @@ class Uploader(nextcloud.Sync):
                         payload_sha256=actual,size=size,sent_bytes=0,state='pending')
         row['payload_md5']=md5.hexdigest()
         with self.index_lock:
-            if actual in self.active_hashes or self.exists(actual,sha1):
+            if actual in self.active_hashes or self.exists(actual,sha1,md5.hexdigest()):
                 print('OPENCLOUD DUPLICATE ACTIVE/EXISTS: '+item['path'],flush=True);return False
             self.active_hashes.add(actual)
         try:
@@ -407,13 +411,13 @@ def main():
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:stopping.set())
     control=args.queue.parent if args.queue else roots[0]/'.download'
     storage.check(control)
-    with storage.lock_archives(roots, 'opencloud.lock'):
+    with storage.lock_archives(roots, 'opencloud.lock') as claim:
         client=Client(args.server,args.username,args.password_file.expanduser().read_text().rstrip('\r\n'),args.timeout)
         if args.upload:client.discover()
         else:client.base=client.server+'/dav/spaces/not-connected/'
         uploader=Uploader(client,stopping,args.chunk_size,args.retries,args.transfers)
         while not stopping.is_set():
-            result=uploader.run_once(roots,args.upload,args.limit)
+            result=uploader.run_once(claim(roots),args.upload,args.limit)
             if args.poll_interval is None:break
             if stopping.wait(args.poll_interval):break
             uploader.index=None;uploader.known_folders.clear()

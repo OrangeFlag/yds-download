@@ -49,16 +49,32 @@ def check(path):
 
 @contextmanager
 def lock_archives(roots, filename):
-    """Prevent overlapping uploader scopes from mutating the same archive."""
+    """Keep archive ownership until exit; admit only roots whose lock is held."""
     with ExitStack() as stack:
-        for root in sorted({Path(root).resolve() for root in roots}):
-            check(root)
-            state = root / '.download'
-            if not state.is_dir():
-                continue
-            lock = stack.enter_context((state / filename).open('a'))
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        yield
+        owned=set()
+        def claim(selected, strict=False):
+            admitted=[]
+            for root in sorted({Path(root).resolve() for root in selected}):
+                check(root)
+                if root not in owned:
+                    state=root/'.download'
+                    if not state.is_dir():continue
+                    lock=(state/filename).open('a')
+                    try:
+                        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        lock.close()
+                        if strict:raise
+                        print('UPLOAD BUSY: archive deferred: '+str(root),flush=True)
+                        continue
+                    except BaseException:
+                        lock.close();raise
+                    stack.enter_context(lock)
+                    owned.add(root)
+                admitted.append(root)
+            return admitted
+        claim(roots,strict=True)
+        yield claim
 
 
 def mounts():

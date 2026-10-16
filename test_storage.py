@@ -48,6 +48,69 @@ class StorageChecks(unittest.TestCase):
         with storage.lock_archives([roots[0]], 'opencloud.lock'):
             pass
 
+    def test_late_archive_is_not_admitted_until_its_lock_is_held(self):
+        root=self.root/'future'
+        with storage.lock_archives([root],'opencloud.lock') as claim:
+            self.assertEqual(claim([root]),[])
+            (root/'.download').mkdir(parents=True)
+            with storage.lock_archives([root],'opencloud.lock'):
+                self.assertEqual(claim([root]),[])
+            self.assertEqual(claim([root]),[root])
+            with self.assertRaises(BlockingIOError):
+                with storage.lock_archives([root],'opencloud.lock'):pass
+
+    def test_admitted_roots_are_a_snapshot_and_locks_survive_between_passes(self):
+        first=self.root/'first';late=self.root/'late'
+        (first/'.download').mkdir(parents=True)
+        with storage.lock_archives([first,late],'nextcloud.lock') as claim:
+            admitted=claim([first,late])
+            (late/'.download').mkdir(parents=True)
+            self.assertEqual(admitted,[first])
+            with self.assertRaises(BlockingIOError):
+                with storage.lock_archives([first],'nextcloud.lock'):pass
+            self.assertEqual(claim([first,late]),[first,late])
+        with storage.lock_archives([first,late],'nextcloud.lock'):pass
+
+    def test_both_uploader_loops_claim_late_archives_and_keep_ownership(self):
+        import nextcloud
+        import opencloud
+        from threading import Event
+        for name,module in [('nextcloud',nextcloud),('opencloud',opencloud)]:
+            with self.subTest(service=name):
+                directory=self.root/name;directory.mkdir()
+                first=directory/'first';late=directory/'late'
+                (first/'.download').mkdir(parents=True)
+                queue=directory/'queue.json'
+                download.write_json(queue,dict(archives=[dict(destination=str(p)) for p in (first,late)]))
+                stop=Event();calls=[]
+                def wait_for_pass(_):
+                    if len(calls)>=2:stop.set()
+                    return stop.is_set()
+                def run_once(roots,*args):
+                    calls.append(list(roots))
+                    for root in roots:
+                        with self.assertRaises(BlockingIOError):
+                            with storage.lock_archives([root],name+'.lock'):pass
+                    if len(calls)==1:(late/'.download').mkdir(parents=True)
+                    return 0
+                sync=SimpleNamespace(run_once=run_once,index=None,known_folders=set())
+                argv=[name+'.py','--queue',str(queue)]
+                if name=='nextcloud':
+                    argv+=['--nextcloud-upload','https://example.invalid/s/upload']
+                    constructor='Sync'
+                else:
+                    token=directory/'token';token.write_text('test-only token')
+                    argv+=['--server','https://example.invalid','--username','test',
+                           '--password-file',str(token),'--upload','--poll-interval','1']
+                    constructor='Uploader'
+                with patch.object(module,'Event',return_value=stop), \
+                     patch.object(module,constructor,return_value=sync), \
+                     patch.object(stop,'wait',side_effect=wait_for_pass), \
+                     patch.object(module.signal,'signal'),patch.object(module.os,'umask'), \
+                     patch.object(opencloud.Client,'discover'),patch('sys.argv',argv):
+                    module.main()
+                self.assertEqual(calls,[[first],[first,late]])
+
     def test_missing_mount_is_not_a_missing_video(self):
         item = dict(path='/Course/video.mp4', size=7, sha256='1' * 64, file='https://example.invalid/video')
         with patch.dict(os.environ, dict(self.env, YDS_DISK_DEVICE='-1')):

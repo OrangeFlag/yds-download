@@ -141,6 +141,24 @@ class UploadChecks(unittest.TestCase):
         self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
         self.assertEqual(sum(method=='POST' for method,_,_ in self.server.calls),1)
 
+    def test_computed_md5_skips_existing_copy_when_yandex_metadata_has_no_md5(self):
+        self.uploader.index=[dict(path='other/Lecture.mp4',size=len(self.content),
+                                  checksums=['MD5:'+hashlib.md5(self.content).hexdigest()],directory=False)]
+        with patch.object(d,'api',return_value=self.item):
+            self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(self.server.calls,[])
+
+    def test_known_sha1_suppresses_partial_without_payload_reads(self):
+        (self.state/'events.jsonl').write_text('')
+        self.local.write_bytes(b'x'*len(self.content))
+        item=dict(self.item,sha1=hashlib.sha1(self.content).hexdigest())
+        d.write_json(self.state/'01-manifest.json',[item])
+        d.write_json(self.state/'partial-copies.json',[dict(item,source=self.data['source'],
+            recovered_path='Course/Lecture.mp4',local_size=len(self.content),downloaded_bytes=15,mtime_ns=self.local.stat().st_mtime_ns)])
+        self.uploader.index=[dict(path='other/Lecture.mp4',size=len(self.content),checksums=['SHA1:'+item['sha1']],directory=False)]
+        self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(self.server.calls,[])
+
     def test_known_md5_matches_without_name_or_size_filters(self):
         item=dict(self.item,md5=hashlib.md5(self.content).hexdigest())
         self.uploader.index=[dict(path='other/unrelated.mp4',size=1,checksums=['MD5:'+item['md5']],directory=False)]
@@ -222,6 +240,25 @@ class UploadChecks(unittest.TestCase):
         self.assertEqual(len(self.uploader.jobs([self.root])),1)
         (self.state/'events.jsonl').write_text('')
         jobs=self.uploader.jobs([self.root]);self.assertEqual(len(jobs),1);self.assertEqual(jobs[0][5],'camrip')
+
+    def test_known_manifest_hash_suppresses_camrip_without_source_requests(self):
+        (self.state/'events.jsonl').write_text('')
+        self.local.write_bytes(b'x'*len(self.content))
+        record=dict(local=str(self.local),source=self.data['source'],size=len(self.content),mtime_ns=self.local.stat().st_mtime_ns,
+            actual_sha256=hashlib.sha256(self.local.read_bytes()).hexdigest(),original_sha256=self.item['sha256'],original_size=len(self.content),
+            match=dict(course_path='/Course',file='Lecture.mp4',sheet='2024 осень'))
+        d.write_json(self.state/'recordings.json',[record])
+        for kind in ('sha1','md5'):
+            with self.subTest(kind=kind):
+                digest=getattr(hashlib,kind)(self.content).hexdigest()
+                d.write_json(self.state/'01-manifest.json',[dict(self.item,**{kind:digest})])
+                self.uploader.index=[dict(path='other/Lecture.mp4',size=len(self.content),checksums=[kind.upper()+':'+digest],directory=False)]
+                with patch.object(d,'api',side_effect=AssertionError('Known hash needs no source request')):
+                    self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+                self.assertEqual(self.server.calls,[])
+                for changed in (dict(self.item,size=self.item['size']+1),dict(self.item,sha256='0'*64)):
+                    d.write_json(self.state/'01-manifest.json',[dict(changed,**{kind:digest})])
+                    self.assertNotIn(kind,self.job()[3])
 
     def test_foreign_session_location_is_rejected(self):
         with self.assertRaises(ValueError):

@@ -703,7 +703,7 @@ def main():
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:stopping.set())
     control=args.queue if args.queue else args.destination/'.download/source.json'
     lockpath=control.with_suffix('.nextcloud.lock')
-    with lockpath.open('a') as lock:
+    with lockpath.open('a') as lock, storage.lock_archives([], 'nextcloud.lock') as claim:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         nickname=args.nickname or (json.loads(args.queue.read_text()).get('mark') if args.queue else None) or 'yds-download'
         sync=Sync(args.nextcloud_existing,args.nextcloud_upload,stopping,args.timeout,nickname,args.chunk_size_mib*1024**2,
@@ -711,8 +711,7 @@ def main():
         while not stopping.is_set():
             storage.check(control)
             roots=[Path(a['destination']) for a in json.loads(args.queue.read_text())['archives'] if a.get('enabled',True)] if args.queue else [args.destination.resolve()]
-            with storage.lock_archives(roots, 'nextcloud.lock'):
-                sync.run_once(roots)
+            sync.run_once(claim(roots))
             if args.once:
                 break
             stopping.wait(args.poll_interval)
