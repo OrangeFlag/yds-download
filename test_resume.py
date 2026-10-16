@@ -172,7 +172,7 @@ class ResumeChecks(unittest.TestCase):
             self.assertEqual(self.run_download(deep=True), 0)
         repaired = json.loads((self.state / 'local-copies.json').read_text())[0]
         self.assertEqual(repaired['status'], 'valid')
-        self.assertEqual(repaired['local'], str(external))
+        self.assertEqual(storage.saved_local(self.root, repaired['local']), external)
 
     def test_deep_missing_unstarted_course_stays_pending(self):
         (self.state / 'course-history.json').unlink()
