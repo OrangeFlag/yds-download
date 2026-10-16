@@ -438,7 +438,8 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
         summary_path = state / 'summary.json'
         handoff = json.loads(summary_path.read_text()) if deep and not retry_check and summary_path.exists() else {}
         handoff = {key: handoff[key] for key in ('downloads_complete', 'pending_courses') if key in handoff}
-        read_events(state / 'events.jsonl', repair=True)
+        event_index = EventIndex(state / 'events.jsonl')
+        event_index.refresh()
         recovered = {}
         if retry_check:
             from recovery import recover_corrupted
@@ -461,7 +462,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
             from recovery import recover_corrupted
             recovered = {event['path']: event for event in recover_corrupted(
                 root, source, retries, True, courses=recovery_courses, tuning=tuning)}
-        events = {event['path']: event for event in read_events(state / 'events.jsonl')}
+        events = dict(event_index.refresh())
         registry = state / 'local-copies.json'
         local_copies = json.loads(registry.read_text()) if registry.exists() else []
         for event in local_copies:

@@ -232,6 +232,20 @@ class NextcloudChecks(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(first_upload_id, next(iter(receipts.values()))['upload_id'])
 
+    def test_uploader_reuses_compact_proof_index_across_polls(self):
+        download.append_events(self.state/'events.jsonl',
+            [dict(self.proof,range_attempts=['history'*1000]*50)])
+        sync=nextcloud.Sync(None,self.upload,Event())
+        first=sync.jobs([self.root])
+        self.assertEqual(len(first),1)
+        with patch.object(download,'iter_events',
+                          side_effect=AssertionError('Full proof journal rescanned')):
+            second=sync.jobs([self.root])
+        self.assertEqual(len(second),1)
+        index=sync.event_indexes[self.root]
+        self.assertNotIn('range_attempts',index.events[self.item['path']])
+        self.assertEqual(index.events[self.item['path']]['mtime_ns'],self.proof['mtime_ns'])
+
     def test_sync_streams_source_events_without_retaining_bulk_jsonl_history(self):
         sync = nextcloud.Sync(self.read, self.upload, Event())
         journal = self.state / 'events.jsonl'

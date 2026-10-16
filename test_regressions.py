@@ -248,6 +248,16 @@ class ReviewRegression(unittest.TestCase):
         counts = json.loads((self.state / 'course-history.json').read_text())['Course']
         self.assertEqual((counts['verified'], counts['failed'], counts['complete']), (1, 0, True))
 
+    def test_deep_mode_keeps_compact_proofs_instead_of_bulk_event_history(self):
+        download.append_events(self.state/'events.jsonl',
+                               [dict(self.event,range_attempts=['x'*1024]*30)])
+        with patch.object(download,'read_events',
+                          side_effect=AssertionError('Bulk events loaded')), \
+             patch.object(download,'list_course',side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                download.download(dict(source=self.source,title='test'),
+                                  ['Course'],self.root,deep=True)
+
     def test_interrupted_deep_preserves_finished_course(self):
         status = dict(total=1, verified=1, failed=0, complete=True, state='finished',
                       course='Course', source=self.source, time='2026-01-01')
