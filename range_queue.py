@@ -103,36 +103,8 @@ class JsonCache:
 
 
 
-class EventIndex:
-    """Hold current compact proofs, not the complete append-only JSONL history."""
+EventIndex = d.EventIndex
 
-    FIELDS = ('path', 'source', 'status', 'local', 'size', 'sha256', 'mtime_ns')
-
-    def __init__(self, path):
-        self.path = path
-        self.events = {}
-        self.inode = None
-        self.offset = 0
-
-    def refresh(self):
-        # The writer and reader share STATE_LOCK; a crash-torn final row is repaired.
-        with d.STATE_LOCK:
-            try:
-                stat = self.path.stat()
-            except FileNotFoundError:
-                self.events.clear()
-                self.inode = None
-                self.offset = 0
-                return self.events
-            if self.inode != stat.st_ino or stat.st_size < self.offset:
-                self.events.clear()
-                self.offset = 0
-            self.inode = stat.st_ino
-            for offset, row in d.scan_events(self.path, repair=True, start=self.offset):
-                self.offset = offset
-                if row is not None:
-                    self.events[row['path']] = {key: row[key] for key in self.FIELDS if key in row}
-        return self.events
 
 def retire_cached_copy(background, path, job, proofs):
     item = job['item']
