@@ -594,7 +594,8 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             saved=json.loads(saved_path.read_text()) if saved_path.exists() else {}
             if saved.get('source')==source and saved.get('share')==remote_index.link:
                 remote_files=saved.get('files',{})
-        events = {row['path']: row for row in d.iter_events(state / 'events.jsonl', repair=True)}
+        event_index = d.EventIndex(state / 'events.jsonl')
+        events = dict(event_index.refresh())
         history_path = state / 'course-history.json'
         history = json.loads(history_path.read_text()) if history_path.exists() else {}
         for path in state.glob('*-status.json'):
@@ -649,18 +650,12 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             from report import retry_reports
             retry_reports(root)
         active = {}
-        event_stamp = None
-        proofs = {}
         last_summary = None
 
         def finalize():
-            nonlocal event_stamp, proofs, last_summary
+            nonlocal last_summary
             background.poll()
-            event_path = state / 'events.jsonl'
-            stamp = Background.stat(event_path) if event_path.exists() else None
-            if stamp != event_stamp:
-                proofs = {row['path']: row for row in d.iter_events(event_path)}
-                event_stamp = stamp
+            proofs = event_index.refresh()
             for course, (index, entries) in list(active.items()):
                 jobs = [job for job in background.jobs.values() if job['course'] == course]
                 waiting = bool(background.transferring == course or jobs or any(name == course for _, name, _ in background.retry))
