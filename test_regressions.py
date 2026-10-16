@@ -609,7 +609,7 @@ class ReviewRegression(unittest.TestCase):
         latest = download.read_events(self.state / 'events.jsonl')[-1]
         self.assertEqual(latest['status'], 'valid')
         self.assertEqual(latest['sha256'], self.item['sha256'])
-        self.assertEqual(storage.saved_local(self.root, latest.get('local', str(original))), original)
+        self.assertEqual(download.storage.saved_local(self.root, latest.get('local', str(original))), original)
         self.assertEqual(json.loads((self.state / 'local-copies.json').read_text())[0]['status'], 'missing')
 
     def test_new_source_partial_replaces_old_higher_coverage(self):
