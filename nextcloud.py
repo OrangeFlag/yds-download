@@ -229,7 +229,7 @@ class Index:
             print('NEXTCLOUD LOOKUP UNAVAILABLE: '+folder+'; downloading from source',flush=True)
             return []
         return [row for row in self.folders[folder] if not row['directory']
-                and normalized(str(PurePosixPath(row['path']).parent))==folder
+                and str(PurePosixPath(row['path']).parent)==folder
                 and normalized(re.sub(r'^\d{3,} - ','',PurePosixPath(row['path']).name))==PurePosixPath(relative).name]
 
 

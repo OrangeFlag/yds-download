@@ -82,6 +82,13 @@ class NextcloudChecks(unittest.TestCase):
                           mtime_ns=stat.st_mtime_ns, local=str(self.local))
         download.append_events(self.state / 'events.jsonl', [self.proof])
 
+    def test_remote_candidate_matching_preserves_trailing_space_in_course_folder(self):
+        item=dict(self.item,path='/Course /video.mp4')
+        row=dict(path='2023-fall/Course /001 - video.mp4',size=item['size'],
+                 directory=False,checksums=['SHA256:'+item['sha256']])
+        with patch.object(nextcloud.Share,'listing',return_value=[row]):
+            self.assertTrue(nextcloud.Index(self.root,self.read).contains(self.data,item))
+
     def test_numbered_names_match_only_the_same_course_size_and_checksum(self):
         index = nextcloud.Index(self.root, self.read)
         rows = [dict(path='2023-fall/Course/001 - 2023-09-15 Лекция.mp4', size=7, directory=False, checksums=[])]
