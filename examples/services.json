@@ -1,4 +1,5 @@
 {
+  "speed_targets_mbit_s": {"download": 90, "upload": 90},
   "repo": "/home/USER/gitRepos/yds-download",
   "state_dir": "/home/USER/.local/state/yds-download",
   "mount_root": "/run/media/USER/DISK",

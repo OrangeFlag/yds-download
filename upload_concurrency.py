@@ -3,18 +3,32 @@ from contextlib import contextmanager
 from datetime import datetime
 import fcntl
 import json
+import math
+import os
 from pathlib import Path
 from threading import Lock, RLock
 import time
 import uuid
 
 
+def target_speed(value):
+    try:
+        speed = float(value)
+    except (TypeError, ValueError):
+        raise ValueError('Transfer target must be a finite nonnegative Mbit/s value') from None
+    if isinstance(value, bool) or not math.isfinite(speed) or speed < 0:
+        raise ValueError('Transfer target must be a finite nonnegative Mbit/s value')
+    return speed
+
+
 class UploadConcurrency:
-    def __init__(self, minimum, maximum, probe_zero=False):
+    def __init__(self, minimum, maximum, probe_zero=False, target_mbit_s=None):
         if not 1<=minimum<=maximum:
             raise ValueError('Expected 1 <= minimum uploads <= maximum uploads')
         self.minimum, self.maximum, self.limit = minimum, maximum, minimum
         self.probe_zero=probe_zero
+        self.target_mbit_s=target_speed(os.environ.get('YDS_TRANSFER_TARGET_MBIT_S', '0')
+                                      if target_mbit_s is None else target_mbit_s)
         self.lock = Lock()
         self.total = 0
         self.window = None
@@ -59,6 +73,12 @@ class UploadConcurrency:
             print(f'TRANSFER CONCURRENCY: active={active}; next_limit={self.limit}; '
                   f'confirmed_mbit_s={rate*8/1_000_000:.2f}; draining',flush=True)
             return self.limit
+        if self.target_mbit_s and rate*8/1_000_000>=self.target_mbit_s:
+            self.trial=None
+            self.direction=1
+            print(f'TRANSFER CONCURRENCY: active={active}; next_limit={self.limit}; '
+                  f'confirmed_mbit_s={rate*8/1_000_000:.2f}; target_mbit_s={self.target_mbit_s:g}; target reached',flush=True)
+            return self.limit
         old_limit = self.limit
         reason = 'hold'
         if self.trial is not None:
@@ -93,8 +113,8 @@ class SharedUploadBudget:
     """One adaptive limit for all cloud processes; each waiting cloud gets a turn."""
     fields=('limit','total','window','trial','direction','next_probe','last_rate','last_rate_time')
 
-    def __init__(self, directory, name, minimum=2, maximum=8, probe_zero=False):
-        UploadConcurrency(minimum,maximum)
+    def __init__(self, directory, name, minimum=2, maximum=8, probe_zero=False, target_mbit_s=None):
+        self.target_mbit_s=UploadConcurrency(minimum,maximum,probe_zero,target_mbit_s).target_mbit_s
         self.directory=Path(directory)
         self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.name,self.minimum,self.maximum=name,minimum,maximum
@@ -132,12 +152,13 @@ class SharedUploadBudget:
                     lease.unlink(missing_ok=True)
             expected=dict(minimum=self.minimum,maximum=self.maximum)
             if self.probe_zero:expected['probe_zero']=True
+            if self.target_mbit_s:expected['target_mbit_s']=self.target_mbit_s
             if state.get('settings')!=expected:
                 if members:raise ValueError('Shared upload limits differ between processes')
                 state.clear();state.update(settings=expected,members={})
                 members=state['members']
             if not members:
-                controller=UploadConcurrency(self.minimum,self.maximum,self.probe_zero)
+                controller=UploadConcurrency(self.minimum,self.maximum,self.probe_zero,self.target_mbit_s)
                 state['controller']={k:getattr(controller,k) for k in self.fields}
             member=members.setdefault(self.key,dict(name=self.name,active=0,waiting=0,confirmed_bytes=0,active_slots=[],waiting_slots=[]))
             state['controller']['total']+=max(0,self.confirmed_bytes-member['confirmed_bytes'])
@@ -158,7 +179,7 @@ class SharedUploadBudget:
             if now<self.next_update:return
             self.next_update=now+1
             with self.state() as state:
-                controller=UploadConcurrency(self.minimum,self.maximum,self.probe_zero)
+                controller=UploadConcurrency(self.minimum,self.maximum,self.probe_zero,self.target_mbit_s)
                 for key in self.fields:setattr(controller,key,state['controller'][key])
                 active=sum(row['active'] for row in state['members'].values())
                 if active>=controller.limit or not any(row['waiting'] for row in state['members'].values()):

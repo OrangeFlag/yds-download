@@ -11,6 +11,7 @@ import sys
 import uuid
 
 import storage
+from upload_concurrency import target_speed
 
 NAMES = ('queue', 'range', 'nextcloud', 'opencloud')
 RUNNING = {'active', 'activating', 'reloading', 'deactivating'}
@@ -52,6 +53,11 @@ def load(path):
         raise ValueError('previous_mounts must contain absolute disk mount paths')
     if set(config['services']) - set(NAMES):
         raise ValueError('Unknown service; choose ' + ', '.join(NAMES))
+    targets = config.get('speed_targets_mbit_s', {})
+    if not isinstance(targets, dict) or set(targets) - {'download', 'upload'}:
+        raise ValueError('speed_targets_mbit_s must contain download and/or upload')
+    for value in targets.values():
+        target_speed(value)
     for name, service in config['services'].items():
         if not isinstance(service, dict):
             raise ValueError('service must be an object: ' + name)
@@ -83,6 +89,10 @@ def start_command(config, name, root):
     properties = {**PROPERTIES, 'WorkingDirectory': config['repo'],
                   **config.get('properties', {}), **service.get('properties', {})}
     environment = {**config.get('environment', {}), **service.get('environment', {})}
+    direction = 'download' if name in ('queue', 'range') else 'upload'
+    target = config.get('speed_targets_mbit_s', {}).get(direction)
+    if target is not None:
+        environment['YDS_TRANSFER_TARGET_MBIT_S'] = str(target)
     if any(not isinstance(k, str) or not isinstance(v, str) or '\0' in v or '\n' in k or '=' in k
            for k, v in [*properties.items(), *environment.items()]):
         raise ValueError('Properties and environment must be string maps')

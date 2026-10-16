@@ -34,6 +34,21 @@ class ServiceControlTests(unittest.TestCase):
                                         str(self.root / 'disk/a b/queue.json')])
         self.assertIn(str(self.root / 'storage.py'), command)
 
+    def test_speed_targets_apply_to_the_correct_direction(self):
+        self.config['speed_targets_mbit_s'] = {'download': 90, 'upload': 80}
+        self.config['services']['nextcloud'] = {'command': ['python3', '$repo/nextcloud.py']}
+        for name, speed in [('queue', 90), ('range', 90), ('nextcloud', 80)]:
+            command = services.start_command(self.config, name, self.root / 'disk')
+            self.assertIn('--setenv=YDS_TRANSFER_TARGET_MBIT_S=' + str(speed), command)
+
+    def test_invalid_speed_target_is_rejected_before_any_systemd_calls(self):
+        path = self.root / 'services.json'
+        for targets in ({'download': -1}, {'upload': True}, {'other': 90}, {'download': None}):
+            self.config['speed_targets_mbit_s'] = targets
+            path.write_text(json.dumps(self.config))
+            with self.subTest(targets=targets), self.assertRaises(ValueError):
+                services.load(path)
+
     def test_down_does_not_touch_or_require_disk(self):
         with patch('services.states', return_value={'queue': 'active', 'range': 'inactive'}), \
                 patch('services.subprocess.run') as run, \

@@ -12,6 +12,51 @@ import download
 import nextcloud
 
 
+class TransferTargetChecks(unittest.TestCase):
+    def test_reaching_target_holds_slots_and_falling_below_resumes_probing(self):
+        control = nextcloud.UploadConcurrency(2, 8, target_mbit_s=90)
+        with patch('time.monotonic', return_value=0) as clock:
+            control.update(2)
+            control.confirmed(11_250_000 * 90)
+            clock.return_value = 90
+            self.assertEqual(control.update(2), 2)
+            self.assertIsNone(control.trial)
+            control.confirmed(10_000_000 * 90)
+            clock.return_value = 180
+            self.assertEqual(control.update(2), 3)
+
+    def test_trial_reaching_target_is_kept_without_ten_percent_gain(self):
+        control = nextcloud.UploadConcurrency(2, 8, target_mbit_s=90)
+        with patch('time.monotonic', return_value=0) as clock:
+            control.update(2)
+            control.confirmed(11_000_000 * 90)
+            clock.return_value = 90
+            self.assertEqual(control.update(2), 3)
+            control.update(3)
+            control.confirmed(11_250_000 * 90)
+            clock.return_value = 180
+            self.assertEqual(control.update(3), 3)
+            self.assertIsNone(control.trial)
+
+    def test_target_is_inherited_and_shared_processes_must_agree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict('os.environ', YDS_TRANSFER_TARGET_MBIT_S='90'):
+                with nextcloud.SharedUploadBudget(directory, 'nextcloud') as first:
+                    self.assertEqual(first.target_mbit_s, 90)
+                    with self.assertRaisesRegex(ValueError, 'differ'):
+                        nextcloud.SharedUploadBudget(directory, 'opencloud', target_mbit_s=80)
+                    with nextcloud.SharedUploadBudget(directory, 'opencloud'):
+                        state = json.loads((Path(directory) / 'state.json').read_text())
+                        self.assertEqual(state['settings']['target_mbit_s'], 90)
+
+    def test_invalid_targets_fail_before_budget_files_are_created(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for value in (-1, float('inf'), float('nan'), True, 'oops'):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    nextcloud.SharedUploadBudget(Path(directory) / 'budget', 'test', target_mbit_s=value)
+            self.assertFalse((Path(directory) / 'budget').exists())
+
+
 class SharedUploadChecks(unittest.TestCase):
     def setUp(self):
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
