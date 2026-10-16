@@ -21,7 +21,7 @@ import urllib.parse
 import urllib.request
 import network
 import storage
-from settings import OPTIONS, add_arguments, resolve
+from settings import OPTIONS, add_arguments, add_source_arguments, source_settings, validate_source_settings, resolve
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), network.HTTPHandler(), network.HTTPSHandler())
 ENV = {k: v for k, v in os.environ.items()
@@ -365,20 +365,21 @@ def list_course(source, course, retries=2, retry_delay=60):
             time.sleep(retry_delay)
 
 
-def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None, defer_range=False, range_budget=None, range_files=16, nextcloud_existing=None, nextcloud_fallback=None):
-    if nextcloud_existing and nextcloud_fallback:
+def download(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None, defer_range=False, range_budget=None, range_files=16, nextcloud_existing=None, nextcloud_fallback=None, opencloud_fallback=None, download_budget=None):
+    opencloud_fallback, download_budget = validate_source_settings(opencloud_fallback, download_budget)
+    if nextcloud_existing and (nextcloud_fallback or opencloud_fallback):
         raise ValueError('Choose remote skipping or verified fallback, not both')
-    if (nextcloud_existing or nextcloud_fallback) and data.get('root'):
-        raise ValueError('Nextcloud course filtering cannot be used for personal/root archives')
+    if (nextcloud_existing or nextcloud_fallback or opencloud_fallback) and data.get('root'):
+        raise ValueError('Cloud course filtering cannot be used for personal/root archives')
     if deep:
-        if nextcloud_existing or nextcloud_fallback:
+        if nextcloud_existing or nextcloud_fallback or opencloud_fallback:
             raise ValueError('--nextcloud-existing cannot replace local SHA checks in --deep mode')
-        return download_deep(data, courses, root, retries, report_repo, mark, git_push, deep, retry_check, tuning)
+        return download_deep(data, courses, root, retries, report_repo, mark, git_push, deep, retry_check, tuning, download_budget=download_budget)
     from pipeline import run
-    return run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range, range_budget, range_files, nextcloud_existing, nextcloud_fallback)
+    return run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range, range_budget, range_files, nextcloud_existing, nextcloud_fallback, opencloud_fallback=opencloud_fallback, download_budget=download_budget)
 
 
-def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None):
+def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None, download_budget=None):
     tuning = resolve(tuning)
     if not all(shutil.which(name) for name in ('aria2c', 'cp')):
         raise RuntimeError('Install aria2c and coreutils first')
@@ -401,7 +402,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
         preserve_queue = deep and not retry_check and (state / 'courses.json').exists()
         queue_courses = json.loads((state / 'courses.json').read_text()) if preserve_queue else courses
         if not preserve_queue or not (state / 'settings.json').exists():
-            write_json(state / 'settings.json', dict(retries=retries, deep=deep, retry_check=retry_check, tuning=tuning))
+            write_json(state / 'settings.json', dict(retries=retries, deep=deep, retry_check=retry_check, tuning=tuning, download_budget=download_budget))
         summary_path = state / 'summary.json'
         handoff = json.loads(summary_path.read_text()) if deep and not retry_check and summary_path.exists() else {}
         handoff = {key: handoff[key] for key in ('downloads_complete', 'pending_courses') if key in handoff}
@@ -543,6 +544,14 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                     queue.append(f"{item['file']}\n dir={destination.parent}\n out={destination.name}\n checksum=sha-256={item['sha256']}\n")
                 (state / 'queue.txt').write_text(''.join(queue), encoding='utf-8')
                 from pipeline import transfer_process
+                extra = {}
+                if download_budget:
+                    from adaptive_downloads import AriaBatch, get_budgets
+                    from progress import progress
+                    runner = AriaBatch(get_budgets(download_budget)['yandex'], progress={
+                        str(target(root, item, course)): progress(target(root, item, course), item['size'],
+                            sha256=item['sha256']).get('downloaded_bytes') for item in pending})
+                    extra['runner'] = runner.run
                 code = transfer_process([
                     'aria2c', '--input-file=' + str(state / 'queue.txt'),
                     '--disable-ipv6=true', '--continue=true', '--always-resume=true', '--check-integrity=true',
@@ -559,7 +568,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                     f"--connect-timeout={tuning['connect_timeout']}", f"--timeout={tuning['timeout']}",
                     f"--summary-interval={tuning['summary_interval']}", '--enable-color=false',
                     '--console-log-level=warn', '--log=' + str(state / 'aria2.log'), '--log-level=info',
-                ], env=ENV, on_tick=lambda: None)
+                ], env=ENV, on_tick=lambda: None, **extra)
                 if code == 9:
                     raise OSError(errno.ENOSPC, 'aria2 reports insufficient disk space')
                 if code in (130, -2, 143, -15):
@@ -666,6 +675,7 @@ def main():
     fetching.add_argument('--nextcloud-existing', help='Skip originals present in this public Nextcloud share; remote copies are not local SHA proofs')
     fetching.add_argument('--nextcloud-fallback', help='After Yandex transfer retries, download failed course videos from this public share and compare SHA-256')
     add_arguments(fetching)
+    add_source_arguments(fetching)
     salvage = commands.add_parser('recover', help='Retain videos with over 50 percent confirmed bytes next to originals')
     salvage.add_argument('--destination', required=True, type=Path)
     damaged = commands.add_parser('corrupted', help='Save corrupted download progress and list retained files over 30 percent')
@@ -707,12 +717,22 @@ def main():
             raise ValueError('--report-repo requires --mark')
         if args.retries < 0:
             raise ValueError('--retries must be non-negative')
+        try:
+            opencloud_fallback, download_budget = source_settings(args)
+            if args.nextcloud_existing and (args.nextcloud_fallback or opencloud_fallback):
+                raise ValueError('Choose remote skipping or verified fallback, not both')
+            if args.root and (args.nextcloud_existing or args.nextcloud_fallback or opencloud_fallback):
+                raise ValueError('Cloud course filtering cannot be used for personal/root archives')
+        except ValueError as error:
+            parser.error(str(error))
         tuning = resolve({name: getattr(args, name) for name in OPTIONS})
         data = json.loads(args.catalog.read_text(encoding='utf-8')) if args.catalog else catalog(args.source, args.root)
         if args.root and args.catalog and not data.get('root'):
             raise ValueError('--root requires a root catalog')
         if data.get('root') and (args.report_repo or [row['name'] for row in data['courses']] != ['.']):
             raise ValueError('Root catalogs must contain only . and cannot publish course reports')
+        if data.get('root') and (args.nextcloud_existing or args.nextcloud_fallback or opencloud_fallback):
+            parser.error('Cloud course filtering cannot be used for personal/root archives')
         chosen = select_courses(data, args.include, args.exclude)
         if not chosen:
             raise ValueError('No courses selected')
@@ -720,7 +740,7 @@ def main():
             available = {item['name'] for item in catalog(data['source'])['courses']}
             if {PurePosixPath(name).parts[0] for name in chosen} - available:
                 raise ValueError('Selected courses no longer exist in the source folder')
-        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep, args.retry_check, tuning, args.defer_range, args.range_budget, args.range_files, args.nextcloud_existing, args.nextcloud_fallback)
+        return download(data, chosen, args.destination.resolve(), args.retries, args.report_repo, args.mark, args.git_push, args.deep, args.retry_check, tuning, args.defer_range, args.range_budget, args.range_files, args.nextcloud_existing, args.nextcloud_fallback, opencloud_fallback=opencloud_fallback, download_budget=download_budget)
     except (ValueError, KeyError, OSError, RuntimeError, subprocess.SubprocessError) as error:
         parser.exit(storage.TEMPFAIL if storage.disk_error(error) else 2, f'Error: {error}\n')
 

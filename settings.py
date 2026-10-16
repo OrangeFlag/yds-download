@@ -1,6 +1,7 @@
 """Shared CLI and semester-queue tuning; sizes have explicit binary units."""
 import math
 import argparse
+from pathlib import Path
 
 # name: default, minimum, maximum (None = unbounded), description
 OPTIONS = {
@@ -77,4 +78,67 @@ def arguments(values):
         flag = name.replace('_', '-')
         result.append(('--' if value else '--no-') + flag if isinstance(value, bool)
                       else '--' + flag + '=' + str(value))
+    return result
+
+
+def add_source_arguments(parser):
+    group = parser.add_argument_group('Verified cloud fallback and adaptive downloads')
+    group.add_argument('--opencloud-fallback', help='HTTPS OpenCloud server origin for failed course originals')
+    group.add_argument('--opencloud-username', help='OpenCloud account username')
+    group.add_argument('--opencloud-password-file', type=Path, help='OpenCloud password file; only its path is persisted')
+    group.add_argument('--download-budget', type=Path, help='Shared measured download budget directory')
+    group.add_argument('--download-min-files', type=int, default=2, help='Minimum total simultaneous files across all download sources (default: 2)')
+    group.add_argument('--download-max-files', type=int, default=8, help='Maximum total simultaneous files across all download sources (default: 8)')
+
+
+def validate_source_settings(opencloud=None, budget=None):
+    from urllib.parse import urlsplit
+    if opencloud is not None:
+        if (not isinstance(opencloud, dict) or set(opencloud) != {'server', 'username', 'password_file'}
+                or any(not isinstance(opencloud[key], (str, Path)) or not str(opencloud[key]).strip()
+                       or any(ord(char) < 32 for char in str(opencloud[key])) for key in opencloud)):
+            raise ValueError('OpenCloud requires server, username and password file')
+        server = str(opencloud['server'])
+        parsed = urlsplit(server)
+        if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+                or parsed.path not in ('', '/') or parsed.query or parsed.fragment
+                or any(char.isspace() for char in server)):
+            raise ValueError('Expected an HTTPS OpenCloud server origin')
+        parsed.port  # Validate the port before any transfer.
+        if ':' in str(opencloud['username']):
+            raise ValueError('OpenCloud username cannot contain a colon')
+        opencloud = dict(server=server.rstrip('/'), username=str(opencloud['username']),
+                         password_file=str(Path(opencloud['password_file']).expanduser().resolve()))
+    if budget is not None:
+        if (not isinstance(budget, dict) or set(budget) != {'directory', 'minimum', 'maximum'}
+                or not isinstance(budget['directory'], (str, Path)) or not str(budget['directory']).strip()
+                or any(ord(char) < 32 for char in str(budget['directory']))
+                or any(type(budget[key]) is not int for key in ('minimum', 'maximum'))
+                or not 1 <= budget['minimum'] <= budget['maximum']):
+            raise ValueError('Download file limits must satisfy 1 <= minimum <= maximum')
+        budget = dict(budget, directory=str(Path(budget['directory']).expanduser().resolve()))
+    return opencloud, budget
+
+
+def source_settings(args):
+    values = (args.opencloud_fallback, args.opencloud_username, args.opencloud_password_file)
+    if any(value is not None for value in values) and not all(values):
+        raise ValueError('--opencloud-fallback requires --opencloud-username and --opencloud-password-file')
+    if not 1 <= args.download_min_files <= args.download_max_files:
+        raise ValueError('Download file limits must satisfy 1 <= minimum <= maximum')
+    cloud = dict(zip(('server', 'username', 'password_file'), values)) if all(values) else None
+    budget = (dict(directory=args.download_budget, minimum=args.download_min_files, maximum=args.download_max_files)
+              if args.download_budget is not None else None)
+    return validate_source_settings(cloud, budget)
+
+
+def source_arguments(opencloud=None, budget=None):
+    opencloud, budget = validate_source_settings(opencloud, budget)
+    result = []
+    if opencloud:
+        result += ['--opencloud-fallback', opencloud['server'], '--opencloud-username', opencloud['username'],
+                   '--opencloud-password-file', opencloud['password_file']]
+    if budget:
+        result += ['--download-budget', budget['directory'], '--download-min-files', str(budget['minimum']),
+                   '--download-max-files', str(budget['maximum'])]
     return result

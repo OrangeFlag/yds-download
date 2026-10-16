@@ -1,4 +1,4 @@
-"""Automatic upload concurrency and a process-shared cloud upload budget."""
+"""Measured transfer concurrency and a process-shared file budget."""
 from contextlib import contextmanager
 from datetime import datetime
 import fcntl
@@ -10,10 +10,11 @@ import uuid
 
 
 class UploadConcurrency:
-    def __init__(self, minimum, maximum):
+    def __init__(self, minimum, maximum, probe_zero=False):
         if not 1<=minimum<=maximum:
             raise ValueError('Expected 1 <= minimum uploads <= maximum uploads')
         self.minimum, self.maximum, self.limit = minimum, maximum, minimum
+        self.probe_zero=probe_zero
         self.lock = Lock()
         self.total = 0
         self.window = None
@@ -55,7 +56,7 @@ class UploadConcurrency:
         self.window = now,total,active
         if draining:
             self.trial = active,rate
-            print(f'UPLOAD CONCURRENCY: active={active}; next_limit={self.limit}; '
+            print(f'TRANSFER CONCURRENCY: active={active}; next_limit={self.limit}; '
                   f'confirmed_mbit_s={rate*8/1_000_000:.2f}; draining',flush=True)
             return self.limit
         old_limit = self.limit
@@ -64,7 +65,7 @@ class UploadConcurrency:
             old, baseline = self.trial
             self.trial = None
             threshold = 11 if self.limit>old else 9
-            if rate*10<baseline*threshold:
+            if (baseline==0 and rate==0) or rate*10<baseline*threshold:
                 self.direction = -1 if self.limit>old else 1
                 self.limit = old
                 self.next_probe = now+300
@@ -72,7 +73,7 @@ class UploadConcurrency:
             elif self.limit in (self.minimum,self.maximum):
                 self.direction *= -1
                 self.next_probe = now+300
-        if self.limit==old_limit and rate>0 and now>=self.next_probe:
+        if self.limit==old_limit and (rate>0 or self.probe_zero) and now>=self.next_probe:
             candidate = self.limit+self.direction
             if not self.minimum<=candidate<=self.maximum:
                 self.direction *= -1
@@ -83,7 +84,7 @@ class UploadConcurrency:
                 reason = 'probe'
         if self.limit!=old_limit:
             self.window = None
-        print(f'UPLOAD CONCURRENCY: active={active}; limit={old_limit}; '
+        print(f'TRANSFER CONCURRENCY: active={active}; limit={old_limit}; '
               f'confirmed_mbit_s={rate*8/1_000_000:.2f}; next_limit={self.limit}; {reason}',flush=True)
         return self.limit
 
@@ -92,11 +93,12 @@ class SharedUploadBudget:
     """One adaptive limit for all cloud processes; each waiting cloud gets a turn."""
     fields=('limit','total','window','trial','direction','next_probe','last_rate','last_rate_time')
 
-    def __init__(self, directory, name, minimum=2, maximum=8):
+    def __init__(self, directory, name, minimum=2, maximum=8, probe_zero=False):
         UploadConcurrency(minimum,maximum)
         self.directory=Path(directory)
         self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.name,self.minimum,self.maximum=name,minimum,maximum
+        self.probe_zero=probe_zero
         self.key=uuid.uuid4().hex
         self.lease_path=self.directory/(self.key+'.member')
         self.lease=self.lease_path.open('a')
@@ -129,12 +131,13 @@ class SharedUploadBudget:
                     del members[key]
                     lease.unlink(missing_ok=True)
             expected=dict(minimum=self.minimum,maximum=self.maximum)
+            if self.probe_zero:expected['probe_zero']=True
             if state.get('settings')!=expected:
                 if members:raise ValueError('Shared upload limits differ between processes')
                 state.clear();state.update(settings=expected,members={})
                 members=state['members']
             if not members:
-                controller=UploadConcurrency(self.minimum,self.maximum)
+                controller=UploadConcurrency(self.minimum,self.maximum,self.probe_zero)
                 state['controller']={k:getattr(controller,k) for k in self.fields}
             member=members.setdefault(self.key,dict(name=self.name,active=0,waiting=0,confirmed_bytes=0,active_slots=[],waiting_slots=[]))
             state['controller']['total']+=max(0,self.confirmed_bytes-member['confirmed_bytes'])
@@ -155,7 +158,7 @@ class SharedUploadBudget:
             if now<self.next_update:return
             self.next_update=now+1
             with self.state() as state:
-                controller=UploadConcurrency(self.minimum,self.maximum)
+                controller=UploadConcurrency(self.minimum,self.maximum,self.probe_zero)
                 for key in self.fields:setattr(controller,key,state['controller'][key])
                 active=sum(row['active'] for row in state['members'].values())
                 if active>=controller.limit or not any(row['waiting'] for row in state['members'].values()):
@@ -165,7 +168,7 @@ class SharedUploadBudget:
 
     @contextmanager
     def slot(self, stopping):
-        if stopping.is_set():raise InterruptedError('Upload budget interrupted')
+        if stopping.is_set():raise InterruptedError('File transfer budget interrupted')
         token=uuid.uuid4().hex
         acquired=False
         try:
@@ -183,7 +186,7 @@ class SharedUploadBudget:
                         acquired=True
                 if acquired:break
                 stopping.wait(.5)
-            if not acquired:raise InterruptedError('Upload budget interrupted')
+            if not acquired:raise InterruptedError('File transfer budget interrupted')
             yield
         finally:
             with self.state() as state:

@@ -28,7 +28,7 @@ def now():
     return datetime.now().astimezone().isoformat()
 
 
-def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
+def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None, runner=None):
     log = next((Path(arg[6:]) for arg in command if arg.startswith('--log=')), None)
     inputs = next((Path(arg[13:]) for arg in command if arg.startswith('--input-file=')), None)
     destinations = {}
@@ -44,7 +44,7 @@ def transfer_process(command, *, env, on_tick, stop_timeout=30, stopping=None):
     retry = network.RequestRetry(str(log), stopping)
     while True:
         offset = log.stat().st_size if log is not None and log.exists() else 0
-        code = _transfer_process_once(command, env=env, on_tick=on_tick, stop_timeout=stop_timeout)
+        code = (runner or _transfer_process_once)(command, env=env, on_tick=on_tick, stop_timeout=stop_timeout)
         if (command[0] != 'aria2c' or code in (0, 9, 130, -2, 143, -15)
                 or stopping is not None and stopping.is_set() or log is None):
             return code
@@ -146,7 +146,7 @@ def failure_manifests_batch(root, events):
 
 
 class Background:
-    def __init__(self, root, source, retries, tuning, defer_range=False, range_pool=None, budget=None, range_files=1, nextcloud_fallback=None, retry_check=False, recheck_probes=16, recheck_full_interval=604800):
+    def __init__(self, root, source, retries, tuning, defer_range=False, range_pool=None, budget=None, range_files=1, nextcloud_fallback=None, retry_check=False, recheck_probes=16, recheck_full_interval=604800, opencloud_fallback=None, download_budget=None):
         self.root, self.source, self.retries, self.tuning = root, source, retries, tuning
         self.state = root / '.download'
         self.directory = self.state / 'tasks'
@@ -165,8 +165,14 @@ class Background:
             self.pools['range'].shutdown()
             self.pools['range'] = range_pool
         self.stopping = Event()
+        from adaptive_downloads import get_budgets
+        self.download_budgets=get_budgets(download_budget)
         from nextcloud_fallback import Fallback
-        self.fallback = Fallback(root,nextcloud_fallback,self.stopping) if nextcloud_fallback else None
+        if opencloud_fallback:
+            from cloud_fallback import CloudFallback
+            self.fallback=CloudFallback(root,nextcloud_fallback,self.stopping,opencloud=opencloud_fallback,budget=self.download_budgets)
+        else:
+            self.fallback = Fallback(root,nextcloud_fallback,self.stopping,**({'budget':self.download_budgets['nextcloud']} if self.download_budgets else {})) if nextcloud_fallback else None
         self.download_active = Event()
         self.wake = Event()
         self.retry = []
@@ -523,7 +529,13 @@ class Background:
         self.download_active.set()
         self.transferring = course
         try:
-            code = transfer_process(command, env=d.ENV, on_tick=self.on_tick, stopping=self.stopping)
+            extra={}
+            if self.download_budgets:
+                from adaptive_downloads import AriaBatch
+                runner=AriaBatch(self.download_budgets['yandex'],self.stopping,
+                                 {str(d.target(self.root,item,course)):progress[item['path']] for item in pending})
+                extra['runner']=runner.run
+            code = transfer_process(command, env=d.ENV, on_tick=self.on_tick, stopping=self.stopping, **extra)
         finally:
             self.download_active.clear()
             self.transferring = None
@@ -557,7 +569,7 @@ class Background:
             self.metrics.close()
 
 
-def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range=False, range_budget=None, range_files=16, nextcloud_existing=None, nextcloud_fallback=None):
+def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, tuning, defer_range=False, range_budget=None, range_files=16, nextcloud_existing=None, nextcloud_fallback=None, opencloud_fallback=None, download_budget=None):
     storage.check(root)
     tuning = resolve(tuning)
     if not all(shutil.which(name) for name in ('aria2c', 'cp')):
@@ -572,7 +584,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
         if identity.exists() and json.loads(identity.read_text())['source'] != source:
             raise ValueError('Use a separate destination for a different public folder/year')
         d.write_json(identity, dict(source=source, title=data['title']))
-        d.write_json(state / 'settings.json', dict(retries=retries, deep=False, retry_check=retry_check, tuning=tuning, defer_range=defer_range, nextcloud_existing=nextcloud_existing, nextcloud_fallback=nextcloud_fallback))
+        d.write_json(state / 'settings.json', dict(retries=retries, deep=False, retry_check=retry_check, tuning=tuning, defer_range=defer_range, nextcloud_existing=nextcloud_existing, nextcloud_fallback=nextcloud_fallback,opencloud_fallback=opencloud_fallback,download_budget=download_budget))
         remote_index = None
         remote_files = {}
         if nextcloud_existing:
@@ -623,7 +635,8 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             from request_budget import ProcessRangeBudget
             budget = ProcessRangeBudget(range_budget, rps=tuning['range_rps'])
         background = Background(root, source, retries, tuning, defer_range=defer_range and budget is None,
-                                budget=budget, range_files=range_files if budget else 1, nextcloud_fallback=nextcloud_fallback,retry_check=retry_check)
+                                budget=budget, range_files=range_files if budget else 1, nextcloud_fallback=nextcloud_fallback,retry_check=retry_check,
+                                opencloud_fallback=opencloud_fallback,download_budget=download_budget)
         if remote_index:
             remote_index.stopping=background.stopping
         for path in background.directory.glob('*.json'):

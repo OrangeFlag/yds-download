@@ -22,7 +22,7 @@ from report import queue_report, retry_reports
 from pipeline import Background, failure_manifests, now
 from file_state import FileState
 import recovery as r
-from settings import resolve
+from settings import resolve, add_source_arguments, source_settings, validate_source_settings
 from metrics import Metrics
 
 
@@ -284,7 +284,8 @@ def seed_legacy_tasks(background):
     if count:print('YANDEX RECHECK LEGACY QUEUED: '+str(root)+'; files='+str(count),flush=True)
 
 
-def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60, nextcloud_fallback=None, recheck_interval=0, recheck_files=8, recheck_probes=16, recheck_full_interval=604800):
+def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60, nextcloud_fallback=None, recheck_interval=0, recheck_files=8, recheck_probes=16, recheck_full_interval=604800, opencloud_fallback=None, download_budget=None):
+    opencloud_fallback, download_budget = validate_source_settings(opencloud_fallback, download_budget)
     if files < 1 or per_file < 1:
         raise ValueError('Range file limits must be positive')
     if not 1 <= secondary_slots <= max(1, files - 1):
@@ -343,13 +344,26 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                             continue
                         tasks = cache.tasks(state / 'tasks')
                         settings=cache.read(state/'settings.json',{})
-                        link=nextcloud_fallback or settings.get('nextcloud_fallback')
-                        fallback=None
-                        if link and state.joinpath('source.json').exists() and not cache.read(state/'catalog.json',{}).get('root'):
-                            from nextcloud_fallback import Fallback
-                            if root not in fallbacks or fallbacks[root].link!=link:
-                                fallbacks[root]=Fallback(root,link,stopping)
-                            fallback=fallbacks[root]
+                        link = nextcloud_fallback or archive.get('nextcloud_fallback', config.get('nextcloud_fallback', settings.get('nextcloud_fallback')))
+                        cloud = opencloud_fallback or archive.get('opencloud_fallback', config.get('opencloud_fallback', settings.get('opencloud_fallback')))
+                        download_config = download_budget or archive.get('download_budget', config.get('download_budget', settings.get('download_budget')))
+                        cloud, download_config = validate_source_settings(cloud, download_config)
+                        fallback = None
+                        if (link or cloud) and state.joinpath('source.json').exists() and not cache.read(state/'catalog.json',{}).get('root'):
+                            fallback_key = json.dumps([link, cloud, download_config], sort_keys=True)
+                            if root not in fallbacks or fallbacks[root][0] != fallback_key:
+                                budgets = None
+                                if download_config:
+                                    from adaptive_downloads import get_budgets
+                                    budgets = get_budgets(download_config)
+                                if cloud:
+                                    from cloud_fallback import CloudFallback
+                                    source_fallback = CloudFallback(root, link, stopping, opencloud=cloud, budget=budgets)
+                                else:
+                                    from nextcloud_fallback import Fallback
+                                    source_fallback = Fallback(root, link, stopping, **({'budget': budgets['nextcloud']} if budgets else {}))
+                                fallbacks[root] = fallback_key, source_fallback
+                            fallback = fallbacks[root][1]
                         legacy=recheck_interval and archive.get('legacy_recheck') and not cache.read(state/'legacy-recheck-seeded.json',{}).get('complete')
                         if not legacy and not summary.get('pending_courses') and not any(job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or recheck_due(job,recheck_interval) or fallback_due(fallback,job)) for _, job in tasks):
                             continue
@@ -369,7 +383,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 tuning = resolve({**settings['tuning'], 'range_workers': per_file, 'range_rps': rps})
                                 background = Background(root, identity['source'], settings['retries'], tuning,
                                                         range_pool=pool, budget=budget, range_files=files, nextcloud_fallback=link if fallback else None,retry_check=settings.get('retry_check',False),
-                                                        recheck_probes=recheck_probes,recheck_full_interval=recheck_full_interval)
+                                                        recheck_probes=recheck_probes,recheck_full_interval=recheck_full_interval,
+                                                        opencloud_fallback=cloud if fallback else None,download_budget=download_config)
                             except BaseException:
                                 lock.close()
                                 raise
@@ -503,14 +518,19 @@ def main():
     parser.add_argument('--recheck-files',type=int,default=8,help='Extra recheck file slots, split between first and later queues')
     parser.add_argument('--recheck-probes',type=int,default=16,help='Maximum cheap availability requests before full recovery; 0 always runs full recovery')
     parser.add_argument('--recheck-full-interval',type=float,default=604800,help='Seconds between full rechecks even after negative probes; 0 always runs full recovery')
+    add_source_arguments(parser)
     args = parser.parse_args()
+    try:
+        opencloud_fallback, download_budget = source_settings(args)
+    except ValueError as error:
+        parser.error(str(error))
     stopping = Event()
     for number in (signal.SIGINT, signal.SIGTERM):
         signal.signal(number, lambda *_: stopping.set())
     # Prevent two workers from multiplying the global limits.
     with args.queue[0].with_suffix('.range.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget, args.metrics_interval, args.nextcloud_fallback,args.recheck_interval,args.recheck_files,args.recheck_probes,args.recheck_full_interval)
+        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget, args.metrics_interval, args.nextcloud_fallback,args.recheck_interval,args.recheck_files,args.recheck_probes,args.recheck_full_interval,opencloud_fallback=opencloud_fallback,download_budget=download_budget)
 
 
 if __name__ == '__main__':

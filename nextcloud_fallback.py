@@ -1,4 +1,5 @@
 """Fetch failed course videos from a public share without trusting remote checksums."""
+from contextlib import nullcontext
 from datetime import datetime
 import hashlib
 import errno
@@ -24,15 +25,16 @@ TRANSFERS=BoundedSemaphore(2)
 
 
 class Fallback:
-    def __init__(self, root, link, stopping):
+    def __init__(self, root, link, stopping, *, index=None, budget=None, label="NEXTCLOUD"):
         self.root,self.link,self.stopping=Path(root),link,stopping
-        self.index=Index(root,link,stopping=stopping)
+        self.index=index if index is not None else Index(root,link,stopping=stopping)
+        self.budget,self.label=budget,label
         self.index.share.timeout=60
         self.device=self.root.stat().st_dev
         self.lookup_lock=Lock()
         self.source=json.loads((self.root/'.download/source.json').read_text())
         self.is_shad=bool(re.search(r'(?:^|\W)(?:шад|shad|ysda|yds)(?:$|\W)',self.source.get('title',''),re.I))
-        self.directory=self.root/'.download/nextcloud-downloads'
+        self.directory=self.root/('.download/'+label.lower()+'-downloads')
 
     def state_path(self,item):
         key=hashlib.sha256(json.dumps([self.source['source'],self.index.link,item['path'],item['size'],item['sha256']]).encode()).hexdigest()
@@ -78,7 +80,7 @@ class Fallback:
             row.setdefault('bodies',{})[key]={name:row.get(name) for name in ('etag','body_complete','received_bytes')}
         row['time']=datetime.now().astimezone().isoformat()
         d.write_json(self.state_path(item),row)
-        d.append_events(self.root/'.download/nextcloud-downloads.jsonl',[dict(row)])
+        d.append_events(self.directory.with_suffix('.jsonl'),[dict(row)])
 
     def mismatch_path(self,item,host,digest=None,collision=0):
         original=PurePosixPath(item['path']);suffix=' (SHA mismatch, '+host+')'+original.suffix
@@ -88,11 +90,37 @@ class Fallback:
             stem=stem.encode()[:230-len((marker+suffix).encode())].decode(errors='ignore')+marker
         return d.local_path(self.root,str(original.with_name(stem+suffix)))
 
-    def recover_all(self,item,event):
+    def hash_file(self,path):
+        storage.check(path)
+        while not d.HASH_LOCK.acquire(timeout=.25):
+            if self.stopping.is_set():raise InterruptedError('SHA interrupted')
+        try:
+            hashes={kind:hashlib.new(kind) for kind in ('sha256','sha1','md5')}
+            with path.open('rb') as stream:
+                while block:=stream.read(1024**2):
+                    if self.stopping.is_set():raise InterruptedError('SHA interrupted')
+                    for digest in hashes.values():digest.update(block)
+                os.fsync(stream.fileno())
+            return {kind:digest.hexdigest() for kind,digest in hashes.items()}
+        finally:d.HASH_LOCK.release()
+
+    def retained(self,candidate,retained_hashes,retained_digests):
+        remote={kind.lower():value.lower() for kind,value in re.findall(
+            r'\b(SHA256|SHA1|MD5):([a-fA-F0-9]+)',' '.join(candidate.get('checksums',[])),re.I)}
+        if remote.get('sha256') in retained_hashes:return True
+        for actual in retained_digests:
+            common=next((kind for kind in ('sha256','sha1','md5') if remote.get(kind) and actual.get(kind)),None)
+            if common and remote[common]==actual[common]:return True
+        # Without a common checksum, name and size cannot establish identical bytes.
+        return False
+
+    def recover_all(self,item,event,*,retained_hashes=(),retained_digests=()):
+        retained_hashes=frozenset(retained_hashes)
+        retained_digests=tuple(dict(hashes) for hashes in retained_digests)
         result=None
         attempts,limit=0,1
         while attempts<limit:
-            current=self.recover(item,event)
+            current=self.recover(item,event,retained_hashes=retained_hashes,retained_digests=retained_digests)
             if current:
                 result=current
                 if current['status']=='valid':return current
@@ -103,7 +131,9 @@ class Fallback:
                 break
         return result
 
-    def recover(self,item,event):
+    def recover(self,item,event,*,retained_hashes=(),retained_digests=()):
+        retained_hashes=frozenset(retained_hashes)
+        retained_digests=tuple(dict(hashes) for hashes in retained_digests)
         if not self.is_shad or PurePosixPath(item['path']).suffix.casefold() not in VIDEO:
             return None
         catalog=self.root/'.download/catalog.json'
@@ -117,15 +147,26 @@ class Fallback:
         if row.get('state') in ('verified','mismatch','not_found','unmapped') and not self.ready(item):
             return None
         row.update(source=self.source['source'],path=item['path'],size=item['size'],sha256=item['sha256'],share=self.index.link)
+        own_hashes=[]
+        for copy in row.get('retained_copies',{}).values():
+            local=Path(copy['local'])
+            if (local.is_file() and not Path(str(local)+'.aria2').exists()
+                    and self.stamp(local)==copy['local_stat']):
+                own_hashes.append(dict(copy.get('actual_hashes',{}),sha256=copy['actual_sha256']))
+        retained_hashes=retained_hashes|frozenset(hashes['sha256'] for hashes in own_hashes)
+        retained_digests=retained_digests+tuple(own_hashes)
         acquired=False
         try:
-            while not TRANSFERS.acquire(timeout=.25):
-                if self.stopping.is_set():raise InterruptedError('Fallback interrupted')
-            acquired=True
+            if self.budget is None:
+                while not TRANSFERS.acquire(timeout=.25):
+                    if self.stopping.is_set():raise InterruptedError('Fallback interrupted')
+                acquired=True
             try:
                 folder=str(PurePosixPath(remote_path(self.source,item)).parent)
             except ValueError:
-                row['state']='unmapped';self.save(item,row);return None
+                if not getattr(self.index,'global_candidates',False):
+                    row['state']='unmapped';self.save(item,row);return None
+                folder=None
             with self.lookup_lock:
                 if (row.get('state')=='not_found' or row.get('http_status')==404) and not isinstance(self.index.folders.get(folder),Exception):
                     self.index.folders.pop(folder,None)
@@ -136,9 +177,11 @@ class Fallback:
             if changed:
                 row['rejected_candidates']=[signature for signature in row.get('rejected_candidates',[]) if signature not in changed]
             candidates=[c for c in candidates if [c.get('download_path',c['path']),c['size'],c.get('etag')]
-                        not in row.get('rejected_candidates',[])]
+                        not in row.get('rejected_candidates',[])
+                        and not self.retained(c,retained_hashes,retained_digests)]
             if not candidates:
-                row.update(state='mismatch',remaining_candidates=False);self.save(item,row);return None
+                row.update(state='mismatch' if row.get('local') else 'not_found',remaining_candidates=False,
+                           retry_after=time.time()+3600);self.save(item,row);return None
             row['remaining_candidates']=len(candidates)>1
             row['candidate_count']=len(candidates)
             untried=[c for c in candidates if [c.get('download_path',c['path']),c['size'],c.get('etag')]
@@ -170,8 +213,9 @@ class Fallback:
                 else:offset=0
                 if shutil.disk_usage(self.root).free < size-offset+1024**3:
                     raise OSError(errno.ENOSPC,'Insufficient space for Nextcloud fallback')
-                print('NEXTCLOUD DOWNLOAD START: '+item['path'],flush=True)
-                with self.index.share.request('GET',remote,headers=headers) as response:
+                print(self.label+' DOWNLOAD START: '+item['path'],flush=True)
+                with self.budget.slot(self.stopping) if self.budget is not None else nullcontext(), \
+                        self.index.share.request('GET',remote,headers=headers) as response:
                     if response.status==206:
                         match=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',response.headers.get('Content-Range',''))
                         if (not resume or not match or tuple(map(int,match.groups()))!=(offset,size-1,size)
@@ -197,17 +241,18 @@ class Fallback:
                             storage.check(self.root)
                             block=response.read(1024**2)
                             if not block:break
+                            if self.budget is not None:self.budget.confirmed(len(block))
                             if offset+len(block)>size:raise RuntimeError('Nextcloud sent more bytes than advertised')
                             stream.write(block);offset+=len(block)
                             if time.monotonic()-last>=30:
                                 stream.flush();row['received_bytes']=offset;self.save(item,row)
-                                print(f'NEXTCLOUD DOWNLOAD PROGRESS: {item["path"]}; {offset}/{size} bytes',flush=True)
+                                print(f'{self.label} DOWNLOAD PROGRESS: {item["path"]}; {offset}/{size} bytes',flush=True)
                                 last=time.monotonic()
                         stream.flush();os.fsync(stream.fileno())
                     if offset!=size:raise RuntimeError('Incomplete Nextcloud response')
                 row.update(body_complete=True,received_bytes=size)
                 self.save(item,row)
-            before=self.stamp(part);actual=d.sha256_file(part,self.stopping)
+            before=self.stamp(part);actual_hashes=self.hash_file(part);actual=actual_hashes['sha256']
             if self.stamp(part)!=before:raise RuntimeError('Fallback file changed while verifying SHA')
             matched=size==item['size'] and actual==item['sha256'].lower()
             host=urllib.parse.urlsplit(self.index.link).hostname
@@ -231,16 +276,16 @@ class Fallback:
             row.update(state='verified' if matched else 'mismatch',actual_sha256=actual,local=str(target),local_stat=stat,received_bytes=size)
             if matched:
                 proof=d.record(self.root/'.download',item,event['course'],event['attempt'],'valid',
-                    'Nextcloud '+host+'; SHA-256 verified',local=target,verified_stat=stat)
+                    self.label.title()+' '+host+'; SHA-256 verified',local=target,verified_stat=stat)
                 if proof['status']!='valid':raise RuntimeError('Published fallback file changed')
                 result=dict(event,**proof,range_recovered_complete=True,recovered_stat=stat,nextcloud_source=host)
                 r.recovery_state(self.root,result,'finished')
             else:
                 signature=[remote,size,candidate.get('etag')]
                 row.setdefault('rejected_candidates',[]).append(signature)
-                row.setdefault('retained_copies',{})[key]=dict(signature=signature,local=str(target),local_stat=stat,actual_sha256=actual)
+                row.setdefault('retained_copies',{})[key]=dict(signature=signature,local=str(target),local_stat=stat,actual_sha256=actual,actual_hashes=actual_hashes)
                 result=dict(status='mismatch',local=str(target),actual_sha256=actual,expected_sha256=item['sha256'],source=host)
-                print('NEXTCLOUD SHA MISMATCH: '+str(target),flush=True)
+                print(self.label+' SHA MISMATCH: '+str(target),flush=True)
             self.save(item,row)
             part.unlink();storage.sync_directory(part.parent)
             return result
@@ -254,7 +299,7 @@ class Fallback:
             details = error_details(error)
             row.update(state='pending',retry_after=time.time()+60,**details)
             self.save(item,row)
-            print(f'NEXTCLOUD DOWNLOAD RETRY: {item["path"]}; {type(error).__name__}; HTTP={details["http_status"]}; reason={details["error_reason"]!r}; errno={details["error_errno"]}',flush=True)
+            print(f'{self.label} DOWNLOAD RETRY: {item["path"]}; {type(error).__name__}; HTTP={details["http_status"]}; reason={details["error_reason"]!r}; errno={details["error_errno"]}',flush=True)
             return None
         finally:
             if acquired:TRANSFERS.release()

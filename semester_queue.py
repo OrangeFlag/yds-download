@@ -14,7 +14,7 @@ from download import cli, write_json
 from pipeline import transfer_process
 from metrics import Metrics
 from collections import Counter
-from settings import arguments, resolve
+from settings import arguments, resolve, add_source_arguments, source_settings, source_arguments
 
 def main():
     os.umask(0o077)
@@ -25,8 +25,13 @@ def main():
     parser.add_argument('--range-files', type=int, default=16)
     parser.add_argument('--nextcloud-existing', help='Skip originals already available in this public Nextcloud share')
     parser.add_argument('--nextcloud-fallback', help='Verified fallback for failed course videos')
+    add_source_arguments(parser)
     args = parser.parse_args()
-    if args.nextcloud_existing and args.nextcloud_fallback:
+    try:
+        opencloud_fallback, download_budget = source_settings(args)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.nextcloud_existing and (args.nextcloud_fallback or opencloud_fallback):
         parser.error('Choose remote skipping or verified fallback, not both')
     if args.range_budget is not None and (not args.defer_range or args.range_files < 1):
         parser.error('--range-budget requires --defer-range and positive --range-files')
@@ -77,6 +82,7 @@ def main():
                        '--catalog', job['catalog'], '--destination', job['destination'],
                        '--retries', str(data.get('retries', 2))]
             command += arguments({**data.get('tuning', {}), **job.get('tuning', {})})
+            command += source_arguments(opencloud_fallback, download_budget)
             if args.nextcloud_existing:
                 command += ['--nextcloud-existing', args.nextcloud_existing]
             if args.nextcloud_fallback:
