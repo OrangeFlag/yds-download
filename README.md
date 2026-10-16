@@ -504,6 +504,24 @@ journalctl --user -u yds-download-range.service -n 30
 # Для файловых логов: tail -f /absolute/path/YandexDisk/.download/range-queue.log
 ```
 
+Для постоянного ограничения памяти Range-worker используйте поставляемый
+systemd drop-in (размеры указаны в двоичных единицах: 2560 MiB = 2,5 GiB):
+
+```sh
+install -Dm0644 deploy/systemd/user/yds-download-range.service.d/10-memory.conf \
+  "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/yds-download-range.service.d/10-memory.conf"
+systemctl --user daemon-reload
+systemctl --user restart yds-download-range.service
+systemctl --user show yds-download-range.service \
+  -p MemoryHigh -p MemoryMax -p EffectiveMemoryHigh -p EffectiveMemoryMax -p MemoryCurrent
+```
+
+`MemoryHigh=2560M` начинает ограничивать потребление на уровне cgroup, включая
+файловый кэш; `MemoryMax=3072M` задаёт жёсткий предел, при котором возможен
+OOM-kill. Файл в репозитории **не меняет настройки работающего сервера** до
+установки drop-in, `daemon-reload` и перезапуска unit. При меньших лимитах
+родительского slice проверьте `EffectiveMemoryHigh` и `EffectiveMemoryMax`.
+
 Перед ручной проверкой `--deep`/`--retry-check` или изменением Git-репозитория
 отчётов остановите обычный загрузчик курсов и общий worker, чтобы освободить
 блокировки архива и публикации. `.download` и личные данные в Git не попадают.
