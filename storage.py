@@ -124,9 +124,18 @@ def migrate(old, new, uuid, state, previous=()):
         prefixes = known | {str(old)} | set(previous)
         if saved.get('mount'):
             prefixes.add(saved['mount'])
+        replacements = [(prefix, str(new)) for prefix in sorted(prefixes, key=len, reverse=True)
+                        if prefix != str(new)]
+        def rewrite(line):
+            # Only replace complete JSON string paths, never URLs or diagnostic text.
+            for old_root, new_root in replacements:
+                line = line.replace('"' + old_root + '/', '"' + new_root + '/')
+                line = line.replace('"' + old_root + '"', '"' + new_root + '"')
+            return line
+
         def scan_error(error):
             raise error
-        for directory, _, names in (os.walk(new, onerror=scan_error) if prefixes - {str(new)} else ()):
+        for directory, _, names in (os.walk(new, onerror=scan_error) if replacements else ()):
             if '.download' not in Path(directory).relative_to(new).parts:
                 continue
             metadata = False
@@ -135,14 +144,15 @@ def migrate(old, new, uuid, state, previous=()):
                 if path.suffix not in ('.json', '.jsonl') or not stat.S_ISREG(path.lstat().st_mode):
                     continue
                 metadata = True
-                text = path.read_text(); updated = text
-                for prefix in sorted(prefixes, key=len, reverse=True):
-                    if prefix != str(new):
-                        updated = updated.replace(prefix + '/', str(new) + '/')
-                if updated != text:
+                # JSONL can be very large; never materialize the full journal in RAM.
+                with path.open(encoding='utf-8') as source:
+                    changed = any(rewrite(line) != line for line in source)
+                if changed:
                     temporary = path.with_name(path.name + '.mount.tmp')
-                    with temporary.open('w') as stream:
-                        stream.write(updated); stream.flush(); os.fsync(stream.fileno())
+                    with path.open(encoding='utf-8') as source, temporary.open('w', encoding='utf-8') as output:
+                        for line in source:
+                            output.write(rewrite(line))
+                        output.flush(); os.fsync(output.fileno())
                     temporary.chmod(path.stat().st_mode & 0o777)
                     temporary.replace(path)
             if metadata:
