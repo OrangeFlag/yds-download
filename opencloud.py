@@ -152,7 +152,7 @@ class Uploader(nextcloud.Sync):
             seen.add(folder)
             self.known_folders.add(folder)
             for row in self.share.listing(folder):
-                path=row['path']
+                path=row.get('download_path',row['path'])
                 if row['directory']:
                     if path and path!=folder:folders.append(path)
                 elif not PurePosixPath(path).name.startswith('.yds-'):
