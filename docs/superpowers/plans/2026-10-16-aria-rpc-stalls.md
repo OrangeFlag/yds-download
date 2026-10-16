@@ -9,6 +9,8 @@ Approved: fix remaining operational problems with independent deep review/debug 
 - [x] Cap startup calls by remaining15-second readiness deadline. Check cancellation/diskfull before promoting control failures.
 - [x] Add RPC call/time/error/retry counters to existing batched Metrics, no network probes or perrequest state writes.
 - [x] Focused/full checks, independent review; fix P1/P2, original validation then fresh review as needed.
-- [ ] Commit/push main and restart affected downloader services, verify real calls/progress/restarts and memory.
+- [x] Commit/push main and restart affected downloader services, verify real calls/progress/restarts and memory.
 
 Original diagnosis reviewer validated both P1/P2 fixes and passed all 17 adaptive tests. Fresh independent implementation review found no P1/P2. Focused normal/deep/pipeline suite: 70 tests passed. Full release suite: 505 tests passed (`python3 -m unittest discover -q`, exit 0).
+
+Rollout: main85f2baf pushed; foreground queue and Range restarted from saved launch records, clouds kept sending. RPC30s/2 extra status reads persisted in semester queue tuning. Small launch/queue backups are on the external disk. At23:52:50 the authenticated foreground metrics recorded591RPC calls,6.094seconds cumulative,0timeouts;2 startup failures, no subsequent control errors/restarts observed,232275968new aria bytes. All four services active. This is an initial operational sample, not proof that Yandex backend errors disappeared; routing/header failures still use existing retry/Range handling.
