@@ -166,6 +166,20 @@ class StorageChecks(unittest.TestCase):
         self.assertEqual(actual['description'],content['description'])
         self.assertEqual(actual['url'],content['url'])
 
+    def test_mount_migration_rewrites_unicode_paths_escaped_in_json(self):
+        old=self.root/'старый диск'
+        new=self.root/'новый диск'
+        path=new/'YandexDisk/.download/queue.json';path.parent.mkdir(parents=True)
+        initial={'local':str(old/'курс/video.mp4'), 'destination':str(old),
+                 'note':'Do not change descriptive text: '+str(old/'курс/video.mp4')}
+        path.write_text(json.dumps(initial))
+        self.assertIn('\\\\u',path.read_text())
+        storage.migrate(old,new,'uuid',self.root/'state')
+        actual=json.loads(path.read_text())
+        self.assertEqual(actual['local'],str(new/'курс/video.mp4'))
+        self.assertEqual(actual['destination'],str(new))
+        self.assertEqual(actual['note'],initial['note'])
+
     def test_mount_migration_streams_large_jsonl_instead_of_reading_entire_log(self):
         old=self.root/'old';new=self.root/'new';state=self.root/'state'
         path=new/'YandexDisk/.download/events.jsonl';path.parent.mkdir(parents=True)
