@@ -82,6 +82,25 @@ class UploadChecks(unittest.TestCase):
 
     def job(self):return self.uploader.jobs([self.root])[0]
 
+    def test_checkpoint_identity_survives_remount_and_reads_legacy_session(self):
+        import shutil
+        job=self.job()
+        previous=self.uploader.checkpoint(job)
+        previous.parent.mkdir(parents=True,exist_ok=True)
+        row=dict(source=self.data['source'],path=self.item['path'],variant='original',
+                 size=self.item['size'],payload_sha256=self.item['sha256'],
+                 session_url='https://cloud.example/data/oldsession',
+                 target='ingest/Walterit/2024-fall/Course/001 - Lecture.mp4',
+                 state='uploading',sent_bytes=7)
+        d.write_json(previous,row)
+        moved=self.root/'new_mount'
+        (moved/'.download').mkdir(parents=True)
+        shutil.copytree(self.state/'opencloud-uploads',moved/'.download/opencloud-uploads')
+        new_job=(*job[:1],moved,*job[2:4],moved/'Course/Lecture.mp4',*job[5:])
+        self.assertEqual(self.uploader.checkpoint(new_job).relative_to(moved),
+                         previous.relative_to(self.root))
+        self.assertEqual(self.uploader.record(new_job).get('session_url'),row['session_url'])
+
     def test_webdav_scan_uses_exact_server_spelling_for_unicode_folder(self):
         raw='Cafe\u0301 '
         normalized='Café '

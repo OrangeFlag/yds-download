@@ -40,7 +40,7 @@ def main():
     with path.with_suffix('.lock').open('a') as lock, Metrics(path.with_suffix('.metrics.jsonl'),'semester-queue',
             interval=resolve(json.loads(path.read_text()).get('tuning',{}))['metrics_interval']) as metrics:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        data = json.loads(path.read_text())
+        data = storage.read_queue(path)
         resolve(data.get('tuning', {}))
         for job in data['archives']:
             resolve({**data.get('tuning', {}), **job.get('tuning', {})})
@@ -55,7 +55,7 @@ def main():
                 status = json.loads((state / f'{index:02d}-status.json').read_text())
                 if status.get('course') != course or status.get('state') != 'finished':
                     raise RuntimeError('Current archive did not finish; queue remains paused')
-        data = json.loads(path.read_text())
+        data = storage.read_queue(path)
         for job in data['archives']:
             metrics.gauge('archives',dict(Counter(a.get('state','pending') for a in data['archives'])))
             metrics.gauge('current_archive',job['title'])

@@ -135,7 +135,7 @@ def prepare(config, current):
     if not busy:
         storage.migrate(config['mount_root'], root, config['disk_uuid'], state, previous=previous)
     if queue is not None:
-        data = json.loads(queue.read_text())
+        data = storage.read_queue(queue)
         if data.get('tuning') != config['queue_tuning']:
             if busy:
                 raise ValueError('Tuning change requires all services stopped; use restart without a service name')

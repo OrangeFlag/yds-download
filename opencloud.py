@@ -85,6 +85,7 @@ class Uploader(nextcloud.Sync):
         self.index=None
         self.active_hashes=set()
         self.known_folders=set()
+        self.legacy_checkpoints={}
 
     def jobs(self, roots):
         jobs=super().jobs(roots) or []
@@ -101,7 +102,7 @@ class Uploader(nextcloud.Sync):
                 match=row['match'];path=match['course_path'].rstrip('/')+'/'+match['file']
                 if (row['source'],path) in originals:
                     continue
-                local=Path(row['local'])
+                local=storage.saved_local(root, row['local'])
                 if (local in seen or not local.is_file() or Path(str(local)+'.aria2').exists()
                         or (local.stat().st_size,local.stat().st_mtime_ns)!=(row['size'],row['mtime_ns'])):
                     continue
@@ -125,12 +126,27 @@ class Uploader(nextcloud.Sync):
 
     def checkpoint(self, job):
         key=hashlib.sha256(json.dumps([self.share.url(),self.folder,job[2]['source'],job[3]['path'],job[5],
-                                     str(job[4]),job[6],job[10]],ensure_ascii=False).encode()).hexdigest()
+                                     storage.portable_local(job[1],job[4]),job[6],job[10]],ensure_ascii=False).encode()).hexdigest()
         return job[1]/'.download/opencloud-uploads'/key[:2]/(key+'.json')
 
     def record(self, job):
         p=self.checkpoint(job)
-        return json.loads(p.read_text()) if p.exists() else {}
+        if p.exists():
+            return json.loads(p.read_text())
+        root=job[1]
+        if root not in self.legacy_checkpoints:
+            old={}
+            for candidate in (root/'.download/opencloud-uploads').glob('*/*.json'):
+                saved=json.loads(candidate.read_text())
+                identity=(saved.get('source'),saved.get('path'),saved.get('variant'),
+                          saved.get('size'),saved.get('payload_sha256'))
+                if identity not in old or saved.get('sent_bytes',0)>old[identity][0]:
+                    old[identity]=(saved.get('sent_bytes',0),candidate)
+            self.legacy_checkpoints[root]=old
+        digest=job[3].get('payload_sha256',job[3]['sha256'])
+        identity=(job[2]['source'],job[3]['path'],job[5],job[6],digest)
+        previous=self.legacy_checkpoints[root].get(identity)
+        return json.loads(previous[1].read_text()) if previous else {}
 
     def save_record(self, job, row):
         path=self.checkpoint(job)
@@ -412,7 +428,7 @@ def main():
             or args.chunk_size<1 or args.retries<0 or args.transfers<1 or not math.isfinite(args.timeout) or args.timeout<=0
             or args.poll_interval is not None and (not args.upload or not math.isfinite(args.poll_interval) or args.poll_interval<=0)):
         parser.error('Specify archives and positive limit/chunk-size/timeout, non-negative retries')
-    roots=[Path(x['destination']).resolve() for x in json.loads(args.queue.read_text())['archives'] if x.get('enabled',True)] if args.queue else []
+    roots=[Path(x['destination']).resolve() for x in storage.read_queue(args.queue)['archives'] if x.get('enabled',True)] if args.queue else []
     roots=list(dict.fromkeys(roots+[p.resolve() for p in args.destination]))
     if not roots:parser.error('No selected archives')
     if args.upload_budget and (not args.upload or not 1<=args.min_transfers<=args.transfers):

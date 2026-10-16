@@ -331,7 +331,7 @@ class SharedRangeChecks(unittest.TestCase):
             self.assertEqual(FileState(state, 'recovery-state').get(item['path'])['event']['corrupted_path'], latest['corrupted_path'])
             self.assertEqual(FileState(state, 'recovery-state').get(item['path'])['event']['range_attempts'], latest['range_attempts'])
             self.assertEqual(FileState(state, 'recovery-state').get(item['path'])['state'], 'finished')
-            self.assertEqual(d.read_events(state / 'events.jsonl')[-1]['local'], str(local))
+            self.assertEqual(q.storage.saved_local(root, d.read_events(state / 'events.jsonl')[-1]['local']), local)
 
     def test_finished_archive_retires_obsolete_range_without_network_or_sha(self):
         with tempfile.TemporaryDirectory() as directory:

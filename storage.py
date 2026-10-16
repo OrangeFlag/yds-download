@@ -77,6 +77,67 @@ def lock_archives(roots, filename):
         yield claim
 
 
+def saved_local(root, value):
+    """Resolve archive-relative paths and accept legacy absolute paths."""
+    path = Path(value)
+    if not path.is_absolute() and ('..' in path.parts or not path.parts):
+        raise ValueError('Unsafe saved local path')
+    return path if path.is_absolute() else Path(root) / path
+
+
+def portable_local(root, value):
+    """Store archive-owned files relative to that archive, leave external files absolute."""
+    path = Path(value)
+    root = Path(root)
+    return str(path.relative_to(root)) if path.is_absolute() and path.is_relative_to(root) else value
+
+
+def queue_path(queue, value):
+    """Resolve a queue-relative path, also accepting legacy absolute paths."""
+    path = Path(value)
+    return path if path.is_absolute() else (Path(queue).parent / path).resolve()
+
+
+def read_queue(queue, data=None):
+    """Return an absolute-path view without changing persisted queue data."""
+    data = json.loads(Path(queue).read_text()) if data is None else data
+    result = dict(data)
+    result['archives'] = [
+        {**archive,
+         **{key: str(queue_path(queue, archive[key])) for key in ('destination', 'catalog') if key in archive}}
+        for archive in data['archives']
+    ]
+    if data.get('wait_for'):
+        result['wait_for'] = {**data['wait_for'],
+                              'destination': str(queue_path(queue, data['wait_for']['destination']))}
+    return result
+
+
+def portable_state(path, data):
+    """Normalize only local-file fields inside archive metadata and queue references."""
+    path = Path(path)
+    archive = next((parent.parent for parent in path.parents if parent.name == '.download'), None)
+    if archive is not None:
+        def convert(value):
+            if isinstance(value, dict):
+                return {key: portable_local(archive, entry) if key == 'local' and isinstance(entry, str)
+                        else convert(entry) for key, entry in value.items()}
+            if isinstance(value, list):
+                return [convert(entry) for entry in value]
+            return value
+        data = convert(data)
+    if isinstance(data, dict) and isinstance(data.get('archives'), list):
+        def ref(value):
+            value = Path(value)
+            return os.path.relpath(value, path.parent) if value.is_absolute() else str(value)
+        data = {**data, 'archives': [
+            {**entry, **{key: ref(entry[key]) for key in ('destination', 'catalog') if key in entry}}
+            for entry in data['archives']]}
+        if data.get('wait_for') and 'destination' in data['wait_for']:
+            data['wait_for'] = {**data['wait_for'], 'destination': ref(data['wait_for']['destination'])}
+    return data
+
+
 def mounts():
     result = subprocess.check_output(['findmnt', '--list', '-J', '-o', 'UUID,TARGET,OPTIONS'], text=True)
     return json.loads(result)['filesystems']
