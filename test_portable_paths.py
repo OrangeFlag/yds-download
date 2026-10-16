@@ -62,6 +62,7 @@ class PortablePathChecks(unittest.TestCase):
         target=newer/'YandexDisk/Course'
         queue_new=newer/'YandexDisk/.download/semester-queue/queue.json'
         self.assertEqual(storage.queue_path(queue_new,stored['archives'][0]['destination']),target)
+        self.assertEqual(storage.read_queue(queue_new)['archives'][0]['destination'],str(target))
 
 
 if __name__=='__main__':
