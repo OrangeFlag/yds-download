@@ -124,8 +124,12 @@ def migrate(old, new, uuid, state, previous=()):
         prefixes = known | {str(old)} | set(previous)
         if saved.get('mount'):
             prefixes.add(saved['mount'])
-        replacements = [(prefix, str(new)) for prefix in sorted(prefixes, key=len, reverse=True)
-                        if prefix != str(new)]
+        replacements = list(dict.fromkeys(
+            (json.dumps(prefix, ensure_ascii=escape)[1:-1],
+             json.dumps(str(new), ensure_ascii=escape)[1:-1])
+            for prefix in sorted(prefixes, key=len, reverse=True) if prefix != str(new)
+            for escape in (False, True)
+        ))
         def rewrite(line):
             # Only replace complete JSON string paths, never URLs or diagnostic text.
             for old_root, new_root in replacements:
