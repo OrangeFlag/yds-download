@@ -412,7 +412,7 @@ def main():
             or args.chunk_size<1 or args.retries<0 or args.transfers<1 or not math.isfinite(args.timeout) or args.timeout<=0
             or args.poll_interval is not None and (not args.upload or not math.isfinite(args.poll_interval) or args.poll_interval<=0)):
         parser.error('Specify archives and positive limit/chunk-size/timeout, non-negative retries')
-    roots=[Path(x['destination']).resolve() for x in json.loads(args.queue.read_text())['archives'] if x.get('enabled',True)] if args.queue else []
+    roots=[Path(x['destination']).resolve() for x in storage.read_queue(args.queue)['archives'] if x.get('enabled',True)] if args.queue else []
     roots=list(dict.fromkeys(roots+[p.resolve() for p in args.destination]))
     if not roots:parser.error('No selected archives')
     if args.upload_budget and (not args.upload or not 1<=args.min_transfers<=args.transfers):

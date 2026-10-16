@@ -30,6 +30,9 @@ STATE_LOCK = RLock()
 HASH_LOCK = Lock()
 
 
+saved_local = storage.saved_local
+
+
 def sha256_file(path, stopping=None):
     storage.check(path)
     while not HASH_LOCK.acquire(timeout=0.25):
@@ -163,6 +166,7 @@ def target(root, item, course):
 def write_json(path, data):
     storage.check(path)
     with STATE_LOCK:
+        data = storage.portable_state(path, data)
         temporary = path.with_name(path.name + '.tmp')
         with temporary.open('w', encoding='utf-8') as stream:
             json.dump(data, stream, ensure_ascii=False, indent=2)
@@ -191,7 +195,7 @@ def append_events(path, rows):
     with STATE_LOCK:
         with path.open('a', encoding='utf-8') as stream:
             for row in rows:
-                stream.write(json.dumps(row, ensure_ascii=False) + '\n')
+                stream.write(json.dumps(storage.portable_state(path, row), ensure_ascii=False) + '\n')
             stream.flush(); os.fsync(stream.fileno())
         storage.sync_directory(path.parent)
 

@@ -40,7 +40,7 @@ def main():
     with path.with_suffix('.lock').open('a') as lock, Metrics(path.with_suffix('.metrics.jsonl'),'semester-queue',
             interval=resolve(json.loads(path.read_text()).get('tuning',{}))['metrics_interval']) as metrics:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        data = json.loads(path.read_text())
+        data = storage.read_queue(path)
         resolve(data.get('tuning', {}))
         for job in data['archives']:
             resolve({**data.get('tuning', {}), **job.get('tuning', {})})

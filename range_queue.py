@@ -298,7 +298,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                 rechecks = []
                 recheck_times = {}
                 for priority, queue in enumerate(queues):
-                    config = cache.read(queue)
+                    config = storage.read_queue(queue, cache.read(queue))
                     archives=list(config['archives'])
                     predecessor=config.get('wait_for',{}).get('destination')
                     if recheck_interval and predecessor and all(row['destination']!=predecessor for row in archives):
