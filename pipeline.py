@@ -650,10 +650,11 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             from report import retry_reports
             retry_reports(root)
         active = {}
+        proofs = {}
         last_summary = None
 
         def finalize():
-            nonlocal last_summary
+            nonlocal proofs, last_summary
             background.poll()
             proofs = event_index.refresh()
             for course, (index, entries) in list(active.items()):
