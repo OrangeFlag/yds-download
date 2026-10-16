@@ -148,6 +148,28 @@ class AdaptiveDownloadChecks(unittest.TestCase):
         self.assertFalse(process.running)
         self.assertEqual(runner.fatal_code,9)
 
+    def test_rpc_failure_wins_over_sibling_budget_interruption(self):
+        import time
+        command=self.command();queue=self.root/'queue.txt'
+        queue.write_text(queue.read_text()+f'http://127.0.0.1:{self.server.server_port}/file\n dir={self.root}\n out=second.mp4\n')
+        release=Event()
+        class Process:
+            running=True
+            def poll(this):return None if this.running else 0
+            def send_signal(this, signal):pass
+            def wait(this, timeout=None):time.sleep(.6);this.running=False;return 0
+        def rpc(method,*args):
+            if method in ('getVersion','addUri'):return 'gid'
+            if not release.wait(3):raise AssertionError('Batch did not start')
+            raise TimeoutError('RPC response timed out')
+        with nextcloud.SharedUploadBudget(self.root/'single-budget','yandex',1,2,probe_zero=True) as budget:
+            runner=self.ad.AriaBatch(budget,Event())
+            with patch.object(self.ad.subprocess,'Popen',return_value=Process()),patch.object(self.ad,'RPC',return_value=SimpleNamespace(call=rpc)):
+                with self.assertRaisesRegex(RuntimeError,'control channel lost') as error:
+                    runner.run(command,env=self.env,on_tick=release.set)
+            self.assertIsInstance(error.exception.__cause__,TimeoutError)
+        self.assertTrue(runner.stopping.is_set())
+
     def test_disk_full_wins_over_sibling_interruption_during_result_collection(self):
         command=self.command();queue=self.root/'queue.txt'
         queue.write_text(queue.read_text()+f'http://127.0.0.1:{self.server.server_port}/file\n dir={self.root}\n out=second.mp4\n')

@@ -66,6 +66,8 @@ class AriaBatch:
         self.engine_lock=Lock()
         self.stop_timeout=30
         self.fatal_code=None
+        self.first_error=None
+        self.error_lock=Lock()
 
     @staticmethod
     def stamp(path):
@@ -108,13 +110,13 @@ class AriaBatch:
                 # An ambiguous addUri is never retried while its engine can still write.
                 try:gid=rpc.call('addUri',[uri],dict(options,gid=secrets.token_hex(8)))
                 except (OSError,ValueError,RuntimeError) as error:
-                    raise RuntimeError('aria2 submission unconfirmed; progress retained') from error
+                    raise RuntimeError('aria2 submission unconfirmed ('+type(error).__name__+'); progress retained') from error
                 seen=self.progress.get(str(path),0)
                 while not self.stopping.is_set():
                     storage.check(path)
                     try:row=rpc.call('tellStatus',gid,['status','completedLength','errorCode'])
                     except (OSError,ValueError,RuntimeError) as error:
-                        raise RuntimeError('aria2 control channel lost; progress retained') from error
+                        raise RuntimeError('aria2 control channel lost ('+type(error).__name__+'); progress retained') from error
                     complete=int(row['completedLength'])
                     if seen is None:
                         # Initial zero can precede loading the existing resume controls.
@@ -137,6 +139,11 @@ class AriaBatch:
                     if process.poll() is not None:raise RuntimeError('aria2 stopped before file completion')
                     self.stopping.wait(.5)
                 raise InterruptedError('Download interrupted')
+            except Exception as error:
+                if not isinstance(error,InterruptedError):
+                    with self.error_lock:
+                        if self.first_error is None:self.first_error=error
+                raise
             finally:
                 if not inactive:
                     self.stopping.set()
@@ -169,17 +176,21 @@ class AriaBatch:
             futures={pool.submit(self.file,rpc,process,entry) for entry in entries}
             codes=[];next_tick=0
             while futures:
-                if self.stopping.is_set():return self.fatal_code or 130
+                if self.fatal_code:return self.fatal_code
+                if self.first_error is not None:raise self.first_error
+                if self.stopping.is_set():return 130
                 self.budget.update()
                 if time.monotonic()>=next_tick:
                     on_tick();next_tick=time.monotonic()+5
                 done=wait(futures,timeout=.5,return_when=FIRST_COMPLETED).done
                 if self.fatal_code:return self.fatal_code
+                if self.first_error is not None:raise self.first_error
                 for future in done:
                     futures.remove(future)
                     try:codes.append(future.result())
                     except Exception:
                         if self.fatal_code:return self.fatal_code
+                        if self.first_error is not None:raise self.first_error
                         raise
             finished=True
             return 9 if 9 in codes else 1 if any(codes) else 0
