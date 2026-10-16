@@ -370,10 +370,13 @@ class SupervisorChecks(unittest.TestCase):
                     patch('storage.mounted_ok', side_effect=lambda *args: launch.call_count == 0 or not offline[0]), \
                     patch('storage.subprocess.Popen', side_effect=[first, second]) as launch, \
                     patch('storage.terminate', side_effect=stop_child) as terminate:
-                self.assertEqual(storage.supervise('uuid', old, ['python3', str(old / 'YandexDisk/queue.json')],
-                                                    root / 'state', Mock(), stop), 0)
+                url='https://example.invalid'+str(old)+'/image'
+                self.assertEqual(storage.supervise('uuid', old,
+                                                   ['python3', str(old), str(old / 'YandexDisk/queue.json'), url],
+                                                   root / 'state', Mock(), stop), 0)
             terminate.assert_any_call(first, 90)
-            self.assertEqual(launch.call_args.args[0][1], str(new / 'YandexDisk/queue.json'))
+            self.assertEqual(launch.call_args.args[0][1:], [
+                str(new), str(new / 'YandexDisk/queue.json'), url])
 
     def test_rotating_logs_are_bounded(self):
         with tempfile.TemporaryDirectory() as tmp:
