@@ -82,6 +82,35 @@ class UploadChecks(unittest.TestCase):
 
     def job(self):return self.uploader.jobs([self.root])[0]
 
+    def test_webdav_scan_preserves_trailing_space_in_directory_name(self):
+        from urllib.parse import quote
+        client=oc.Client('https://cloud.example','Walterit','secret')
+        client.base='https://cloud.example/dav/spaces/project/'
+        folder='2024-fall/Course '
+        files=[f'{folder}/video-{i}.mp4' for i in range(9)]
+        visited=[]
+        def response(rows):
+            xml='<d:multistatus xmlns:d="DAV:">'
+            for path,is_dir in rows:
+                href='/dav/spaces/project/'+quote(path,safe='/')+('/' if is_dir else '')
+                xml+=('<d:response><d:href>'+href+'</d:href><d:propstat><d:prop>'
+                      '<d:resourcetype>'+('<d:collection/>' if is_dir else '')+'</d:resourcetype>'
+                      '<d:getcontentlength>1</d:getcontentlength>'
+                      '</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>')
+            return Response(207,body=(xml+'</d:multistatus>').encode())
+        def request(method,path='',data=None,headers=None):
+            visited.append(path)
+            if path=='':return response([('2024-fall',True)])
+            if path=='2024-fall':return response([(folder,True)])
+            if path==folder:return response([(name,False) for name in files])
+            raise AssertionError('Wrong WebDAV directory: '+repr(path))
+        client.request=request
+        uploader=oc.Uploader(client,Event())
+        found=uploader.scan()
+        self.assertEqual(len(found),9)
+        self.assertEqual([row['path'] for row in found],files)
+        self.assertEqual(visited,['','2024-fall',folder])
+
     def test_dry_run_makes_no_upload_requests(self):
         self.uploader.run_once([self.root])
         self.assertEqual(self.server.calls,[])
