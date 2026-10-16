@@ -149,6 +149,39 @@ class StorageChecks(unittest.TestCase):
         with patch('storage.mounts', return_value=mounts):
             self.assertEqual(storage.select_mount('disk-uuid', '/old'), Path('/new'))
 
+    def test_mount_migration_updates_only_actual_json_path_values(self):
+        old=self.root/'old';new=self.root/'new';state=self.root/'state'
+        path=new/'YandexDisk/.download/queue.json';path.parent.mkdir(parents=True)
+        source=str(old/'YandexDisk/video.mp4')
+        content={'local':source,'destination':str(old),
+                 'description':'Previously at '+source,
+                 'url':'https://example.invalid/'+source,
+                 'nested':[{'local':source},source]}
+        path.write_text(json.dumps(content))
+        storage.migrate(old,new,'uuid',state)
+        actual=json.loads(path.read_text())
+        self.assertEqual(actual['local'],str(new/'YandexDisk/video.mp4'))
+        self.assertEqual(actual['destination'],str(new))
+        self.assertEqual(actual['nested'],[{'local':str(new/'YandexDisk/video.mp4')},str(new/'YandexDisk/video.mp4')])
+        self.assertEqual(actual['description'],content['description'])
+        self.assertEqual(actual['url'],content['url'])
+
+    def test_mount_migration_streams_large_jsonl_instead_of_reading_entire_log(self):
+        old=self.root/'old';new=self.root/'new';state=self.root/'state'
+        path=new/'YandexDisk/.download/events.jsonl';path.parent.mkdir(parents=True)
+        entries=[dict(path='/Course/video.mp4',local=str(old/f'video-{i}.mp4'),
+                      details='a'*1024) for i in range(64)]
+        path.write_text(''.join(json.dumps(row)+chr(10) for row in entries))
+        original=Path.read_text
+        def read(p,*args,**kwargs):
+            if p==path:raise AssertionError('Materialized entire event journal')
+            return original(p,*args,**kwargs)
+        with patch.object(Path,'read_text',read):
+            storage.migrate(old,new,'uuid',state)
+        records=[json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([row['local'] for row in records],[str(new/f'video-{i}.mp4') for i in range(64)])
+        self.assertEqual([row['details'] for row in records],[row['details'] for row in entries])
+
     def test_mount_migration_preserves_other_paths_and_is_idempotent(self):
         old = self.root / 'old'; new = self.root / 'new'; state = self.root / 'state'
         p = new / 'YandexDisk/Course/.download/tasks/task.json';p.parent.mkdir(parents=True)
