@@ -107,7 +107,7 @@ def sync_directory(path):
         os.close(directory)
 
 
-def migrate(old, new, uuid, state):
+def migrate(old, new, uuid, state, previous=()):
     old, new, state = Path(old), Path(new), Path(state)
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (state / (uuid + '.lock')).open('a') as lock:
@@ -117,15 +117,16 @@ def migrate(old, new, uuid, state):
             saved = json.loads(record.read_text())
         except FileNotFoundError:
             saved = {}
-        if saved.get('mount') == str(new) or old == new and not saved:
+        known = set(saved.get('previous', []))
+        if saved.get('mount') == str(new) and set(previous).issubset(known):
             sync_directory(state)
             return
-        prefixes = set(saved.get('previous', [])) | {str(old)}
+        prefixes = known | {str(old)} | set(previous)
         if saved.get('mount'):
             prefixes.add(saved['mount'])
         def scan_error(error):
             raise error
-        for directory, _, names in os.walk(new, onerror=scan_error):
+        for directory, _, names in (os.walk(new, onerror=scan_error) if prefixes - {str(new)} else ()):
             if '.download' not in Path(directory).relative_to(new).parts:
                 continue
             metadata = False

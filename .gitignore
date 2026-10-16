@@ -5,3 +5,4 @@ corrupted/
 *.aria2
 *.log
 catalog.json
+services.local.json
