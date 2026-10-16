@@ -16,7 +16,7 @@
 - [x] Add shared-budget aria2 RPC runner and zero-speed exploratory probe; retain safe stop, local-outage retry semantics and old fixed mode. Tests: real local HTTP/aria2 transfer, resume-byte accounting, failed HTTP, failed RPC without duplicate submissions, concurrency/drain and stop.
 - [x] Wire six source/budget flags through download, semester queue and Range worker; persist configuration without credentials. Tests: partial configuration rejection, flag forwarding, fallback scheduling.
 - [x] Run full unittest suite and independent deep review. Fix P1/P2 with regression tests, validate in original reviewer and rerun independent review when required.
-- [ ] Commit/push main and restart affected services with saved settings only after clean review. Verify actual transfers and bounded shared state.
+- [x] Commit/push main and restart affected services with saved settings only after clean review. Verify actual transfers and bounded shared state.
 
 ## Review focus
 
@@ -28,4 +28,4 @@
 
 ## Release verification
 
-486 tests passed (`python3 -m unittest discover -q`). Independent final review #5 found no remaining P1/P2 after regression fixes and validation by the original reviewers. Runtime rollout follows this commit.
+486 tests passed (`python3 -m unittest discover -q`). Independent final review #5 found no remaining P1/P2 after regression fixes and validation by the original reviewers. Rolled out to main and restarted the foreground queue and Range worker with a shared 2–8 file budget and OpenCloud fallback. Upload services were preserved. Both restarted workers remained active with zero restarts; the budget registered all three sources from both processes and performed a real 2→3 probe. Initial Yandex requests still timed out, so no speed gain is claimed. Existing OpenCloud upload catalog HTTP 404 remains separate from this change. Saved state/configuration backups and updated pause/resume service launch records were retained.
