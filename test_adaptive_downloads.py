@@ -83,6 +83,102 @@ class AdaptiveDownloadChecks(unittest.TestCase):
         self.assertEqual(len(submitted),1)
         self.assertTrue(all(r['active']==0 for r in json.loads((self.root/'budget/state.json').read_text())['members'].values()))
 
+    def test_status_timeout_retries_same_gid_without_releasing_slot(self):
+        self.command();self.target.write_bytes(self.content);calls=[]
+        runner=self.ad.AriaBatch(self.budget,Event())
+        def call(method,*args):
+            calls.append((method,args))
+            if method=='addUri':return 'same-gid'
+            state=json.loads((self.root/'budget/state.json').read_text())
+            self.assertEqual(state['members'][self.budget.key]['active'],1)
+            if sum(m=='tellStatus' for m,_ in calls)<3:raise TimeoutError('slow status')
+            return dict(status='complete',completedLength=str(len(self.content)))
+        process=SimpleNamespace(poll=lambda:None,send_signal=lambda *_:self.fail('healthy engine stopped'))
+        entry=('http://example.invalid/file',dict(dir=str(self.root),out=self.target.name),self.target)
+        self.assertEqual(runner.file(SimpleNamespace(call=call),process,entry),0)
+        self.assertEqual([args[0] for method,args in calls if method=='tellStatus'],['same-gid']*3)
+        self.assertEqual(sum(method=='addUri' for method,_ in calls),1)
+        self.assertFalse(runner.stopping.is_set())
+
+    def test_status_timeout_during_stop_does_not_replace_user_cancellation(self):
+        self.command();stopping=Event();runner=self.ad.AriaBatch(self.budget,stopping)
+        process=SimpleNamespace(poll=lambda:0)
+        def call(method,*args):
+            if method=='addUri':return 'gid'
+            stopping.set();raise TimeoutError('socket timed out during shutdown')
+        entry=('http://example.invalid/file',dict(dir=str(self.root),out=self.target.name),self.target)
+        with self.assertRaises(InterruptedError):runner.file(SimpleNamespace(call=call),process,entry)
+        self.assertIsNone(runner.first_error)
+
+    def test_dead_engine_status_timeout_is_not_retried(self):
+        self.command();calls=[];runner=self.ad.AriaBatch(self.budget,Event())
+        def call(method,*args):
+            calls.append(method)
+            if method=='addUri':return 'gid'
+            raise TimeoutError('engine unresponsive')
+        process=SimpleNamespace(poll=lambda:0)
+        entry=('http://example.invalid/file',dict(dir=str(self.root),out=self.target.name),self.target)
+        with self.assertRaisesRegex(RuntimeError,'control channel lost'):
+            runner.file(SimpleNamespace(call=call),process,entry)
+        self.assertEqual(calls,['addUri','tellStatus'])
+
+    def test_live_unresponsive_engine_status_retries_are_bounded(self):
+        self.command();calls=[];runner=self.ad.AriaBatch(self.budget,Event())
+        process=SimpleNamespace(running=True)
+        process.poll=lambda:None if process.running else 0
+        process.send_signal=lambda *_:setattr(process,'running',False)
+        process.wait=lambda **_:0
+        def call(method,*args):
+            calls.append(method)
+            if method=='addUri':return 'gid'
+            raise TimeoutError('persistent slow RPC')
+        entry=('http://example.invalid/file',dict(dir=str(self.root),out=self.target.name),self.target)
+        with self.assertRaisesRegex(RuntimeError,'control channel lost'):
+            runner.file(SimpleNamespace(call=call),process,entry)
+        self.assertEqual(calls,['addUri']+['tellStatus']*3)
+        self.assertFalse(process.running)
+
+    def test_permanent_rpc_rejection_is_not_retried(self):
+        self.command();calls=[];runner=self.ad.AriaBatch(self.budget,Event())
+        process=SimpleNamespace(poll=lambda:0)
+        def call(method,*args):
+            calls.append(method)
+            if method=='addUri':return 'gid'
+            raise RuntimeError('RPC rejected tellStatus')
+        entry=('http://example.invalid/file',dict(dir=str(self.root),out=self.target.name),self.target)
+        with self.assertRaises(RuntimeError):runner.file(SimpleNamespace(call=call),process,entry)
+        self.assertEqual(calls,['addUri','tellStatus'])
+
+    def test_rpc_timeout_and_metrics_describe_existing_calls(self):
+        import io
+        from collections import Counter
+        counters=Counter();rpc=self.ad.RPC(1,'never logged',timeout=17,metrics=SimpleNamespace(add=counters.update))
+        with patch.object(rpc.opener,'open',return_value=io.BytesIO(b'{"result": {}}')) as opened:
+            self.assertEqual(rpc.call('getVersion'),{})
+            self.assertEqual(opened.call_args.kwargs['timeout'],17)
+        with patch.object(rpc.opener,'open',side_effect=TimeoutError('slow local server')):
+            with self.assertRaises(TimeoutError):rpc.call('tellStatus','gid')
+        self.assertEqual(counters['aria_rpc_calls'],2)
+        self.assertEqual(counters['aria_rpc_failures'],1)
+        self.assertEqual(counters['aria_rpc_timeouts'],1)
+        self.assertGreaterEqual(counters['aria_rpc_seconds'],0)
+
+    def test_startup_rpc_timeout_is_capped_by_remaining_deadline(self):
+        command=self.command();clock=[0.0];observed=[]
+        process=SimpleNamespace(running=True)
+        process.poll=lambda:None if process.running else 0
+        process.send_signal=lambda *_:setattr(process,'running',False)
+        process.wait=lambda **_:0
+        rpc=SimpleNamespace()
+        def call(method,*args):
+            observed.append(rpc.timeout);clock[0]+=rpc.timeout;raise TimeoutError('startup unresponsive')
+        rpc.call=call
+        with patch.object(self.ad.subprocess,'Popen',return_value=process),patch.object(self.ad,'RPC',return_value=rpc),patch.object(self.ad.time,'monotonic',side_effect=lambda:clock[0]):
+            with self.assertRaisesRegex(RuntimeError,'failed to start'):
+                self.ad.AriaBatch(self.budget,Event(),rpc_timeout=30).run(command,env=self.env,on_tick=lambda:None)
+        self.assertEqual(observed,[15])
+        self.assertFalse(process.running)
+
     def test_zero_speed_can_probe_but_no_gain_rolls_back(self):
         with patch('time.monotonic',return_value=100) as clock,self.budget.slot(Event()),self.budget.slot(Event()):
             clock.return_value=101;self.budget.update()

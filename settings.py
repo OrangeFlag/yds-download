@@ -16,6 +16,8 @@ OPTIONS = {
     'bandwidth_limit': (0, 0, None, 'Total aria2 limit, bytes/second; 0 unlimited'),
     'auto_save_interval': (30, 1, None, 'Resume metadata save interval, seconds'),
     'connect_timeout': (20, 1, None, 'aria2 connection timeout, seconds'),
+    'rpc_timeout': (30.0, 0.1, None, 'Local aria2 RPC timeout, seconds'),
+    'rpc_status_retries': (2, 0, None, 'Extra read-only aria2 status retries; never repeats addUri'),
     'timeout': (60, 1, None, 'aria2 timeout, seconds'),
     'metrics_interval': (60, 1, None, 'Service metrics interval, seconds'),
     'summary_interval': (30, 1, None, 'aria2 progress interval, seconds'),

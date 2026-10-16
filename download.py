@@ -588,7 +588,8 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                     from progress import progress
                     runner = AriaBatch(get_budgets(download_budget)['yandex'], progress={
                         str(target(root, item, course)): progress(target(root, item, course), item['size'],
-                            sha256=item['sha256']).get('downloaded_bytes') for item in pending})
+                            sha256=item['sha256']).get('downloaded_bytes') for item in pending},
+                        rpc_timeout=tuning['rpc_timeout'],rpc_status_retries=tuning['rpc_status_retries'])
                     extra['runner'] = runner.run
                 code = transfer_process([
                     'aria2c', '--input-file=' + str(state / 'queue.txt'),

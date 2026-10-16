@@ -533,7 +533,8 @@ class Background:
             if self.download_budgets:
                 from adaptive_downloads import AriaBatch
                 runner=AriaBatch(self.download_budgets['yandex'],self.stopping,
-                                 {str(d.target(self.root,item,course)):progress[item['path']] for item in pending})
+                                 {str(d.target(self.root,item,course)):progress[item['path']] for item in pending},
+                                 rpc_timeout=t['rpc_timeout'],rpc_status_retries=t['rpc_status_retries'],metrics=self.metrics)
                 extra['runner']=runner.run
             code = transfer_process(command, env=d.ENV, on_tick=self.on_tick, stopping=self.stopping, **extra)
         finally:

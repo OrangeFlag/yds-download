@@ -1153,3 +1153,9 @@ tail -F '/data/YandexDisk/ШАД весна 2026/.download/opencloud-uploads.jso
 ### Proof journal readers and cloud traversal
 
 Upload polling and cloud fallback keep compact incremental SHA/stat proof indexes. Concurrent readers never repair `events.jsonl`: an unfinished final line stays untouched and is retried after the writer appends its newline. Archive owners retain crash-tail repair under the archive lock. Cloud fallback indexes each `(path, local)` copy separately and omits Range attempt histories. OpenCloud uses exact DAV paths for traversal; course matching preserves trailing spaces while normalizing Unicode.
+
+### Slow local aria2 RPC
+
+`--rpc-timeout` defaults to 30 seconds; `--rpc-status-retries` defaults to 2 extra reads. A transient `tellStatus` transport error retries the same GID while retaining its download slot. `addUri` is never replayed after an ambiguous reply. An exited engine, permanent RPC rejection or exhausted retry allowance stops safely with native resume state retained; supervision can resume it. User interruption and disk-full handling retain priority. Startup RPC calls stay within the 15-second readiness deadline. These settings do not change Yandex HTTP timeouts.
+
+Existing foreground metrics collect `aria_rpc_calls`, `aria_rpc_seconds`, `aria_rpc_failures`, `aria_rpc_timeouts` and `aria_rpc_status_retries`; collection observes the actual authenticated control calls and sends no extra probes. Metrics are batched by the existing interval.

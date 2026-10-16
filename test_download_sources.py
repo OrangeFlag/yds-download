@@ -137,7 +137,7 @@ class DownloadSourceChecks(unittest.TestCase):
                                          ['Course'], root, deep=True, retry_check=True, retries=0,
                                          download_budget=config)
             self.assertEqual(code, 0)
-            batch.assert_called_once_with(budget, progress={str(destination): 0})
+            batch.assert_called_once_with(budget, progress={str(destination): 0},rpc_timeout=30.0,rpc_status_retries=2)
             self.assertEqual(process.call_args.kwargs['runner'], batch.return_value.run)
             saved = json.loads((root/'.download/settings.json').read_text())
             self.assertEqual(saved['download_budget'], config)
