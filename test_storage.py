@@ -173,7 +173,7 @@ class StorageChecks(unittest.TestCase):
         initial={'local':str(old/'курс/video.mp4'), 'destination':str(old),
                  'note':'Do not change descriptive text: '+str(old/'курс/video.mp4')}
         path.write_text(json.dumps(initial))
-        self.assertIn('\\\\u',path.read_text())
+        self.assertIn(chr(92)+'u',path.read_text())
         storage.migrate(old,new,'uuid',self.root/'state')
         actual=json.loads(path.read_text())
         self.assertEqual(actual['local'],str(new/'курс/video.mp4'))
