@@ -228,7 +228,12 @@ def supervise(uuid, root, command, state, logger, stopping, poll=5, stop_timeout
             migrate(root, candidate, uuid, state)
             if not mounted_ok(candidate, device):
                 raise StorageUnavailable(candidate)
-            current_command = [arg.replace(str(root) + '/', str(candidate) + '/') for arg in command]
+            old_root = str(root)
+            current_command = [
+                str(candidate) + arg[len(old_root):]
+                if arg == old_root or arg.startswith(old_root + '/') else arg
+                for arg in command
+            ]
             env = dict(os.environ, YDS_DISK_ROOT=str(candidate), YDS_DISK_DEVICE=str(device))
             if stopping.is_set():
                 return 130
