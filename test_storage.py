@@ -171,7 +171,7 @@ class StorageChecks(unittest.TestCase):
         path=new/'YandexDisk/.download/events.jsonl';path.parent.mkdir(parents=True)
         entries=[dict(path='/Course/video.mp4',local=str(old/f'video-{i}.mp4'),
                       details='a'*1024) for i in range(64)]
-        path.write_text(''.join(json.dumps(row)+'\\n' for row in entries))
+        path.write_text(''.join(json.dumps(row)+chr(10) for row in entries))
         original=Path.read_text
         def read(p,*args,**kwargs):
             if p==path:raise AssertionError('Materialized entire event journal')
