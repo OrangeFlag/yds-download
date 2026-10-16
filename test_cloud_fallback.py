@@ -126,6 +126,17 @@ class CloudChecks(unittest.TestCase):
         self.assertEqual(index.candidates(self.data,self.item),[])
         self.assertEqual(self.server.gets,[])
 
+    def test_unhashed_opencloud_candidate_preserves_trailing_course_space(self):
+        self.item['path']='/Course /Lecture.mp4'
+        self.rows[-2]['path']='ingest/Other/2023-fall/Course '
+        self.rows[-1]['path']='ingest/Other/2023-fall/Course /001 - Lecture.mp4'
+        index=self.cloud().sources[0].index
+        self.assertEqual(index.candidates(self.data,self.item),[self.rows[-1]])
+        self.rows[-2]['path']='ingest/Other/2023-fall/Course'
+        self.rows[-1]['path']='ingest/Other/2023-fall/Course/001 - Lecture.mp4'
+        index.catalog['expires']=0
+        self.assertEqual(index.candidates(self.data,self.item),[])
+
     def test_metadata_failure_is_cached_and_does_not_publish_partial_catalog(self):
         cloud=self.cloud();index=cloud.sources[0].index
         with patch.object(self.server,'listing',side_effect=TimeoutError('offline')) as listing:
@@ -194,6 +205,34 @@ class CloudChecks(unittest.TestCase):
         d.write_json(self.state/'local-copies.json',[proof])
         with patch.object(d,'sha256_file',side_effect=AssertionError('verified body rehashed')):
             self.assertFalse(self.cloud().ready(self.item))
+
+    def test_event_proofs_are_compact_and_preserve_separate_local_copies(self):
+        target=d.target(self.root,self.item,'Course');target.parent.mkdir();target.write_bytes(self.body)
+        proof=dict(self.item,source=self.data['source'],status='valid',local=str(target),
+                   local_stat=Fallback.stamp(target),actual_sha256=self.item['sha256'],
+                   range_attempts=[dict(unneeded='x'*100000)])
+        d.append_events(self.state/'events.jsonl',[proof,dict(proof,local=str(self.root/'other.mp4'),status='invalid')])
+        cloud=self.cloud()
+        with patch.object(d,'sha256_file',side_effect=AssertionError('valid proof was lost')):
+            self.assertFalse(cloud.ready(self.item))
+        cached=cloud.event_index.refresh()
+        self.assertEqual(len(cached),2)
+        self.assertTrue(all('range_attempts' not in row and 'file' not in row for row in cached.values()))
+        self.assertLess(len(json.dumps(list(cached.values()))),3000)
+
+    def test_event_proof_refresh_reads_only_new_rows_and_invalidates_changed_proof(self):
+        target=d.target(self.root,self.item,'Course');target.parent.mkdir();target.write_bytes(self.body)
+        proof=dict(self.item,source=self.data['source'],status='valid',local=str(target),local_stat=Fallback.stamp(target))
+        journal=self.state/'events.jsonl';d.append_events(journal,[proof]);cloud=self.cloud()
+        with patch.object(d,'sha256_file',side_effect=AssertionError('unnecessary hash')):
+            self.assertFalse(cloud.ready(self.item))
+            offset=journal.stat().st_size
+            d.append_events(journal,[dict(proof,status='invalid')])
+            target.write_bytes(b'x'*len(self.body))
+            with patch.object(d,'scan_events',wraps=d.scan_events) as scan,patch.object(d,'sha256_file',return_value='0'*64) as sha:
+                self.assertTrue(cloud.ready(self.item))
+            self.assertEqual(scan.call_args.kwargs['start'],offset)
+            sha.assert_called_once()
 
     def test_valid_cloud_receipt_skips_body_hash(self):
         target=d.target(self.root,self.item,'Course');target.parent.mkdir();target.write_bytes(self.body)

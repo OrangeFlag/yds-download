@@ -239,6 +239,29 @@ class NextcloudChecks(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertEqual(first_upload_id, next(iter(receipts.values()))['upload_id'])
 
+    def test_uploader_never_repairs_another_process_unfinished_event(self):
+        sync=nextcloud.Sync(None,self.upload,Event())
+        journal=self.state/'events.jsonl'
+        payload=json.dumps(dict(self.proof,status='invalid')).encode()
+        prefix=payload[:len(payload)//2]
+        with journal.open('ab') as stream:stream.write(prefix)
+        before=journal.read_bytes()
+        self.assertEqual(len(sync.jobs([self.root])),1)
+        self.assertEqual(journal.read_bytes(),before)
+        with journal.open('ab') as stream:stream.write(payload[len(prefix):]+b'\n')
+        self.assertEqual(sync.jobs([self.root]),[])
+
+    def test_uploader_waits_for_newline_before_consuming_a_tail_proof(self):
+        sync=nextcloud.Sync(None,self.upload,Event())
+        journal=self.state/'events.jsonl'
+        payload=json.dumps(dict(self.proof,status='invalid')).encode()
+        with journal.open('ab') as stream:stream.write(payload)
+        before=journal.read_bytes()
+        self.assertEqual(len(sync.jobs([self.root])),1)
+        self.assertEqual(journal.read_bytes(),before)
+        with journal.open('ab') as stream:stream.write(b'\n')
+        self.assertEqual(sync.jobs([self.root]),[])
+
     def test_uploader_reuses_compact_proof_index_across_polls(self):
         download.append_events(self.state/'events.jsonl',
             [dict(self.proof,range_attempts=['history'*1000]*50)])

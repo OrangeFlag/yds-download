@@ -196,7 +196,7 @@ def append_events(path, rows):
         storage.sync_directory(path.parent)
 
 
-def scan_events(path, repair=False, start=0):
+def scan_events(path, repair=False, start=0, complete_lines=False):
     """Iterate JSONL rows and their end offsets without loading the entire journal."""
     if not path.exists():
         return
@@ -209,6 +209,8 @@ def scan_events(path, repair=False, start=0):
             if not line:
                 break
             end = offset + len(line)
+            if complete_lines and not line.endswith(b'\n'):
+                return
             row = None
             if line.strip():
                 try:
@@ -238,7 +240,8 @@ class EventIndex:
 
     FIELDS = ('path', 'source', 'status', 'local', 'size', 'sha256', 'mtime_ns')
 
-    def __init__(self, path):
+    def __init__(self, path, by_copy=False, repair=True):
+        self.by_copy, self.repair = by_copy, repair
         self.path = path
         self.events = {}
         self.inode = None
@@ -258,10 +261,12 @@ class EventIndex:
                 self.events.clear()
                 self.offset = 0
             self.inode = stat.st_ino
-            for offset, row in scan_events(self.path, repair=True, start=self.offset):
+            for offset, row in scan_events(self.path, repair=self.repair, start=self.offset, complete_lines=not self.repair):
                 self.offset = offset
                 if row is not None:
-                    self.events[row['path']] = {key: row[key] for key in self.FIELDS if key in row}
+                    identity = (row['path'], row.get('local')) if self.by_copy else row['path']
+                    fields = self.FIELDS + ('state', 'actual_sha256', 'local_stat', 'recovered_stat') if self.by_copy else self.FIELDS
+                    self.events[identity] = {key: row[key] for key in fields if key in row}
         return self.events
 
 

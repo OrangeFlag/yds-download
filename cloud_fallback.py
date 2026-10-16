@@ -5,6 +5,7 @@ from pathlib import Path, PurePosixPath
 import re
 from threading import Lock
 import time
+import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
 
@@ -67,7 +68,7 @@ class OpenCloudIndex:
                 plain=normalized(re.sub(r'^\d+\s*-\s*','',path.name))
                 expected=PurePosixPath(relative)
                 # User prefixes may differ, but course and semester must agree.
-                parent=normalized(str(path.parent))
+                parent=unicodedata.normalize('NFC',str(path.parent))
                 if (plain==expected.name and (parent==str(expected.parent) or parent.endswith('/'+str(expected.parent)))):
                     result.append(row)
             return result
@@ -87,8 +88,7 @@ class CloudFallback:
         self.manifest_stamp=None
         self.manifest={}
         self.local_proofs={}
-        self.events_stamp=None
-        self.events={}
+        self.event_index=d.EventIndex(self.root/'.download/events.jsonl',by_copy=True,repair=False)
 
     def _listed(self,item):
         paths=sorted((self.root/'.download').glob('*-manifest.json'))
@@ -109,12 +109,8 @@ class CloudFallback:
         target=d.local_path(self.root,item['path'])
         paths={target:[]}
         source=json.loads((self.root/'.download/source.json').read_text())['source']
-        events_path=self.root/'.download/events.jsonl'
-        events_stamp=Fallback.stamp(events_path) if events_path.exists() else None
-        if events_stamp!=self.events_stamp:
-            self.events={(row.get('path'),row.get('local')):row for row in d.iter_events(events_path)}
-            self.events_stamp=events_stamp
-        rows=[row for row in self.events.values() if row.get('path')==item['path']]
+        with d.STATE_LOCK:
+            rows=[row for row in self.event_index.refresh().values() if row.get('path')==item['path']]
         if event:rows.append(event)
         for row in rows:
             path=Path(row['local']) if row.get('local') else target

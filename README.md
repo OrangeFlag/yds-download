@@ -1149,3 +1149,7 @@ tail -F '/data/YandexDisk/ШАД весна 2026/.download/opencloud-uploads.jso
 приватные файлы состояния находятся в каталоге с правами `0700`.
 Тела видео и временные копии на системном диске не создаются. При запуске
 на съёмном диске применяйте `storage.py` с UUID так же, как для других команд.
+
+### Proof journal readers and cloud traversal
+
+Upload polling and cloud fallback keep compact incremental SHA/stat proof indexes. Concurrent readers never repair `events.jsonl`: an unfinished final line stays untouched and is retried after the writer appends its newline. Archive owners retain crash-tail repair under the archive lock. Cloud fallback indexes each `(path, local)` copy separately and omits Range attempt histories. OpenCloud uses exact DAV paths for traversal; course matching preserves trailing spaces while normalizing Unicode.
