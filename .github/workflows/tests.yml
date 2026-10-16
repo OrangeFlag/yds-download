@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, feature/portable-state-paths-20261017]
   workflow_dispatch:
 
 jobs:
