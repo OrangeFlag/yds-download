@@ -82,6 +82,17 @@ class UploadChecks(unittest.TestCase):
 
     def job(self):return self.uploader.jobs([self.root])[0]
 
+    def test_webdav_scan_uses_exact_server_spelling_for_unicode_folder(self):
+        raw='Cafe\u0301 '
+        normalized='Café '
+        def listing(folder):
+            if folder=='':return [dict(path=normalized,download_path=raw,directory=True)]
+            if folder==raw:return [dict(path=raw+'/video.mp4',directory=False,size=1,checksums=[])]
+            raise AssertionError('Normalized folder used for PROPFIND: '+repr(folder))
+        with patch.object(self.server,'listing',side_effect=listing):
+            result=self.uploader.scan()
+        self.assertEqual(len(result),1)
+
     def test_webdav_scan_preserves_trailing_space_in_directory_name(self):
         from urllib.parse import quote
         client=oc.Client('https://cloud.example','Walterit','secret')
