@@ -118,7 +118,7 @@ class Share:
             if properties is None:
                 continue
             length = properties.findtext('{DAV:}getcontentlength')
-            result.append(dict(path=normalized(path[len(prefix):].rstrip('/')),
+            result.append(dict(path=unicodedata.normalize('NFC', path[len(prefix):].rstrip('/')),
                 download_path=path[len(prefix):].rstrip('/'),etag=properties.findtext('{DAV:}getetag'),
                 directory=properties.find('{DAV:}resourcetype/{DAV:}collection') is not None,
                 size=int(length) if length is not None else None,
