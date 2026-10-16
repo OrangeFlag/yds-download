@@ -113,18 +113,18 @@ class CloudFallback:
             rows=[row for row in self.event_index.refresh().values() if row.get('path')==item['path']]
         if event:rows.append(event)
         for row in rows:
-            path=Path(row['local']) if row.get('local') else target
+            path=storage.saved_local(self.root, row['local']) if row.get('local') else target
             paths.setdefault(path,[]).append(row)
         registry=self.root/'.download/local-copies.json'
         if registry.exists():
             for row in json.loads(registry.read_text()):
                 if row.get('source')==source and row.get('path')==item['path'] and row.get('status')=='valid':
-                    paths.setdefault(Path(row['local']),[]).append(row)
+                    paths.setdefault(storage.saved_local(self.root, row['local']),[]).append(row)
         for fallback in self.sources:
             row=fallback.read(item)
             if (row.get('state')=='verified' and row.get('source')==source
                     and row.get('actual_sha256')==item['sha256']):
-                paths.setdefault(Path(row['local']),[]).append(row)
+                paths.setdefault(storage.saved_local(self.root, row['local']),[]).append(row)
         for path,proofs in paths.items():
             if not path.is_file() or Path(str(path)+'.aria2').exists():continue
             stamp=Fallback.stamp(path)
@@ -176,7 +176,7 @@ class CloudFallback:
             retained=set();digests=[]
             for previous in self.sources:
                 for copy in previous.read(item).get('retained_copies',{}).values():
-                    path=Path(copy['local'])
+                    path=storage.saved_local(self.root, copy['local'])
                     if path.is_file() and Fallback.stamp(path)==copy['local_stat']:
                         retained.add(copy['actual_sha256'])
                         digests.append(dict(copy.get('actual_hashes',{}),sha256=copy['actual_sha256']))

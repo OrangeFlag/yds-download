@@ -115,7 +115,7 @@ def retire_cached_copy(background, path, job, proofs):
                 or (proof.get('size'), proof.get('sha256')) != (item['size'], item['sha256'])
                 or proof.get('mtime_ns') is None):
             continue
-        local = Path(proof['local']) if proof.get('local') else destination
+        local = storage.saved_local(root, proof['local']) if proof.get('local') else destination
         try:
             stat = local.stat()
         except FileNotFoundError:
@@ -174,7 +174,7 @@ def finish_courses(background, config, changed_courses=()):
         for item in entries:
             for proof in (events.get(item['path'], {}), external.get(item['path'], {})):
                 # Manifests deliberately omit expiring URLs; only the destination is needed here.
-                local = Path(proof['local']) if proof.get('local') else d.target(root, dict(item, file='https://disk.yandex.ru'), course)
+                local = storage.saved_local(root, proof['local']) if proof.get('local') else d.target(root, dict(item, file='https://disk.yandex.ru'), course)
                 if (proof.get('status') == 'valid' and (proof.get('size'), proof.get('sha256')) == (item['size'], item['sha256'])
                         and local.exists() and local.stat().st_size == item['size']
                         and ('mtime_ns' not in proof or local.stat().st_mtime_ns == proof['mtime_ns'])

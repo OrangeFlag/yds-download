@@ -339,8 +339,8 @@ def inspect_copies(root, item, course, cached, source, source_current=False):
                 and copy['source'].rstrip('/') == source.rstrip('/')]
     locations = [local_path(root, item['path'])]
     if cached.get('local'):
-        locations.append(Path(cached['local']))
-    locations.extend(Path(copy['local']) for copy in matching)
+        locations.append(saved_local(root, cached['local']))
+    locations.extend(saved_local(root, copy['local']) for copy in matching)
     result = None
     for local in dict.fromkeys(locations):
         stat = local.stat() if local.exists() else None
@@ -350,7 +350,7 @@ def inspect_copies(root, item, course, cached, source, source_current=False):
                        source_current=source_current)
         status = event['status']
         for copy in matching:
-            if Path(copy['local']) == local:
+            if saved_local(root, copy['local']) == local:
                 copy.update(event)
         if result is None or (result['status'] != 'valid' and status != 'missing'):
             result = event
@@ -476,7 +476,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
         local_copies = json.loads(registry.read_text()) if registry.exists() else []
         for event in local_copies:
             if event['source'].rstrip('/') == source.rstrip('/') and (deep or event['status'] == 'valid'):
-                local = Path(event['local'])
+                local = saved_local(root, event['local'])
                 if deep or (local.exists() and local.stat().st_size == event['size']
                         and local.stat().st_mtime_ns == event['mtime_ns']
                         and not Path(str(local) + '.aria2').exists()):
@@ -541,7 +541,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                 local = target(root, item, course)
                 cached = events.get(item['path'], {})
                 if cached.get('local') and (deep or cached.get('status') == 'valid'):
-                    local = Path(cached['local'])
+                    local = saved_local(root, cached['local'])
                 if deep and not retry_check:
                     event = inspect_copies(root, item, course, cached, source, source_current=True)
                     if event['status'] == 'valid':

@@ -609,7 +609,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                 history[old['course']] = old
         registry = state / 'local-copies.json'
         for row in json.loads(registry.read_text()) if registry.exists() else []:
-            local = Path(row['local'])
+            local = storage.saved_local(root, row['local'])
             if (row['source'].rstrip('/') == source.rstrip('/') and row['status'] == 'valid' and local.exists()
                     and (local.stat().st_size, local.stat().st_mtime_ns) == (row['size'], row['mtime_ns'])
                     and not Path(str(local) + '.aria2').exists()):
@@ -664,7 +664,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                 valid = 0
                 for item in entries:
                     for proof in (proofs.get(item['path'], {}), events.get(item['path'], {})):
-                        local = Path(proof['local']) if proof.get('local') else d.target(root, item, course)
+                        local = storage.saved_local(root, proof['local']) if proof.get('local') else d.target(root, item, course)
                         if (proof.get('status') == 'valid' and (proof.get('size'), proof.get('sha256')) == (item['size'], item['sha256'])
                                 and local.exists() and local.stat().st_size == item['size']
                                 and ('mtime_ns' not in proof or local.stat().st_mtime_ns == proof['mtime_ns'])
@@ -725,7 +725,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                     if remote_index:
                         d.write_json(state/'nextcloud-existing.json',dict(source=source,share=remote_index.link,files=remote_files))
                     cached = events.get(item['path'], {})
-                    local = Path(cached['local']) if cached.get('local') and cached.get('status') == 'valid' else d.target(root, item, course)
+                    local = storage.saved_local(root, cached['local']) if cached.get('local') and cached.get('status') == 'valid' else d.target(root, item, course)
                     if (cached.get('status') == 'valid' and (cached.get('size'), cached.get('sha256')) == (item['size'], item['sha256'])
                             and local.exists() and local.stat().st_size == item['size']
                             and ('mtime_ns' not in cached or local.stat().st_mtime_ns == cached['mtime_ns'])

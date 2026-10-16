@@ -101,7 +101,7 @@ class Uploader(nextcloud.Sync):
                 match=row['match'];path=match['course_path'].rstrip('/')+'/'+match['file']
                 if (row['source'],path) in originals:
                     continue
-                local=Path(row['local'])
+                local=storage.saved_local(root, row['local'])
                 if (local in seen or not local.is_file() or Path(str(local)+'.aria2').exists()
                         or (local.stat().st_size,local.stat().st_mtime_ns)!=(row['size'],row['mtime_ns'])):
                     continue

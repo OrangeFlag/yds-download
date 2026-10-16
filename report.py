@@ -208,7 +208,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
         if (event.get('status') != 'valid' or 'mtime_ns' not in event
                 or (events[key]['size'], events[key]['sha256']) == (event['size'], event['sha256'])):
             continue
-        local = Path(event['local']) if event.get('local') else local_path(destination, event['path'])
+        local = storage.saved_local(destination, event['local']) if event.get('local') else local_path(destination, event['path'])
         if (local.exists() and local.stat().st_size == event['size']
                 and local.stat().st_mtime_ns == event['mtime_ns'] and not Path(str(local) + '.aria2').exists()):
             events[key] = event
@@ -225,7 +225,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
             known_external[normalized(copy['path'])] = dict(copy, status='missing')
             if copy['status'] != 'valid' or not same_identity(copy):
                 continue
-            local = Path(copy['local'])
+            local = storage.saved_local(destination, copy['local'])
             if local.exists():
                 stat = local.stat()
                 if stat.st_size == copy['size'] and stat.st_mtime_ns == copy['mtime_ns'] and not Path(str(local) + '.aria2').exists():
@@ -287,7 +287,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
             status = 'unknown'
             if event:
                 status = event['status']
-                local = Path(local_copy['local']) if local_copy else local_path(destination, event['path'])
+                local = storage.saved_local(destination, local_copy['local']) if local_copy else local_path(destination, event['path'])
                 if status == 'valid' and (not same_identity(event) or not local.exists() or local.stat().st_size != event['size']
                                          or ('mtime_ns' in event and local.stat().st_mtime_ns != event['mtime_ns'])
                                          or Path(str(local) + '.aria2').exists()):

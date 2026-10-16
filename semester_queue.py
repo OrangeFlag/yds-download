@@ -55,7 +55,7 @@ def main():
                 status = json.loads((state / f'{index:02d}-status.json').read_text())
                 if status.get('course') != course or status.get('state') != 'finished':
                     raise RuntimeError('Current archive did not finish; queue remains paused')
-        data = json.loads(path.read_text())
+        data = storage.read_queue(path)
         for job in data['archives']:
             metrics.gauge('archives',dict(Counter(a.get('state','pending') for a in data['archives'])))
             metrics.gauge('current_archive',job['title'])

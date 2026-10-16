@@ -357,7 +357,7 @@ class Sync:
                     if PurePosixPath(item['path']).suffix.casefold() not in VIDEO:
                         continue
                     event=events.get(item['path'],{})
-                    local=Path(event['local']) if event.get('local') else local_path(root,item['path'])
+                    local=storage.saved_local(root, event['local']) if event.get('local') else local_path(root,item['path'])
                     variant='original'
                     expected_size=item['size']
                     same=(event.get('size'),event.get('sha256'))==(item['size'],item['sha256'])

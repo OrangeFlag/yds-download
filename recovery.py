@@ -649,7 +649,7 @@ def reconcile_course(root, course):
     if registry.exists():
         for row in json.loads(registry.read_text()):
             if row['source'].rstrip('/') == source and row['status'] == 'valid':
-                local = Path(row['local'])
+                local = storage.saved_local(root, row['local'])
                 if local.exists() and (local.stat().st_size, local.stat().st_mtime_ns) == (row['size'], row['mtime_ns']):
                     proofs[row['path']] = row
     prefix = '/' if course == '.' else '/' + course + '/'
@@ -664,7 +664,7 @@ def reconcile_course(root, course):
     verified = 0
     for row in expected:
         proof = proofs.get(row['path'], {})
-        local = Path(proof['local']) if proof.get('local') else local_path(root, row['path'])
+        local = storage.saved_local(root, proof['local']) if proof.get('local') else local_path(root, row['path'])
         if (proof.get('status') == 'valid' and proof.get('sha256') == row['sha256']
                 and proof.get('size') == row['size'] and local.exists()
                 and local.stat().st_size == row['size']
@@ -843,7 +843,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
     if registry.exists():
         for row in json.loads(registry.read_text()):
             if row['source'].rstrip('/') == source.rstrip('/') and row['status'] == 'valid':
-                local = Path(row['local'])
+                local = storage.saved_local(root, row['local'])
                 if local.exists() and (local.stat().st_size, local.stat().st_mtime_ns) == (row['size'], row['mtime_ns']):
                     valid[row['path']] = row
     ledger = FileState(root/'.download', 'recovery-state')
@@ -859,7 +859,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
                 results.append(checked)
                 reconcile_course(root, event['course'])
                 continue
-        local = Path(known['local']) if known.get('local') else local_path(root, event['path'])
+        local = storage.saved_local(root, known['local']) if known.get('local') else local_path(root, event['path'])
         complete = (known.get('status') == 'valid' and known.get('sha256') == event['sha256']
                     and known.get('size') == event['size'] and local.exists()
                     and local.stat().st_size == known['size']

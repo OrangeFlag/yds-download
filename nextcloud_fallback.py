@@ -46,7 +46,7 @@ class Fallback:
 
     def changed_copies(self,row):
         return [copy['signature'] for copy in row.get('retained_copies',{}).values()
-                if not Path(copy['local']).exists() or self.stamp(Path(copy['local']))!=copy['local_stat']]
+                if not storage.saved_local(self.root, copy['local']).exists() or self.stamp(storage.saved_local(self.root, copy['local']))!=copy['local_stat']]
 
     def ready(self,item):
         if not self.is_shad or PurePosixPath(item['path']).suffix.casefold() not in VIDEO:
@@ -59,7 +59,7 @@ class Fallback:
             return False
         if row.get('state')=='mismatch' and self.changed_copies(row):return True
         if row.get('state') in ('verified','mismatch'):
-            local=Path(row['local'])
+            local=storage.saved_local(self.root, row['local'])
             if (local.exists() and self.stamp(local)==row.get('local_stat')
                     and not (row['state']=='mismatch' and row.get('remaining_candidates'))):
                 return False
@@ -149,7 +149,7 @@ class Fallback:
         row.update(source=self.source['source'],path=item['path'],size=item['size'],sha256=item['sha256'],share=self.index.link)
         own_hashes=[]
         for copy in row.get('retained_copies',{}).values():
-            local=Path(copy['local'])
+            local=storage.saved_local(self.root, copy['local'])
             if (local.is_file() and not Path(str(local)+'.aria2').exists()
                     and self.stamp(local)==copy['local_stat']):
                 own_hashes.append(dict(copy.get('actual_hashes',{}),sha256=copy['actual_sha256']))
