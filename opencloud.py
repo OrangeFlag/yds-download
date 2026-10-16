@@ -1,5 +1,6 @@
 """Explicit, resumable OpenCloud uploads; no background worker is enabled."""
 import argparse
+from contextlib import ExitStack
 import base64
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
@@ -249,11 +250,12 @@ class Uploader(nextcloud.Sync):
             futures={}
             try:
                 while True:
+                    if self.upload_budget:self.upload_budget.update()
                     while (len(futures)<self.transfers and not self.stopping.is_set()
                            and (limit is None or uploaded+len(futures)<limit)):
                         job=next(pending,None)
                         if job is None:break
-                        futures[pool.submit(self.transfer,job)]=job
+                        futures[pool.submit(self.run_transfer,job)]=job
                     if not futures:break
                     for future in wait(futures,timeout=.25,return_when=FIRST_COMPLETED).done:
                         job=futures.pop(future)
@@ -329,7 +331,7 @@ class Uploader(nextcloud.Sync):
                     row['session_url']=self.share.safe_url(response.headers['Location'])
                 row['state']='uploading';self.save_record(job,row)
             print('OPENCLOUD UPLOAD START: '+target,flush=True)
-            failures=0;offset=None
+            failures=0;offset=None;confirmed_offset=None
             with local.open('rb') as stream:
                 while row['sent_bytes']<size:
                     if self.stopping.is_set():raise InterruptedError('OpenCloud upload interrupted')
@@ -347,6 +349,9 @@ class Uploader(nextcloud.Sync):
                                 if error.code not in (404,410):raise
                                 self.confirm_publication(row,stage,sha1)
                                 offset=size
+                            if self.upload_budget and confirmed_offset is not None:
+                                self.upload_budget.confirmed(max(0,offset-confirmed_offset))
+                            confirmed_offset=offset
                             row.update(sent_bytes=offset,state='uploading');self.save_record(job,row)
                         if offset==size:break
                         stream.seek(offset);chunk=stream.read(min(self.chunk_size,size-offset))
@@ -356,6 +361,8 @@ class Uploader(nextcloud.Sync):
                             if response.status!=204 or int(response.headers['Upload-Offset'])!=offset+len(chunk):
                                 raise RuntimeError('OpenCloud did not confirm the complete chunk')
                         offset+=len(chunk)
+                        if self.upload_budget:self.upload_budget.confirmed(len(chunk))
+                        confirmed_offset=offset
                         row.update(sent_bytes=offset,state='uploading');self.save_record(job,row)
                         print(f'OPENCLOUD UPLOAD PROGRESS: {target}; {row["sent_bytes"]}/{size} bytes',flush=True)
                         failures=0
@@ -397,6 +404,8 @@ def main():
     parser.add_argument('--timeout',type=float,default=120)
     parser.add_argument('--retries',type=int,default=2)
     parser.add_argument('--transfers',type=int,default=1,help='Simultaneous file uploads, default 1')
+    parser.add_argument('--upload-budget',type=Path,help='Shared automatic total upload budget directory; --transfers/--min-transfers are global limits')
+    parser.add_argument('--min-transfers',type=int,default=2,help='Minimum total uploads with --upload-budget (default: 2)')
     parser.add_argument('--poll-interval',type=float,help='Repeat upload passes after this many seconds; requires --upload')
     args=parser.parse_args()
     if (not args.queue and not args.destination or args.limit is not None and args.limit<1
@@ -406,16 +415,21 @@ def main():
     roots=[Path(x['destination']).resolve() for x in json.loads(args.queue.read_text())['archives'] if x.get('enabled',True)] if args.queue else []
     roots=list(dict.fromkeys(roots+[p.resolve() for p in args.destination]))
     if not roots:parser.error('No selected archives')
+    if args.upload_budget and (not args.upload or not 1<=args.min_transfers<=args.transfers):
+        parser.error('Shared budget requires --upload and 1 <= --min-transfers <= --transfers')
     os.umask(0o077)
     stopping=Event()
     for sig in (signal.SIGINT,signal.SIGTERM):signal.signal(sig,lambda *_:stopping.set())
     control=args.queue.parent if args.queue else roots[0]/'.download'
     storage.check(control)
-    with storage.lock_archives(roots, 'opencloud.lock') as claim:
+    with storage.lock_archives(roots, 'opencloud.lock') as claim, ExitStack() as resources:
         client=Client(args.server,args.username,args.password_file.expanduser().read_text().rstrip('\r\n'),args.timeout)
         if args.upload:client.discover()
         else:client.base=client.server+'/dav/spaces/not-connected/'
         uploader=Uploader(client,stopping,args.chunk_size,args.retries,args.transfers)
+        if args.upload_budget:
+            uploader.upload_budget=resources.enter_context(nextcloud.SharedUploadBudget(
+                args.upload_budget,'opencloud',args.min_transfers,args.transfers))
         while not stopping.is_set():
             result=uploader.run_once(claim(roots),args.upload,args.limit)
             if args.poll_interval is None:break

@@ -106,6 +106,17 @@ class UploadChecks(unittest.TestCase):
         self.assertEqual(sum(m=='POST' for m,p,h in self.server.calls),1)
         self.assertEqual(sum(m=='HEAD' for m,p,h in self.server.calls),2)
 
+    def test_shared_budget_counts_accepted_patch_after_lost_response_only_once(self):
+        with oc.nextcloud.SharedUploadBudget(self.root/'budget','opencloud',2,8) as budget:
+            self.uploader.upload_budget=budget
+            self.server.drop_patch=True
+            self.uploader.run_once([self.root],upload=True)
+            state=json.loads((self.root/'budget/state.json').read_text())
+            self.assertEqual(state['controller']['total'],22)
+            self.uploader.run_once([self.root],upload=True)
+            self.assertEqual(json.loads((self.root/'budget/state.json').read_text())['controller']['total'],22)
+            self.assertTrue(all(row['active']==row['waiting']==0 for row in state['members'].values()))
+
     def test_successful_patch_offsets_need_only_one_head(self):
         self.uploader.run_once([self.root],upload=True)
         self.assertEqual(sum(m=='HEAD' for m,p,h in self.server.calls),1)

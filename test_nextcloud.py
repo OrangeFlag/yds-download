@@ -22,6 +22,26 @@ class Response(io.BytesIO):
 
 
 class NextcloudChecks(unittest.TestCase):
+    def test_shared_budget_counts_only_successful_new_chunks(self):
+        with nextcloud.SharedUploadBudget(self.root/'budget','nextcloud',2,8) as budget:
+            sync=nextcloud.Sync(None,self.upload,Event(),chunk_size=4)
+            sync.upload_budget=budget
+            failed=False
+            def request(share,method,path='',data=None,**kwargs):
+                nonlocal failed
+                if method=='PUT':
+                    data.read()
+                    if not failed:
+                        failed=True
+                        raise urllib.error.URLError(ssl.SSLEOFError(8,'TLS EOF'))
+                return Response()
+            with patch.object(nextcloud.Share,'request',request):
+                sync.run_once([self.root])
+            state=json.loads((self.root/'budget/state.json').read_text())
+            self.assertEqual(state['controller']['total'],7)
+            sync.run_once([self.root])
+            self.assertEqual(json.loads((self.root/'budget/state.json').read_text())['controller']['total'],7)
+
     def test_upload_urlerror_logs_and_saves_underlying_reason(self):
         import errno
         error = urllib.error.URLError(ConnectionRefusedError(errno.ECONNREFUSED, 'proxy refused'))
