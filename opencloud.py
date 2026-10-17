@@ -97,7 +97,26 @@ class Uploader(nextcloud.Sync):
             data=self.read(root/'.download/source.json',{})
             if not data.get('source') or self.read(root/'.download/catalog.json',{}).get('root'):
                 continue
-            for row in self.read(root/'.download/recordings.json',[]):
+            recordings=self.read(root/'.download/recordings.json',[])
+            if not recordings:continue
+            wanted={row['match']['course_path'].rstrip('/')+'/'+row['match']['file']
+                    for row in recordings if row.get('source')==data['source'] and row.get('match')}
+            if not wanted:continue
+            wanted_folders={str(PurePosixPath(path).parent) for path in wanted}
+            names={}
+            hashes_by_identity={}
+            for manifest in (root/'.download').glob('*-manifest.json'):
+                for original in self.read(manifest,[]):
+                    if original['path'] in wanted:
+                        identity=(original['path'],original.get('size'),original.get('sha256'))
+                        hashes_by_identity.setdefault(identity,{}).update(
+                            {kind:original[kind] for kind in ('sha1','md5') if original.get(kind)})
+                    filename=PurePosixPath(original['path'])
+                    if str(filename.parent) in wanted_folders and filename.suffix.casefold() in nextcloud.VIDEO:
+                        names.setdefault(str(filename.parent),set()).add(original['path'])
+            ordinals={path:i for filenames in names.values()
+                      for i,path in enumerate(sorted(filenames,key=nextcloud.normalized),1)}
+            for row in recordings:
                 if row.get('source') != data['source'] or not row.get('match'):
                     continue
                 owner=root
@@ -111,15 +130,8 @@ class Uploader(nextcloud.Sync):
                 if not re.fullmatch('[0-9a-f]{64}',row.get('actual_sha256','')):
                     continue
                 item=dict(path=path,size=row['original_size'],sha256=row['original_sha256'],payload_sha256=row['actual_sha256'])
-                paths=set()
-                for manifest in (owner/'.download').glob('*-manifest.json'):
-                    for original in self.read(manifest,[]):
-                        if (original['path'],original.get('size'),original.get('sha256'))==(path,item['size'],item['sha256']):
-                            item.update({kind:original[kind] for kind in ('sha1','md5') if original.get(kind)})
-                        if (PurePosixPath(original['path']).parent==PurePosixPath(path).parent
-                                and PurePosixPath(original['path']).suffix.casefold() in nextcloud.VIDEO):
-                            paths.add(original['path'])
-                ordinal=next((i for i,p in enumerate(sorted(paths,key=nextcloud.normalized),1) if p==path),None)
+                item.update(hashes_by_identity.get((path,item['size'],item['sha256']),{}))
+                ordinal=ordinals.get(path)
                 if ordinal is None:
                     continue
                 jobs.append((False,owner,data,item,local,'camrip',row['size'],None,None,ordinal,row['mtime_ns']))

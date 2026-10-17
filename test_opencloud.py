@@ -407,6 +407,28 @@ class UploadChecks(unittest.TestCase):
         self.assertEqual(jobs[0][1],self.root)
         self.assertEqual(jobs[0][5],'camrip')
 
+    def test_many_camrip_candidates_index_archive_manifests_once(self):
+        (self.state/'events.jsonl').write_text('')
+        second=dict(self.item,path='/Course/Second.mp4',
+                    sha256=hashlib.sha256(b'second video').hexdigest(),size=12)
+        second_local=d.local_path(self.root,second['path'])
+        second_local.write_bytes(b'second video')
+        d.write_json(self.state/'01-manifest.json',[self.item,second])
+        records=[]
+        for item,local in [(self.item,self.local),(second,second_local)]:
+            records.append(dict(local=str(local),source=self.data['source'],
+                size=item['size'],mtime_ns=local.stat().st_mtime_ns,
+                actual_sha256=item['sha256'],original_sha256=item['sha256'],
+                original_size=item['size'],
+                match=dict(course_path='/Course',file=Path(item['path']).name,sheet='2024 осень')))
+        d.write_json(self.state/'recordings.json',records)
+        with patch.object(self.uploader,'read',wraps=self.uploader.read) as read:
+            jobs=self.uploader.jobs([self.root])
+        self.assertEqual({j[3]['path'] for j in jobs},{self.item['path'],second['path']})
+        self.assertEqual(sorted(j[9] for j in jobs),[1,2])
+        reads=[call for call in read.call_args_list if call.args and call.args[0]==self.state/'01-manifest.json']
+        self.assertLessEqual(len(reads),2)  # super().jobs and one shared CamRip index
+
     def test_camrip_is_used_only_without_local_original(self):
         record=dict(local=str(self.local),source=self.data['source'],size=len(self.content),mtime_ns=self.local.stat().st_mtime_ns,
             actual_sha256=self.item['sha256'],original_sha256=self.item['sha256'],original_size=len(self.content),
