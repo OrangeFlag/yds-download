@@ -92,14 +92,15 @@ class Uploader(nextcloud.Sync):
         jobs=super().jobs(roots) or []
         originals={(job[2]['source'],job[3]['path']) for job in jobs if job[5]=='original'}
         jobs=[job for job in jobs if job[5]=='original' or (job[2]['source'],job[3]['path']) not in originals]
-        sources={self.read(root/'.download/source.json',{}).get('source'):(root,self.read(root/'.download/source.json',{})) for root in roots
-                 if not self.read(root/'.download/catalog.json',{}).get('root')}
         seen=set()
         for root in roots:
+            data=self.read(root/'.download/source.json',{})
+            if not data.get('source') or self.read(root/'.download/catalog.json',{}).get('root'):
+                continue
             for row in self.read(root/'.download/recordings.json',[]):
-                if row.get('source') not in sources or not row.get('match'):
+                if row.get('source') != data['source'] or not row.get('match'):
                     continue
-                owner,data=sources[row['source']]
+                owner=root
                 match=row['match'];path=match['course_path'].rstrip('/')+'/'+match['file']
                 if (row['source'],path) in originals:
                     continue
