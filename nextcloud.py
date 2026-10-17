@@ -60,6 +60,8 @@ def remote_path(data, item):
         parts.pop(0)
     if not year or not season or len(parts) < 2:
         raise ValueError('Nextcloud requires a course archive with a known year and semester')
+    # Nextcloud rejects literal backslashes; keep them visible as a filename character.
+    parts[-1] = parts[-1].replace('\\', '＼')
     return year+'-'+season+'/'+normalized('/'.join(parts))
 
 
@@ -457,6 +459,7 @@ class Sync:
 
     def request(self, method, path, data=None, **kwargs):
         retry = network.RequestRetry(path, self.stopping)
+        server_retries = 0
         while True:
             if self.stopping.is_set():
                 raise InterruptedError('Nextcloud request interrupted')
@@ -472,7 +475,16 @@ class Sync:
                         error.dav_message=tree.findtext('{DAV:}message') or tree.findtext('{http://sabredav.org/ns}message') or ''
                     except (OSError,http.client.HTTPException,ET.ParseError):
                         pass
-                if storage.disk_error(error) or not retry.retry(network.failure(error, 'body' if method=='PUT' else 'connect')):
+                if storage.disk_error(error):
+                    raise
+                if isinstance(error, urllib.error.HTTPError) and error.code in (500, 502, 504):
+                    delay = max(2**server_retries * random.uniform(.75, 1.25), network.retry_after(error.headers))
+                    if server_retries >= 2 or delay > 60:
+                        raise
+                    if self.stopping.wait(delay):
+                        raise InterruptedError('Nextcloud request interrupted') from error
+                    server_retries += 1
+                elif not retry.retry(network.failure(error, 'body' if method=='PUT' else 'connect')):
                     raise
                 if isinstance(data, Body):
                     data.stream.seek(0)

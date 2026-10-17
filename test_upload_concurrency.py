@@ -1,5 +1,6 @@
 """Cloud uploaders share slots and count accepted payload, including resumed TUS chunks."""
 import json
+import io
 from pathlib import Path
 import subprocess
 import sys
@@ -58,6 +59,39 @@ class TransferTargetChecks(unittest.TestCase):
 
 
 class SharedUploadChecks(unittest.TestCase):
+    def test_final_statistics_survive_graceful_and_crashed_epoch_changes(self):
+        for crash in (False,True):
+            with self.subTest(crash=crash),patch('sys.stdout',io.StringIO()) as output,patch('time.time',return_value=1000) as clock:
+                a=self.budget('nextcloud');a.confirmed(1000)
+                clock.return_value=1010
+                if crash:
+                    with a.state():pass
+                    import os
+                    os.utime(self.path/'state.json',(1010,1010))
+                    a.closed=True;a.lease.close()
+                else:a.close()
+                clock.return_value=1020
+                b=self.budget('nextcloud');b.close()
+                packets=[json.loads(line.split('TRANSFER STATS: ',1)[1]) for line in output.getvalue().splitlines() if 'TRANSFER STATS: ' in line]
+                from service_stats import traffic,timestamp
+                for packet in packets:packet['time']=timestamp(packet['time'])
+                self.assertEqual(traffic(packets,None,1020)['nextcloud']['bytes'],1000)
+
+    def test_periodic_statistics_keep_source_totals_after_member_closes(self):
+        output=io.StringIO()
+        with patch('sys.stdout',output),patch('time.time',return_value=1000) as clock:
+            a=self.budget('nextcloud');b=self.budget('opencloud')
+            a.confirmed(100);b.confirmed(200)
+            with a.state():pass
+            with b.state():pass
+            b.close()
+            clock.return_value=1061
+            with a.state():pass
+        snapshots=[json.loads(s.split('TRANSFER STATS: ',1)[1]) for s in output.getvalue().splitlines() if 'TRANSFER STATS: ' in s]
+        self.assertEqual(snapshots[0]['sources'],{'nextcloud':0})
+        self.assertEqual(snapshots[-1]['sources'],{'nextcloud':100,'opencloud':200})
+        self.assertEqual(snapshots[0]['epoch'],snapshots[-1]['epoch'])
+
     def setUp(self):
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
         self.path=Path(tmp.name)

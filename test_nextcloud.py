@@ -22,6 +22,31 @@ class Response(io.BytesIO):
 
 
 class NextcloudChecks(unittest.TestCase):
+    def test_backslash_filename_has_a_safe_remote_name_and_traversal_stays_forbidden(self):
+        item=dict(self.item,path='/Course/Fibers with I\\O.mp4')
+        path=nextcloud.remote_path(self.data,item)
+        self.assertIn('I＼O.mp4',path)
+        self.assertIn('I%EF%BC%BCO.mp4',nextcloud.Share(self.upload).url(path))
+        for unsafe in ('../video.mp4','/absolute.mp4','Course/../video.mp4','Course\\..\\video.mp4'):
+            with self.assertRaises(ValueError):nextcloud.Share(self.upload).url(unsafe)
+
+    def test_transient_http_500_retries_same_chunk_and_counts_only_accepted_bytes(self):
+        sync=nextcloud.Sync(None,self.upload,Event(),chunk_size=4)
+        failed=False;puts=[]
+        def request(share,method,path='',data=None,**kwargs):
+            nonlocal failed
+            if method=='PUT':
+                puts.append((path,data.read()))
+                if not failed:
+                    failed=True
+                    raise urllib.error.HTTPError('hidden',500,'Internal Server Error',{},None)
+            return Response()
+        with patch.object(nextcloud.Share,'request',request),patch.object(sync.stopping,'wait',return_value=False):
+            sync.run_once([self.root])
+        self.assertEqual(puts[0],puts[1])
+        row=next(iter(json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+        self.assertEqual((row['state'],row['sent_bytes']),('uploaded',len(self.content)))
+
     def test_shared_budget_counts_only_successful_new_chunks(self):
         with nextcloud.SharedUploadBudget(self.root/'budget','nextcloud',2,8) as budget:
             sync=nextcloud.Sync(None,self.upload,Event(),chunk_size=4)

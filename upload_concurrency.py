@@ -150,6 +150,9 @@ class SharedUploadBudget:
                     except BlockingIOError:continue
                     del members[key]
                     lease.unlink(missing_ok=True)
+            if not members and state.get('transfer_stats'):
+                # Preserve the last durable sample after a crash, before replacing its epoch.
+                self.log_stats(state['transfer_stats'],path.stat().st_mtime)
             expected=dict(minimum=self.minimum,maximum=self.maximum)
             if self.probe_zero:expected['probe_zero']=True
             if self.target_mbit_s:expected['target_mbit_s']=self.target_mbit_s
@@ -160,15 +163,31 @@ class SharedUploadBudget:
             if not members:
                 controller=UploadConcurrency(self.minimum,self.maximum,self.probe_zero,self.target_mbit_s)
                 state['controller']={k:getattr(controller,k) for k in self.fields}
+                state['transfer_stats']=dict(epoch=uuid.uuid4().hex,sources={},last_log=None)
             member=members.setdefault(self.key,dict(name=self.name,active=0,waiting=0,confirmed_bytes=0,active_slots=[],waiting_slots=[]))
-            state['controller']['total']+=max(0,self.confirmed_bytes-member['confirmed_bytes'])
+            delta=max(0,self.confirmed_bytes-member['confirmed_bytes'])
+            state['controller']['total']+=delta
+            stats=state.setdefault('transfer_stats',dict(epoch=uuid.uuid4().hex,sources={},last_log=None))
+            stats['sources'][self.name]=stats['sources'].get(self.name,0)+delta
             member['confirmed_bytes']=max(member['confirmed_bytes'],self.confirmed_bytes)
             yield state
             for row in members.values():
                 row['active']=len(row['active_slots'])
                 row['waiting']=len(row['waiting_slots'])
+            stamp=time.time()
+            emit=not members or stats['last_log'] is None or stamp-stats['last_log']>=60
+            if emit:stats['last_log']=stamp
             if json.dumps(state,sort_keys=True)!=before:
                 write_json(path,state)
+            if emit:
+                self.log_stats(stats,stamp)
+
+    def log_stats(self,stats,stamp):
+        try:
+            print('TRANSFER STATS: '+json.dumps(dict(time=datetime.fromtimestamp(stamp).astimezone().isoformat(),
+                budget=str(self.directory.resolve()),epoch=stats['epoch'],sources=stats['sources'])),flush=True)
+        except OSError:
+            pass
 
     def confirmed(self, size):
         with self.mutex:self.confirmed_bytes+=size

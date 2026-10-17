@@ -182,12 +182,20 @@ def control(config, action, names):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument('action', choices=('up', 'down', 'restart', 'status'))
+    parser.add_argument('action', choices=('up', 'down', 'restart', 'status', 'stats'))
+    parser.add_argument('--since', help='Stats window: 15m, 1h, 2d; default: all retained logs')
     parser.add_argument('services', nargs='*', metavar='SERVICE', help=', '.join(NAMES) + '; up: configured; other actions: all')
     args = parser.parse_args()
     os.umask(0o077)
     try:
         config = load(args.config.expanduser())
+        if args.action == 'stats':
+            from service_stats import duration, show
+            names=list(dict.fromkeys(args.services or NAMES))
+            if set(names)-set(NAMES):raise ValueError('Unknown service')
+            show(config,names,duration(args.since) if args.since is not None else None)
+            return 0
+        if args.since is not None:raise ValueError('--since is only valid for stats')
         names = list(dict.fromkeys(args.services or (config['services'] if args.action == 'up' else NAMES)))
         allowed = config['services'] if args.action == 'up' else NAMES
         if set(names) - set(allowed):
