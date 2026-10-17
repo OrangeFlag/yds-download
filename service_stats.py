@@ -333,6 +333,9 @@ def show(config,names,seconds=None):
                     [('Range',gauges.get('range_regular_active_files','нет данных'),gauges.get('range_eligible_files','нет данных')),
                      ('Recheck',gauges.get('range_recheck_active_files','нет данных'),gauges.get('range_recheck_eligible_files','нет данных'))],right=(1,2))
         if 'range_active_files' in gauges:print(f'Всего активных файлов: {gauges["range_active_files"]}.')
+        if gauges.get('range_task_discovery_pending_archives'):
+            print(f'Обход состояния: осталось архивов {gauges["range_task_discovery_pending_archives"]}; '
+                  f'прочитано JSON {gauges.get("range_task_discovery_reads","?")}. Очередь показана частично.')
     else:print('Нет свежего снимка Range/Recheck.')
     print('Возраст свежих метрик: '+age_label(data['metrics_age'])+'.')
 

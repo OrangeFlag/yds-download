@@ -225,6 +225,154 @@ class SharedRangeChecks(unittest.TestCase):
             d.write_json(path, changed)
             self.assertEqual(next(job for name, job in cache.tasks(directory) if name == path)['state'], 'done')
 
+    def test_task_discovery_is_bounded_and_includes_changes_during_scan(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            job = dict(kind='range', state='pending', course='Course', source='test', attempt=1,
+                       item=dict(path='/Course/video.mp4', size=4, sha256='a'*64))
+            for index in range(5):
+                d.write_json(directory / f'{index}.json', job)
+            cache = q.JsonCache()
+            original = Path.read_text
+            reads = []
+            def read(path, *args, **kwargs):
+                reads.append(path)
+                return original(path, *args, **kwargs)
+            with patch.object(Path, 'read_text', new=read):
+                self.assertEqual(len(cache.tasks(directory, limit=2)), 2)
+                self.assertEqual(len(reads), 2)
+                self.assertFalse(cache.tasks_complete(directory))
+                d.write_json(directory / '0.json', dict(job, state='done'))
+                d.write_json(directory / 'new.json', job)
+                (directory / '1.json').unlink()
+                for _ in range(5):
+                    before = len(reads)
+                    tasks = cache.tasks(directory, limit=2)
+                    self.assertLessEqual(len(reads)-before, 2)
+                    if cache.tasks_complete(directory):
+                        break
+            self.assertTrue(cache.tasks_complete(directory))
+            self.assertEqual({path.name for path, _ in tasks}, {'0.json', '2.json', '3.json', '4.json', 'new.json'})
+            self.assertEqual(dict(tasks)[directory / '0.json']['state'], 'done')
+
+    def test_task_discovery_reaches_tail_during_continuous_prefix_writes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            job = dict(kind='range', state='pending', course='Course', source='test', attempt=1,
+                       item=dict(path='/Course/video.mp4', size=4, sha256='a'*64))
+            for index in range(40):
+                d.write_json(directory / f'{index:02}.json', job)
+            cache = q.JsonCache()
+            original = Path.read_text
+            reads = []
+            def read(path, *args, **kwargs):
+                reads.append(path)
+                return original(path, *args, **kwargs)
+            with patch.object(Path, 'read_text', new=read):
+                for attempt in range(6):
+                    before = len(reads)
+                    cache.tasks(directory, limit=32)
+                    self.assertLessEqual(len(reads)-before, 32)
+                    for index in range(32):
+                        d.write_json(directory / f'{index:02}.json', dict(job, attempt=attempt+2))
+                self.assertEqual(len(set(reads)), 40, 'Repeated prefix writes starved unseen tasks')
+                for _ in range(4):
+                    tasks = cache.tasks(directory, limit=32)
+                    if cache.tasks_complete(directory):
+                        break
+            self.assertTrue(cache.tasks_complete(directory))
+            self.assertEqual(len(tasks), 40)
+            self.assertEqual(dict(tasks)[directory / '00.json']['attempt'], 7)
+
+    def _finished_archive_with_cached_range(self, root):
+        state = root / '.download'
+        (state / 'tasks').mkdir(parents=True)
+        source = 'https://disk.yandex.ru/d/test'
+        local = root / 'external.mp4'
+        local.write_bytes(b'lecture')
+        item = dict(path='/Course/video.mp4', size=7, sha256=hashlib.sha256(b'lecture').hexdigest(),
+                    file='https://example.invalid/video')
+        catalog, queue = state / 'catalog.json', state / 'queue.json'
+        files = {'source.json': dict(source=source), 'catalog.json': dict(source=source),
+                 'settings.json': dict(retries=2, tuning=resolve()), 'courses.json': ['Course'],
+                 'summary.json': dict(downloads_complete=True, pending_courses=[], complete=False, failed=1),
+                 'course-history.json': {'Course': dict(state='finished', verified=0, failed=1)},
+                 '01-manifest.json': [{key: value for key, value in item.items() if key != 'file'}],
+                 'local-copies.json': [dict(item, source=source, status='valid', local=str(local), mtime_ns=local.stat().st_mtime_ns)],
+                 'queue.json': dict(report_repo=str(root / 'reports'), mark='Test',
+                                    archives=[dict(state='finished', destination=str(root), catalog=str(catalog))])}
+        for name, value in files.items():
+            d.write_json(state / name, value)
+        d.write_json(state / 'tasks/00.json', dict(kind='range', source=source, item=item, event={},
+                                                course='Course', attempt=3, state='pending'))
+        for index in range(40):
+            d.write_json(state / 'tasks' / f'zz-{index:02}.json', dict(kind='sha'))
+        return state, queue
+
+    def test_deferred_finished_course_report_survives_stop_and_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state, queue = self._finished_archive_with_cached_range(Path(folder))
+            stopping = Event()
+            with patch.object(stopping, 'wait', side_effect=lambda _: stopping.set()), patch('report.update_report') as report:
+                q.run([queue], stopping=stopping)
+                self.assertEqual(json.loads((state / 'tasks/00.json').read_text())['state'], 'applied')
+                self.assertEqual(json.loads((state / 'summary.json').read_text())['failed'], 1)
+                report.assert_not_called()
+                stopping.clear()
+                passes = 0
+                def wait(_):
+                    nonlocal passes
+                    passes += 1
+                    if passes >= 4:
+                        stopping.set()
+                with patch.object(stopping, 'wait', side_effect=wait):
+                    q.run([queue], stopping=stopping)
+                report.assert_called_once()
+            self.assertTrue(json.loads((state / 'summary.json').read_text())['complete'])
+            self.assertEqual(json.loads((state / 'course-history.json').read_text())['Course']['verified'], 1)
+            self.assertFalse((state / 'range-dirty-courses.json').exists())
+
+    def test_disabling_partially_discovered_archive_releases_idle_lock(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state, queue = self._finished_archive_with_cached_range(Path(folder))
+            stopping = Event()
+            passes = 0
+            def wait(_):
+                nonlocal passes
+                passes += 1
+                with (state / 'download.lock').open('a') as lock:
+                    if passes == 1:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        config = json.loads(queue.read_text())
+                        config['archives'][0]['enabled'] = False
+                        d.write_json(queue, config)
+                    else:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        stopping.set()
+            with patch.object(stopping, 'wait', side_effect=wait), patch('report.update_report') as report:
+                q.run([queue], stopping=stopping)
+            report.assert_not_called()
+            self.assertEqual(json.loads((state / 'range-dirty-courses.json').read_text()), ['Course'])
+
+    def test_finish_courses_defers_until_all_tasks_are_discovered(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            directory = root / '.download/tasks'
+            directory.mkdir(parents=True)
+            for index in range(40):
+                d.write_json(directory / f'{index:02d}.json', dict(
+                    kind='range', state='applied', course='Course', source='test', attempt=1,
+                    item=dict(path=f'/Course/{index}.mp4', size=4, sha256='a'*64)))
+            cache = q.JsonCache()
+            cache.tasks(directory, limit=1)
+            bg = SimpleNamespace(root=root, state=directory.parent, source='test',
+                                 directory=directory, task_cache=cache)
+            self.assertFalse(q.finish_courses(bg, {}))
+            self.assertFalse((bg.state / 'course-history.json').exists())
+            self.assertFalse((bg.state / 'summary.json').exists())
+
     def test_event_index_streams_latest_proofs_without_holding_range_history(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'events.jsonl'
@@ -464,7 +612,7 @@ class SharedRangeChecks(unittest.TestCase):
                 q.run(queues, files=8, secondary_slots=4, stopping=stopping)
             self.assertEqual(Counter(started), {'personal': 4, 'courses': 4})
 
-    def test_worker_recovers_four_files_without_ordinary_downloads(self):
+    def test_worker_recovers_four_files_before_full_task_discovery(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state = root / '.download'
@@ -489,14 +637,23 @@ class SharedRangeChecks(unittest.TestCase):
             d.write_json(state / '01-manifest.json', [{k:v for k,v in item.items() if k != 'file'} for item in items])
             queue = state / 'queue.json'
             d.write_json(queue, dict(archives=[dict(destination=str(root), catalog=str(catalog))]))
+            for index in range(40):
+                d.write_json(state / 'tasks' / f'zz-{index:02d}.json', dict(kind='sha'))
             stopping = Event()
             gate = Event()
             mutex = Lock()
             count = 0
+            read_tasks = set()
+            original_read = Path.read_text
+            def read(path, *args, **kwargs):
+                if path.parent == state / 'tasks':
+                    read_tasks.add(path)
+                return original_read(path, *args, **kwargs)
             def recover(root, event, item, *args, **kwargs):
                 nonlocal count
                 self.assertEqual(kwargs['tuning']['range_workers'], 2)
                 self.assertIsNotNone(kwargs['request_budget'])
+                self.assertLessEqual(len(read_tasks), 32, 'Worker waited for the full task scan')
                 with mutex:
                     count += 1
                     if count == 4:
@@ -513,9 +670,12 @@ class SharedRangeChecks(unittest.TestCase):
                 finish(*args)
                 if not json.loads((state / 'summary.json').read_text())['pending_courses']:
                     stopping.set()
-            with patch('recovery.finish_recovery', side_effect=recover), patch.object(q, 'finish_courses', side_effect=finalize):
+            with patch('recovery.finish_recovery', side_effect=recover), patch.object(q, 'finish_courses', side_effect=finalize), \
+                    patch.object(q, 'retire_cached_copy', side_effect=AssertionError('Completed task was offered again')), \
+                    patch.object(Path, 'read_text', new=read):
                 q.run([queue], stopping=stopping)
             self.assertEqual(count, 4)
+            self.assertEqual(len(read_tasks), 44, 'Unvisited tasks were skipped')
             self.assertTrue(json.loads((state / 'summary.json').read_text())['complete'])
             self.assertTrue(all(json.loads(path.read_text())['state'] == 'applied' for path in (state / 'tasks').glob('*.json') if len(path.stem) == 64))
             with (state / 'download.lock').open('a') as lock:

@@ -2,6 +2,8 @@
 import hashlib
 import io
 import json
+import os
+from contextlib import contextmanager
 from pathlib import Path
 import tempfile
 from threading import Barrier, Event, Lock
@@ -213,6 +215,41 @@ class UploadChecks(unittest.TestCase):
         self.uploader.run_once([self.root],upload=True)
         self.assertEqual(sum(m=='HEAD' for m,p,h in self.server.calls),1)
         self.assertEqual(sum(m=='PATCH' for m,p,h in self.server.calls),4)
+
+    def test_resumed_upload_reuses_verified_hashes_without_rereading_video(self):
+        self.server.drop_patch=True;self.uploader.retries=0
+        self.assertEqual(self.uploader.run_once([self.root],upload=True),1)
+        self.assertEqual(len(self.server.payload),7)
+        real_open=Path.open
+        @contextmanager
+        def guarded(path,*args,**kwargs):
+            with real_open(path,*args,**kwargs) as stream:
+                if path==self.local and (args[0] if args else kwargs.get('mode'))=='rb':
+                    real_read=stream.read
+                    def resumed_read(size=-1):
+                        if stream.tell()<7:raise AssertionError('Unchanged video hashed again')
+                        return real_read(size)
+                    with patch.object(stream,'read',side_effect=resumed_read):
+                        yield stream
+                else:yield stream
+        fresh=oc.Uploader(self.server,Event(),chunk_size=7)
+        with patch.object(Path,'open',guarded):
+            self.assertEqual(fresh.run_once([self.root],upload=True),0)
+        self.assertEqual(fresh.record(self.job())['state'],'uploaded')
+        self.assertEqual(sum(method=='POST' for method,_,_ in self.server.calls),1)
+        self.assertEqual([int(headers['Upload-Offset']) for method,_,headers in self.server.calls if method=='PATCH'],[0,7,14,21])
+
+    def test_hash_cache_rejects_modified_video_even_when_size_and_mtime_are_restored(self):
+        self.server.fail_move=True
+        self.assertEqual(self.uploader.run_once([self.root],upload=True),1)
+        before=self.local.stat()
+        self.local.write_bytes(b'x'*len(self.content))
+        os.utime(self.local,ns=(before.st_atime_ns,before.st_mtime_ns))
+        self.assertNotEqual(before.st_ctime_ns,self.local.stat().st_ctime_ns)
+        self.server.fail_move=False;self.server.calls.clear()
+        fresh=oc.Uploader(self.server,Event(),chunk_size=7)
+        self.assertEqual(fresh.run_once([self.root],upload=True),1)
+        self.assertFalse(any(method=='MOVE' for method,_,_ in self.server.calls))
 
     def test_two_upload_slots_overlap_and_limit_never_exceeds_budget(self):
         uploader=oc.Uploader(self.server,Event(),transfers=2)

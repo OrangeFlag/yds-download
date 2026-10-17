@@ -287,7 +287,7 @@ class Uploader(nextcloud.Sync):
     def transfer(self, job):
         _,root,data,item,local,variant,size,percent,_,ordinal,mtime=job
         storage.check(local)
-        stat=local.stat();fingerprint=(stat.st_ino,size,mtime)
+        stat=local.stat();fingerprint=(stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns)
         if (stat.st_size,stat.st_mtime_ns)!=(size,mtime):raise RuntimeError('Local video changed')
         row=self.record(job)
         if row.get('state') in ('uploaded','existing'):return False
@@ -301,30 +301,47 @@ class Uploader(nextcloud.Sync):
                 row.update(state='existing',error_type=None,http_status=None,error_reason=None,error_errno=None)
                 self.save_record(job,row)
             print('OPENCLOUD EXISTS (metadata): '+item['path'],flush=True);return False
-        digest=hashlib.sha256();sha1=hashlib.sha1();md5=hashlib.md5()
-        with local.open('rb') as stream:
-            while chunk:=stream.read(1024**2):
-                if self.stopping.is_set():raise InterruptedError('OpenCloud upload interrupted')
-                storage.check(local);digest.update(chunk);sha1.update(chunk);md5.update(chunk)
-        actual=digest.hexdigest();sha1=sha1.hexdigest()
+        cached=row.get('local_fingerprint')==list(fingerprint) and all(
+            isinstance(row.get(key),str) and re.fullmatch('[0-9a-f]{'+str(length)+'}',row[key])
+            for key,length in (('payload_sha256',64),('payload_sha1',40),('payload_md5',32)))
+        if cached:
+            actual,sha1,md5=(row[key] for key in ('payload_sha256','payload_sha1','payload_md5'))
+            print('OPENCLOUD HASH CACHED: '+item['path'],flush=True)
+        else:
+            print('OPENCLOUD HASH START: '+item['path']+f'; bytes={size}',flush=True)
+            digest=hashlib.sha256();sha1=hashlib.sha1();md5=hashlib.md5()
+            started=last_log=time.monotonic();read_bytes=0
+            with local.open('rb') as stream:
+                while chunk:=stream.read(1024**2):
+                    if self.stopping.is_set():raise InterruptedError('OpenCloud upload interrupted')
+                    storage.check(local);digest.update(chunk);sha1.update(chunk);md5.update(chunk)
+                    read_bytes+=len(chunk)
+                    if time.monotonic()-last_log>=30:
+                        print(f'OPENCLOUD HASH PROGRESS: {item["path"]}; {read_bytes}/{size} bytes',flush=True)
+                        last_log=time.monotonic()
+            after=local.stat()
+            if read_bytes!=size or (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)!=fingerprint:
+                raise RuntimeError('Local video changed during hashing')
+            actual,sha1,md5=digest.hexdigest(),sha1.hexdigest(),md5.hexdigest()
+            print(f'OPENCLOUD HASH DONE: {item["path"]}; bytes={read_bytes}; seconds={time.monotonic()-started:.3f}',flush=True)
         if variant=='original' and actual!=item['sha256'] or variant=='camrip' and actual!=item['payload_sha256']:
             raise RuntimeError('Local SHA-256 mismatch')
-        if self.exists(actual,sha1,md5.hexdigest()):
-            if row:
-                row.update(state='existing',error_type=None,http_status=None,error_reason=None,error_errno=None)
-                self.save_record(job,row)
-            print('OPENCLOUD EXISTS: '+item['path'],flush=True);return False
         stage=str(PurePosixPath(target).parent/('.yds-'+actual+'.upload'))
         if row and (row['payload_sha256'],row['target'])!=(actual,target):
             raise RuntimeError('Upload identity changed; previous session retained')
         row=row or dict(source=data['source'],path=item['path'],variant=variant,target=target,
                         payload_sha256=actual,size=size,sent_bytes=0,state='pending')
-        row['payload_md5']=md5.hexdigest()
+        row.update(payload_md5=md5,payload_sha1=sha1,local_fingerprint=list(fingerprint))
+        if self.exists(actual,sha1,md5):
+            row.update(state='existing',error_type=None,http_status=None,error_reason=None,error_errno=None)
+            self.save_record(job,row)
+            print('OPENCLOUD EXISTS: '+item['path'],flush=True);return False
         with self.index_lock:
-            if actual in self.active_hashes or self.exists(actual,sha1,md5.hexdigest()):
+            if actual in self.active_hashes or self.exists(actual,sha1,md5):
                 print('OPENCLOUD DUPLICATE ACTIVE/EXISTS: '+item['path'],flush=True);return False
             self.active_hashes.add(actual)
         try:
+            self.save_record(job,row)
             with self.index_lock:
                 for folder in reversed(PurePosixPath(target).parents):
                     folder=str(folder)
@@ -350,7 +367,7 @@ class Uploader(nextcloud.Sync):
                     if self.stopping.is_set():raise InterruptedError('OpenCloud upload interrupted')
                     storage.check(local)
                     after=local.stat()
-                    if (after.st_ino,after.st_size,after.st_mtime_ns)!=fingerprint:raise RuntimeError('Local video changed')
+                    if (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)!=fingerprint:raise RuntimeError('Local video changed')
                     try:
                         if offset is None:
                             try:
@@ -389,7 +406,7 @@ class Uploader(nextcloud.Sync):
             # Offset == size can precede publication; a lost MOVE may already have published the target.
             published=self.confirm_publication(row,stage,sha1)
             after=local.stat()
-            if (after.st_ino,after.st_size,after.st_mtime_ns)!=fingerprint:raise RuntimeError('Local video changed')
+            if (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)!=fingerprint:raise RuntimeError('Local video changed')
             if published!=target:
                 with self.share.request('MOVE',stage,headers={'Destination':self.share.url(target),'Overwrite':'F'}) as response:
                     if response.status!=201:raise RuntimeError('OpenCloud did not confirm file publication')

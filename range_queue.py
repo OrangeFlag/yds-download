@@ -54,6 +54,8 @@ class JsonCache:
     def __init__(self):
         self.entries = {}
         self.directories = {}
+        self.scans = {}
+        self.task_reads = 0
 
     def read(self, path, default=None):
         if not path.exists():
@@ -66,22 +68,46 @@ class JsonCache:
             self.entries[path] = saved
         return saved[1]
 
-    def tasks(self, directory):
+    def tasks_complete(self, directory):
+        if not directory.exists():
+            return True
+        saved = self.directories.get(directory)
+        return directory not in self.scans and saved is not None and saved[0] == Background.stat(directory)
+
+    def tasks(self, directory, limit=None):
         if not directory.exists():
             self.directories.pop(directory, None)
+            self.scans.pop(directory, None)
             return []
         stamp = Background.stat(directory)
         saved = self.directories.get(directory)
-        if saved is not None and saved[0] == stamp:
+        if saved is not None and saved[0] == stamp and directory not in self.scans:
             return saved[2]
-        previous = saved[1] if saved else {}
-        current = {}
-        for path in sorted(directory.glob('*.json')):
-            file_stamp = Background.stat(path)
+        scan = self.scans.get(directory)
+        if scan is None:
+            previous = dict(saved[1]) if saved else {}
+            scan = stamp, iter(sorted(directory.glob('*.json'))), {}, previous
+            self.scans[directory] = scan
+        _, paths, current, previous = scan
+        reads = 0
+        complete = False
+        # shortcut: cold starts still read every task; persist summaries if bounded batches remain too costly.
+        while limit is None or reads < limit:
+            try:
+                path = next(paths)
+            except StopIteration:
+                complete = True
+                break
+            try:
+                file_stamp = Background.stat(path)
+            except FileNotFoundError:
+                continue
             if path in previous and previous[path][0] == file_stamp:
                 summary = previous[path][1]
             else:
                 job = json.loads(path.read_text())
+                reads += 1
+                self.task_reads += 1
                 summary = None
                 if job['kind'] == 'range':
                     item = job['item']
@@ -97,8 +123,25 @@ class JsonCache:
                                        job.get('result', {}).get('event', {}).get('range_recovered_complete', False),
                                        'status':job.get('result',{}).get('event',{}).get('status')}})
             current[path] = file_stamp, summary
-        tasks = [(path, row) for path, (_, row) in current.items() if row is not None]
-        self.directories[directory] = stamp, current, tasks
+        latest = Background.stat(directory)
+        tasks = []
+        for path, (file_stamp, row) in current.items():
+            if row is None:
+                continue
+            if latest != scan[0]:
+                try:
+                    if Background.stat(path) != file_stamp:
+                        continue
+                except FileNotFoundError:
+                    continue
+            tasks.append((path, row))
+        if complete:
+            if latest != scan[0]:
+                previous.update(current)
+                self.scans[directory] = latest, iter(sorted(directory.glob('*.json'))), {}, previous
+            else:
+                self.directories[directory] = latest, current, tasks
+                del self.scans[directory]
         return tasks
 
 
@@ -147,6 +190,15 @@ def retire_cached_copy(background, path, job, proofs):
 
 def finish_courses(background, config, changed_courses=()):
     root, state = background.root, background.state
+    if hasattr(background, 'task_cache'):
+        # An unseen task can still keep its course pending.
+        if background.directory in background.task_cache.scans:
+            return False
+        jobs = [job for _, job in background.task_cache.tasks(background.directory, limit=32)]
+        if not background.task_cache.tasks_complete(background.directory):
+            return False
+    else:
+        jobs = [json.loads(path.read_text()) for path in background.directory.glob('*.json')]
     courses = json.loads((state / 'courses.json').read_text())
     history_path = state / 'course-history.json'
     history = json.loads(history_path.read_text())
@@ -155,9 +207,6 @@ def finish_courses(background, config, changed_courses=()):
     registry = state / 'local-copies.json'
     external = {row['path']: row for row in (json.loads(registry.read_text()) if registry.exists() else [])
                 if row.get('source', '').rstrip('/') == background.source.rstrip('/') and row.get('status') == 'valid'}
-    jobs = ([job for _, job in background.task_cache.tasks(background.directory)]
-            if hasattr(background, 'task_cache')
-            else [json.loads(path.read_text()) for path in background.directory.glob('*.json')])
     from nextcloud import saved_remote_files
     settings = json.loads((state/'settings.json').read_text())
     link = None if getattr(background, 'fallback', None) else settings.get('nextcloud_existing')
@@ -276,9 +325,18 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
         budget = ProcessRangeBudget(budget_directory, requests, rps)
     cache = JsonCache()
     roots = {}
+    changed_courses_by_root = {}
     priorities = {}
     fallbacks = {}
     recheck_roots = {}
+    def mark_courses(background, courses):
+        marker = background.state / 'range-dirty-courses.json'
+        saved = changed_courses_by_root.setdefault(background.root, set(cache.read(marker, [])))
+        added = set(courses) - saved
+        if added:
+            saved.update(added)
+            d.write_json(marker, sorted(saved))
+
     recheck_limits = ([recheck_files] if len(queues)==1 else [(recheck_files+1)//2,recheck_files//2])
     with Metrics(queues[0].with_suffix('.range.metrics.jsonl'),'range-queue',interval=metrics_interval,
                  settings=dict(files=files,per_file=per_file,requests=requests,rps=rps,secondary_slots=secondary_slots,recheck_interval=recheck_interval,recheck_files=recheck_files,recheck_probes=recheck_probes,recheck_full_interval=recheck_full_interval)) as metrics, \
@@ -289,14 +347,15 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                     storage.check(queue)
                 # Poll applies every result under the archive's exclusive download lock.
                 for root, (background, lock, config) in list(roots.items()):
-                    before = len(background.futures)
-                    changed_courses = {job['course'] for job in background.jobs.values()}
+                    if not any(future.done() for future in background.futures.values()):
+                        storage.check(root)
+                        continue
+                    mark_courses(background, (job['course'] for job in background.jobs.values()))
                     background.poll()
-                    if len(background.futures) != before:
-                        finish_courses(background, config, changed_courses)
                 eligible = []
                 rechecks = []
                 recheck_times = {}
+                selected_roots = set()
                 for priority, queue in enumerate(queues):
                     config = storage.read_queue(queue, cache.read(queue))
                     archives=list(config['archives'])
@@ -314,7 +373,9 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         summary = cache.read(state / 'summary.json', {})
                         if not summary.get('downloads_complete') and archive.get('state') != 'finished':
                             continue
-                        tasks = cache.tasks(state / 'tasks')
+                        selected_roots.add(root)
+                        tasks = cache.tasks(state / 'tasks', limit=32)
+                        dirty_courses = cache.read(state / 'range-dirty-courses.json', [])
                         settings=cache.read(state/'settings.json',{})
                         link = nextcloud_fallback or archive.get('nextcloud_fallback', config.get('nextcloud_fallback', settings.get('nextcloud_fallback')))
                         cloud = opencloud_fallback or archive.get('opencloud_fallback', config.get('opencloud_fallback', settings.get('opencloud_fallback')))
@@ -337,7 +398,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 fallbacks[root] = fallback_key, source_fallback
                             fallback = fallbacks[root][1]
                         legacy=recheck_interval and archive.get('legacy_recheck') and not cache.read(state/'legacy-recheck-seeded.json',{}).get('complete')
-                        if not legacy and not summary.get('pending_courses') and not any(job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or recheck_due(job,recheck_interval) or fallback_due(fallback,job)) for _, job in tasks):
+                        if not legacy and not dirty_courses and not summary.get('pending_courses') and not any(job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or recheck_due(job,recheck_interval) or fallback_due(fallback,job)) for _, job in tasks):
                             continue
                         if root not in roots:
                             lock = (state / 'download.lock').open('a')
@@ -361,13 +422,15 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 lock.close()
                                 raise
                             roots[root] = background, lock, config
+                            if dirty_courses:
+                                changed_courses_by_root[root] = set(dirty_courses)
                             priorities[root] = priority
                             background.event_index = EventIndex(state / 'events.jsonl')
                             background.cached_events = background.event_index.refresh()
                             background.task_cache = cache
                             if legacy:
                                 seed_legacy_tasks(background)
-                                tasks=cache.tasks(state/'tasks')
+                                tasks=cache.tasks(state/'tasks', limit=32)
                             background.manifest_items = {(course, item['path']): (item['size'], item['sha256'])
                                 for index, course in enumerate(cache.read(state / 'courses.json'), 1)
                                 for item in cache.read(state / f'{index:02d}-manifest.json')}
@@ -377,7 +440,6 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         remote_link = None if fallback else settings.get('nextcloud_existing')
                         remote_files = saved_remote_files(state, remote_link, source=background.source,
                             saved=cache.read(state/'nextcloud-existing.json', {}) if remote_link else {})
-                        retired = set()
                         external = cache.read(state / 'local-copies.json', [])
                         external_by_path = {}
                         for copy in external:
@@ -394,26 +456,25 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 item = job['item']
                                 remote = remote_files.get(item['path'], {})
                                 if (remote.get('size'), remote.get('sha256')) == (item['size'], item['sha256']):
+                                    mark_courses(background, [job['course']])
                                     background.checkpoint(item,job['course'],job['attempt'],'remote')
                                     saved = json.loads(path.read_text())
                                     saved.update(state='applied',time=now(),superseded_by_nextcloud=True)
                                     d.write_json(path,saved)
-                                    retired.add(job['course'])
                                     continue
                                 if background.manifest_items.get((job['course'], item['path'])) != (item['size'], item['sha256']):
+                                    mark_courses(background, [job['course']])
                                     saved = json.loads(path.read_text())
                                     saved.update(state='applied', time=now(), superseded_by_manifest=True)
                                     d.write_json(path, saved)
                                     continue
                                 proofs = [background.cached_events.get(item['path'], {}), *external_by_path.get(item['path'], [])]
                                 if any(proof.get('status') == 'valid' for proof in proofs):
+                                    mark_courses(background, [job['course']])
                                     if retire_cached_copy(background, path, json.loads(path.read_text()), proofs):
-                                        retired.add(job['course'])
                                         continue
                                 (rechecks if checking else eligible).append((priority, background, path))
                                 if checking:recheck_times[path]=(job['state']=='applied',yandex_checked_time(job))
-                        if retired:
-                            finish_courses(background, config, retired)
                 def is_recheck(background,path):
                     return bool(recheck_interval and background.jobs[path].get('yandex_recheck'))
                 active = sum(not is_recheck(bg,path) for bg,_,_ in roots.values() for path in bg.futures)
@@ -448,11 +509,27 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                           force=job['state']=='applied',yandex_recheck=True)
                         recheck_roots[group]=root;checking_active[group]+=1
                 for root, (background, lock, config) in list(roots.items()):
+                    if root not in selected_roots and not background.futures:
+                        background.close()
+                        lock.close()
+                        del roots[root]
+                        changed_courses_by_root.pop(root, None)
+                        continue
+                    if not cache.tasks_complete(background.directory):
+                        continue
+                    if root in changed_courses_by_root:
+                        if finish_courses(background, config, changed_courses_by_root[root]) is False:
+                            continue
+                        marker = background.state / 'range-dirty-courses.json'
+                        marker.unlink(missing_ok=True)
+                        storage.sync_directory(marker.parent)
+                        del changed_courses_by_root[root]
                     if not background.futures:
                         if any(row[1] is background for row in eligible+rechecks):
                             continue
                         if cache.read(background.state / 'summary.json', {}).get('pending_courses'):
-                            finish_courses(background, config)
+                            if finish_courses(background, config) is False:
+                                continue
                         background.close()
                         lock.close()
                         del roots[root]
@@ -462,6 +539,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                 metrics.gauge('range_recheck_eligible_files',len(rechecks))
                 metrics.gauge('range_regular_active_files',active)
                 metrics.gauge('archives_owned',len(roots))
+                metrics.gauge('range_task_discovery_pending_archives',len(cache.scans))
+                metrics.gauge('range_task_discovery_reads',cache.task_reads)
                 stopping.wait(2)
         finally:
             for background, _, _ in roots.values():

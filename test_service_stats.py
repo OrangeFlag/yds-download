@@ -116,10 +116,11 @@ class StatsTests(unittest.TestCase):
         self.assertNotIn("{'",rendered)
         self.assertEqual(stats.size_label(0),'0.0 Б')
         self.assertEqual(stats.age_label(None),'нет данных')
-        data['gauges']={'range_active_files':4}
+        data['gauges']={'range_active_files':4,'range_task_discovery_pending_archives':2,'range_task_discovery_reads':32}
         with patch.object(stats,'collect',return_value=data),patch('sys.stdout',io.StringIO()) as output:
             stats.show({},['queue'])
         self.assertIn('Всего активных файлов: 4.',output.getvalue())
+        self.assertIn('Очередь показана частично.',output.getvalue())
 
 
 if __name__=='__main__':unittest.main()
