@@ -99,15 +99,20 @@ class Uploader(nextcloud.Sync):
                 continue
             recordings=self.read(root/'.download/recordings.json',[])
             if not recordings:continue
+            wanted={row['match']['course_path'].rstrip('/')+'/'+row['match']['file']
+                    for row in recordings if row.get('source')==data['source'] and row.get('match')}
+            if not wanted:continue
+            wanted_folders={str(PurePosixPath(path).parent) for path in wanted}
             names={}
             hashes_by_identity={}
             for manifest in (root/'.download').glob('*-manifest.json'):
                 for original in self.read(manifest,[]):
-                    identity=(original['path'],original.get('size'),original.get('sha256'))
-                    hashes_by_identity.setdefault(identity,{}).update(
-                        {kind:original[kind] for kind in ('sha1','md5') if original.get(kind)})
+                    if original['path'] in wanted:
+                        identity=(original['path'],original.get('size'),original.get('sha256'))
+                        hashes_by_identity.setdefault(identity,{}).update(
+                            {kind:original[kind] for kind in ('sha1','md5') if original.get(kind)})
                     filename=PurePosixPath(original['path'])
-                    if filename.suffix.casefold() in nextcloud.VIDEO:
+                    if str(filename.parent) in wanted_folders and filename.suffix.casefold() in nextcloud.VIDEO:
                         names.setdefault(str(filename.parent),set()).add(original['path'])
             ordinals={path:i for filenames in names.values()
                       for i,path in enumerate(sorted(filenames,key=nextcloud.normalized),1)}
