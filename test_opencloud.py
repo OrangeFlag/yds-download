@@ -82,10 +82,15 @@ class UploadChecks(unittest.TestCase):
 
     def job(self):return self.uploader.jobs([self.root])[0]
 
+    def legacy_checkpoint(self, job):
+        key=hashlib.sha256(json.dumps([self.server.url(),self.uploader.folder,job[2]['source'],
+            job[3]['path'],job[5],str(job[4]),job[6],job[10]],ensure_ascii=False).encode()).hexdigest()
+        return job[1]/'.download/opencloud-uploads'/key[:2]/(key+'.json')
+
     def test_checkpoint_identity_survives_remount_and_reads_legacy_session(self):
         import shutil
         job=self.job()
-        previous=self.uploader.checkpoint(job)
+        previous=self.legacy_checkpoint(job)
         previous.parent.mkdir(parents=True,exist_ok=True)
         row=dict(source=self.data['source'],path=self.item['path'],variant='original',
                  size=self.item['size'],payload_sha256=self.item['sha256'],
@@ -98,8 +103,36 @@ class UploadChecks(unittest.TestCase):
         shutil.copytree(self.state/'opencloud-uploads',moved/'.download/opencloud-uploads')
         new_job=(*job[:1],moved,*job[2:4],moved/'Course/Lecture.mp4',*job[5:])
         self.assertEqual(self.uploader.checkpoint(new_job).relative_to(moved),
-                         previous.relative_to(self.root))
+                         self.uploader.checkpoint(job).relative_to(self.root))
+        oc.storage.migrate(self.root,moved,'uuid',self.root/'custom-state')
         self.assertEqual(self.uploader.record(new_job).get('session_url'),row['session_url'])
+
+    def test_external_original_copy_uploads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            external=Path(directory)/self.local.name
+            self.local.rename(external)
+            d.write_json(self.state/'local-copies.json',[dict(self.item,source=self.data['source'],
+                status='valid',local=str(external),mtime_ns=external.stat().st_mtime_ns)])
+            self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+            self.assertIn(self.content,self.server.files.values())
+
+    def test_legacy_checkpoint_requires_exact_destination_and_local_version(self):
+        job=self.job();path=self.legacy_checkpoint(job);path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(dict(source=self.data['source'],path=self.item['path'],variant='original',
+            size=job[6],payload_sha256=self.item['sha256'],state='uploaded',sent_bytes=job[6])))
+        self.assertEqual(self.uploader.record(job)['state'],'uploaded')
+        for changed in ('nickname','base'):
+            server=Server();setattr(server,changed,getattr(server,changed)+'changed')
+            self.assertEqual(oc.Uploader(server,Event()).record(job),{})
+        self.assertEqual(oc.Uploader(self.server,Event()).record((*job[:10],job[10]+1)),{})
+
+    def test_legacy_partial_checkpoint_keeps_its_actual_payload_identity(self):
+        job=self.job();job=(*job[:5],'partial',job[6]-1,75,*job[8:])
+        path=self.legacy_checkpoint(job);path.parent.mkdir(parents=True)
+        row=dict(source=self.data['source'],path=self.item['path'],variant='partial',size=job[6],
+            payload_sha256='f'*64,state='uploading',sent_bytes=7,session_url='https://cloud.example/data/old')
+        path.write_text(json.dumps(row))
+        self.assertEqual(self.uploader.record(job),row)
 
     def test_webdav_scan_uses_exact_server_spelling_for_unicode_folder(self):
         raw='Cafe\u0301 '

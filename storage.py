@@ -8,6 +8,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import stat
@@ -185,18 +186,17 @@ def migrate(old, new, uuid, state, previous=()):
         prefixes = known | {str(old)} | set(previous)
         if saved.get('mount'):
             prefixes.add(saved['mount'])
-        replacements = list(dict.fromkeys(
-            (json.dumps(prefix, ensure_ascii=escape)[1:-1],
-             json.dumps(str(new), ensure_ascii=escape)[1:-1])
-            for prefix in sorted(prefixes, key=len, reverse=True) if prefix != str(new)
-            for escape in (False, True)
-        ))
+        replacements = [prefix for prefix in sorted(prefixes,key=len,reverse=True) if prefix != str(new)]
+        strings=re.compile(r'"(?:[^"\\]|\\.)*"')
         def rewrite(line):
             # Only replace complete JSON string paths, never URLs or diagnostic text.
-            for old_root, new_root in replacements:
-                line = line.replace('"' + old_root + '/', '"' + new_root + '/')
-                line = line.replace('"' + old_root + '"', '"' + new_root + '"')
-            return line
+            def replace(match):
+                value=json.loads(match[0])
+                for prefix in replacements:
+                    if value==prefix or value.startswith(prefix+'/'):
+                        return json.dumps(str(new)+value[len(prefix):],ensure_ascii=False)
+                return match[0]
+            return strings.sub(replace,line)
 
         def scan_error(error):
             raise error
@@ -206,6 +206,8 @@ def migrate(old, new, uuid, state, previous=()):
             metadata = False
             for name in names:
                 path = Path(directory) / name
+                if path.name=='mount-history.json' and path.parent.name=='opencloud-uploads':
+                    continue
                 if path.suffix not in ('.json', '.jsonl') or not stat.S_ISREG(path.lstat().st_mode):
                     continue
                 metadata = True
@@ -220,6 +222,12 @@ def migrate(old, new, uuid, state, previous=()):
                         output.flush(); os.fsync(output.fileno())
                     temporary.chmod(path.stat().st_mode & 0o777)
                     temporary.replace(path)
+            if Path(directory).name=='opencloud-uploads' and Path(directory).parent.name=='.download':
+                from download import write_json
+                history=Path(directory)/'mount-history.json'
+                prior=json.loads(history.read_text()) if history.exists() else {}
+                write_json(history,dict(mount=str(new),previous=sorted(prefixes | set(prior.get('previous',[])))))
+                metadata=True
             if metadata:
                 # A prior attempt may have replaced files before its directory sync failed.
                 sync_directory(directory)

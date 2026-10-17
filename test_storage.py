@@ -180,6 +180,17 @@ class StorageChecks(unittest.TestCase):
         self.assertEqual(actual['destination'],str(new))
         self.assertEqual(actual['note'],initial['note'])
 
+    def test_mount_migration_preserves_quoted_diagnostics_and_replaces_prefix_once(self):
+        old=self.root/'old';intermediate=old/'nested';new=intermediate/'new'
+        path=new/'Course/.download/job.json';path.parent.mkdir(parents=True)
+        initial={'local':str(intermediate/'video.mp4'),
+                 'description':'Could not open "'+str(old/'video.mp4')+'"'}
+        path.write_text(json.dumps(initial))
+        storage.migrate(intermediate,new,'uuid',self.root/'state',previous=[str(old)])
+        actual=json.loads(path.read_text())
+        self.assertEqual(actual['local'],str(new/'video.mp4'))
+        self.assertEqual(actual['description'],initial['description'])
+
     def test_mount_migration_streams_large_jsonl_instead_of_reading_entire_log(self):
         old=self.root/'old';new=self.root/'new';state=self.root/'state'
         path=new/'YandexDisk/.download/events.jsonl';path.parent.mkdir(parents=True)
