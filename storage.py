@@ -169,11 +169,21 @@ def sync_directory(path):
         os.close(directory)
 
 
-def migrate(old, new, uuid, state, previous=()):
+def sync_filesystem(path):
+    try:
+        subprocess.run(['sync', '-f', '--', str(path)], check=True, capture_output=True)
+    except subprocess.CalledProcessError as error:
+        raise StorageUnavailable(path) from error
+
+
+def migrate(old, new, uuid, state, previous=(), expected_device=None):
     old, new, state = Path(old), Path(new), Path(state)
+    device = new.stat().st_dev if expected_device is None else expected_device
     state.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (state / (uuid + '.lock')).open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if not mounted_ok(new, device):
+            raise StorageUnavailable(new)
         record = state / (uuid + '.json')
         try:
             saved = json.loads(record.read_text())
@@ -228,9 +238,15 @@ def migrate(old, new, uuid, state, previous=()):
                 prior=json.loads(history.read_text()) if history.exists() else {}
                 write_json(history,dict(mount=str(new),previous=sorted(prefixes | set(prior.get('previous',[])))))
                 metadata=True
-            if metadata:
-                # A prior attempt may have replaced files before its directory sync failed.
+            if metadata and Path(directory).stat().st_dev != device:
+                # Nested filesystems need their own directory durability barrier.
                 sync_directory(directory)
+        if not mounted_ok(new, device):
+            raise StorageUnavailable(new)
+        # Flush renamed metadata once, including unchanged files from interrupted attempts.
+        sync_filesystem(new)
+        if not mounted_ok(new, device):
+            raise StorageUnavailable(new)
         temporary = record.with_suffix('.tmp')
         with temporary.open('w') as stream:
             json.dump(dict(mount=str(new), previous=sorted(prefixes)), stream)
@@ -298,7 +314,9 @@ def supervise(uuid, root, command, state, logger, stopping, poll=5, stop_timeout
                 continue
             if not mounted_ok(candidate, device):
                 raise StorageUnavailable(candidate)
-            migrate(root, candidate, uuid, state)
+            if candidate != root:
+                logger.info('DISK MIGRATION: %s -> %s; updating metadata before resume', root, candidate)
+            migrate(root, candidate, uuid, state, expected_device=device)
             if not mounted_ok(candidate, device):
                 raise StorageUnavailable(candidate)
             old_root = str(root)

@@ -21,10 +21,12 @@ import recovery
 
 class StorageChecks(unittest.TestCase):
     def setUp(self):
+        self.native_sync = storage.sync_filesystem
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.env = dict(YDS_DISK_ROOT=str(self.root), YDS_DISK_DEVICE=str(self.root.stat().st_dev))
+        self.filesystem_sync = self.enterContext(patch('storage.sync_filesystem'))
 
     def test_overlapping_archive_uploaders_share_the_same_nonblocking_lock(self):
         for name in ('opencloud.lock', 'nextcloud.lock'):
@@ -240,34 +242,87 @@ class StorageChecks(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text())['destination'], str(old / 'YandexDisk/Course'))
         self.assertEqual(json.loads((state / 'uuid.json').read_text())['mount'], str(old))
 
-    def test_migration_syncs_metadata_directory_before_mount_marker(self):
+    def test_migration_flushes_filesystem_once_before_mount_marker(self):
         old = self.root / 'old'; new = self.root / 'new'; state = self.root / 'state'
-        path = new / 'YandexDisk/Course/.download/queue.json'; path.parent.mkdir(parents=True)
-        path.write_text(json.dumps({'destination': str(old / 'YandexDisk/Course')}))
-        synced = []; original = os.fsync
-        def sync(fd):
-            synced.append((Path(os.readlink(f'/proc/self/fd/{fd}')), stat.S_ISDIR(os.fstat(fd).st_mode)))
-            original(fd)
-        with patch('storage.os.fsync', side_effect=sync):
+        paths = [new / f'Course/.download/tasks/{i}/task.json' for i in range(3)]
+        for path in paths:
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({'local': str(old / 'video.mp4')}))
+        synced = []; original = storage.sync_directory
+        def flush(path):
+            self.assertFalse((state / 'uuid.json').exists())
+            self.assertFalse((state / 'uuid.tmp').exists())
+            synced.append('filesystem')
+        def directory(path):
+            synced.append(Path(path)); original(path)
+        self.filesystem_sync.side_effect = flush
+        with patch('storage.sync_directory', side_effect=directory):
             storage.migrate(old, new, 'uuid', state)
-        self.assertIn((path.parent, True), synced)
-        self.assertIn((state / 'uuid.tmp', False), synced)
-        self.assertIn((state, True), synced)
-        self.assertLess(synced.index((path.parent, True)), synced.index((state / 'uuid.tmp', False)))
+        self.filesystem_sync.assert_called_once_with(new)
+        self.assertEqual(synced, ['filesystem', state])
+        self.assertEqual(json.loads((state / 'uuid.json').read_text())['mount'], str(new))
 
-    def test_retry_syncs_directory_replaced_before_previous_interruption(self):
+    def test_retry_flushes_filesystem_after_previous_interruption(self):
         old = self.root / 'old'; new = self.root / 'new'; state = self.root / 'state'
-        path = new / 'YandexDisk/Course/.download/queue.json'; path.parent.mkdir(parents=True)
-        path.write_text(json.dumps({'destination': str(old / 'YandexDisk/Course')}))
-        with patch('storage.sync_directory', side_effect=OSError(errno.EIO, 'Directory sync interrupted')):
-            with self.assertRaises(OSError):
+        path = new / 'Course/.download/job.json'; path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({'local': str(old / 'video.mp4')}))
+        self.filesystem_sync.side_effect = storage.StorageUnavailable(new)
+        with self.assertRaises(storage.StorageUnavailable):
+            storage.migrate(old, new, 'uuid', state)
+        self.assertFalse((state / 'uuid.json').exists())
+        self.assertEqual(json.loads(path.read_text())['local'], str(new / 'video.mp4'))
+        self.filesystem_sync.side_effect = None
+        storage.migrate(old, new, 'uuid', state)
+        self.assertEqual(self.filesystem_sync.call_count, 2)
+        storage.migrate(old, new, 'uuid', state)
+        self.assertEqual(self.filesystem_sync.call_count, 2)
+
+    def test_unavailable_disk_during_final_flush_never_commits_mount(self):
+        old = self.root / 'old'; new = self.root / 'new'; state = self.root / 'state'
+        (new / '.download').mkdir(parents=True)
+        writable = [True]
+        self.filesystem_sync.side_effect = lambda path: writable.__setitem__(0, False)
+        with patch('storage.mounted_ok', side_effect=lambda *args: writable[0]):
+            with self.assertRaises(storage.StorageUnavailable):
                 storage.migrate(old, new, 'uuid', state)
         self.assertFalse((state / 'uuid.json').exists())
-        self.assertEqual(json.loads(path.read_text())['destination'], str(new / 'YandexDisk/Course'))
-        original = storage.sync_directory
-        with patch('storage.sync_directory', side_effect=original) as synced:
+
+    def test_device_change_while_waiting_for_migration_lock_rejects_even_fast_path(self):
+        new = self.root / 'new'; state = self.root / 'state'
+        new.mkdir(); state.mkdir()
+        record = state / 'uuid.json'
+        original = json.dumps(dict(mount=str(new), previous=[]))
+        record.write_text(original)
+        expected = new.stat().st_dev; actual = [expected]
+        def lock(*args): actual[0] = expected + 1
+        with patch('storage.fcntl.flock', side_effect=lock), \
+                patch('storage.mounted_ok', side_effect=lambda path, device: device == actual[0]):
+            with self.assertRaises(storage.StorageUnavailable):
+                storage.migrate(new, new, 'uuid', state, expected_device=expected)
+        self.assertEqual(record.read_text(), original)
+        self.filesystem_sync.assert_not_called()
+
+    def test_nested_metadata_filesystem_retains_directory_sync(self):
+        old = self.root / 'old'; new = self.root / 'new'; state = self.root / 'state'
+        path = new / 'Nested/.download/job.json'; path.parent.mkdir(parents=True)
+        path.write_text('{}')
+        original = Path.stat
+        def stat_path(p, *args, **kwargs):
+            if p == path.parent:
+                return SimpleNamespace(st_dev=new.stat().st_dev + 1)
+            return original(p, *args, **kwargs)
+        with patch.object(Path, 'stat', stat_path), patch('storage.sync_directory') as synced:
             storage.migrate(old, new, 'uuid', state)
-        self.assertTrue(any(Path(call.args[0]) == path.parent for call in synced.call_args_list))
+        self.assertIn(unittest.mock.call(str(path.parent)), synced.call_args_list)
+
+    def test_filesystem_flush_uses_native_sync_and_retries_io_failure(self):
+        with patch('storage.subprocess.run') as run:
+            self.native_sync(self.root)
+        run.assert_called_once_with(['sync', '-f', '--', str(self.root)], check=True, capture_output=True)
+        # The class mock avoids flushing the host filesystem in migration tests.
+        with patch('storage.subprocess.run', side_effect=subprocess.CalledProcessError(1, ['sync'], stderr=b'I/O error')):
+            with self.assertRaises(storage.StorageUnavailable):
+                self.native_sync(self.root)
 
     def test_cli_disk_error_has_retryable_exit_code(self):
         with patch('sys.argv', ['download.py', 'download', '--catalog', '/missing', '--destination', '/missing']), \
@@ -281,6 +336,9 @@ class StorageChecks(unittest.TestCase):
 
 
 class SupervisorChecks(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch('storage.sync_filesystem'))
+
     def test_mount_fallback_after_probe_does_not_launch_on_system_disk(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

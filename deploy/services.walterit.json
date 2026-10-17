@@ -1,11 +1,13 @@
 {
   "repo": "/home/geerkics/gitRepos/yds-download",
   "state_dir": "/home/geerkics/.local/state/yds-download",
-  "mount_root": "/run/media/geerkics/088d300e-87f5-4293-999d-80726a0b22502",
+  "mount_root": "/run/media/geerkics/088d300e-87f5-4293-999d-80726a0b22504",
   "disk_uuid": "088d300e-87f5-4293-999d-80726a0b2250",
   "previous_mounts": [
     "/run/media/geerkics/088d300e-87f5-4293-999d-80726a0b2250",
-    "/run/media/geerkics/088d300e-87f5-4293-999d-80726a0b22501"
+    "/run/media/geerkics/088d300e-87f5-4293-999d-80726a0b22501",
+    "/run/media/geerkics/088d300e-87f5-4293-999d-80726a0b22502",
+    "/run/media/geerkics/088d300e-87f5-4293-999d-80726a0b22503"
   ],
   "course_queue": "$mount_root/YandexDisk/.download/semester-queue/queue.json",
   "queue_tuning": {

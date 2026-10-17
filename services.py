@@ -133,7 +133,8 @@ def prepare(config, current):
     if changed and busy:
         raise ValueError('Mount migration requires all services stopped; use restart without a service name')
     if not busy:
-        storage.migrate(config['mount_root'], root, config['disk_uuid'], state, previous=previous)
+        storage.migrate(config['mount_root'], root, config['disk_uuid'], state, previous=previous,
+                        expected_device=device)
     if queue is not None:
         data = storage.read_queue(queue)
         if data.get('tuning') != config['queue_tuning']:
