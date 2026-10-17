@@ -2,6 +2,7 @@
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 from threading import Event
@@ -70,6 +71,25 @@ class FallbackChecks(unittest.TestCase):
         self.assertTrue(result['range_recovered_complete'])
         self.assertTrue(recovery.range_result_current(self.root,self.item,result))
         self.assertFalse(Fallback(self.root,self.link,Event()).ready(self.item))
+        import file_hashes
+        target=d.target(self.root,self.item,'Course')
+        self.assertIsNone(file_hashes.load(target,root=self.root))
+        d.sha256_file(target)
+        hashes=file_hashes.load(target,root=self.root)
+        self.assertEqual(hashes,{name:hashlib.new(name,self.content).hexdigest() for name in file_hashes.ALGORITHMS})
+
+    def test_published_fallback_mutation_does_not_receive_a_hash_cache_proof(self):
+        import file_hashes
+        target=d.target(self.root,self.item,'Course');real_unlink=Path.unlink
+        def changed(path,*args,**kwargs):
+            if path.suffix=='.part' and target.exists():
+                before=target.stat();target.write_bytes(b'x'*len(self.content))
+                os.utime(target,ns=(before.st_atime_ns,before.st_mtime_ns))
+            return real_unlink(path,*args,**kwargs)
+        with patch.object(Path,'unlink',changed):
+            self.fetch()
+        self.assertIsNone(file_hashes.load(target,root=self.root))
+        self.assertNotEqual(d.sha256_file(target),self.item['sha256'])
 
     def test_mismatch_preserves_separate_copy_with_source_suffix(self):
         wrong=b'different video'

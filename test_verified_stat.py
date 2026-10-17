@@ -1,6 +1,7 @@
 """SHA proofs must describe the file version that was actually hashed."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,9 +9,39 @@ from unittest.mock import patch
 
 import download
 import recovery
+import file_hashes
 
 
 class VerifiedStatTests(unittest.TestCase):
+    def test_new_copy_requires_its_own_verification_before_hash_reuse(self):
+        download.sha256_file(self.local)
+        hashes=file_hashes.load(self.local)
+        destination=self.root/'Copy/video.mp4'
+        recovery.copy_saved(self.local,destination,overwrite=False)
+        self.assertIsNone(file_hashes.load(destination))
+        download.sha256_file(destination)
+        self.assertEqual(file_hashes.load(destination),hashes)
+        self.assertEqual(destination.read_bytes(),b'good')
+
+    def test_copy_never_caches_hashes_for_a_destination_changed_during_publication(self):
+        download.sha256_file(self.local)
+        real_sync=recovery.storage.sync_directory
+        for replacement in (False,True):
+            with self.subTest(replacement=replacement):
+                destination=self.root/str(replacement)/'video.mp4'
+                def changed(path):
+                    real_sync(path)
+                    if path!=destination.parent or not destination.exists():return
+                    before=destination.stat()
+                    if replacement:
+                        other=destination.with_suffix('.new');other.write_bytes(b'evil');other.replace(destination)
+                    else:destination.write_bytes(b'evil')
+                    os.utime(destination,ns=(before.st_atime_ns,before.st_mtime_ns))
+                with patch.object(recovery.storage,'sync_directory',side_effect=changed):
+                    recovery.copy_saved(self.local,destination,overwrite=False)
+                self.assertIsNone(file_hashes.load(destination))
+                self.assertNotEqual(download.sha256_file(destination),self.item['sha256'])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

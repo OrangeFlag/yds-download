@@ -23,11 +23,11 @@ import xml.etree.ElementTree as ET
 
 import download as d
 from download import local_path
+from file_hashes import VIDEO
 import network
 import storage
 from upload_concurrency import UploadConcurrency, SharedUploadBudget
 
-VIDEO = {'.mp4', '.mkv', '.mov', '.webm', '.avi', '.m4v', '.ts', '.3gp'}
 PROPERTIES = b'<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:prop><d:resourcetype/><d:getcontentlength/><d:getetag/><oc:checksums/></d:prop></d:propfind>'
 
 

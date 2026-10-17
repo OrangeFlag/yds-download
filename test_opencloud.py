@@ -239,6 +239,23 @@ class UploadChecks(unittest.TestCase):
         self.assertEqual(sum(method=='POST' for method,_,_ in self.server.calls),1)
         self.assertEqual([int(headers['Upload-Offset']) for method,_,headers in self.server.calls if method=='PATCH'],[0,7,14,21])
 
+    def test_download_verification_hashes_are_reused_for_first_upload(self):
+        d.sha256_file(self.local)
+        real_open=Path.open;read_bytes=[]
+        @contextmanager
+        def counted(path,*args,**kwargs):
+            with real_open(path,*args,**kwargs) as stream:
+                if path==self.local and (args[0] if args else kwargs.get('mode'))=='rb':
+                    real_read=stream.read
+                    def read(size=-1):
+                        block=real_read(size);read_bytes.append(len(block));return block
+                    with patch.object(stream,'read',side_effect=read):yield stream
+                else:yield stream
+        with patch.object(Path,'open',counted):
+            self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(sum(read_bytes),len(self.content))
+        self.assertIn(self.content,self.server.files.values())
+
     def test_hash_cache_rejects_modified_video_even_when_size_and_mtime_are_restored(self):
         self.server.fail_move=True
         self.assertEqual(self.uploader.run_once([self.root],upload=True),1)

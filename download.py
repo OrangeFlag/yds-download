@@ -15,25 +15,28 @@ import shutil
 import signal
 import subprocess
 import time
-from threading import RLock, Lock
+from threading import RLock
 import urllib.error
 import urllib.parse
 import urllib.request
 import network
 import storage
+import file_hashes
 from settings import OPTIONS, add_arguments, add_source_arguments, source_settings, validate_source_settings, resolve
 
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), network.HTTPHandler(), network.HTTPSHandler())
 ENV = {k: v for k, v in os.environ.items()
        if k.lower() not in ('http_proxy', 'https_proxy', 'all_proxy')}
 STATE_LOCK = RLock()
-HASH_LOCK = Lock()
+HASH_LOCK = file_hashes.HASH_LOCK
 
 
 saved_local = storage.saved_local
 
 
 def sha256_file(path, stopping=None):
+    if path.suffix.casefold() in file_hashes.VIDEO:
+        return file_hashes.calculate(path, stopping=stopping)['sha256']
     storage.check(path)
     while not HASH_LOCK.acquire(timeout=0.25):
         if stopping is not None and stopping.is_set():

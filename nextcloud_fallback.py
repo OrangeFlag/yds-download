@@ -16,6 +16,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 import download as d
+import file_hashes
 from nextcloud import Index, VIDEO, remote_path, error_details
 import recovery as r
 import storage
@@ -91,18 +92,7 @@ class Fallback:
         return d.local_path(self.root,str(original.with_name(stem+suffix)))
 
     def hash_file(self,path):
-        storage.check(path)
-        while not d.HASH_LOCK.acquire(timeout=.25):
-            if self.stopping.is_set():raise InterruptedError('SHA interrupted')
-        try:
-            hashes={kind:hashlib.new(kind) for kind in ('sha256','sha1','md5')}
-            with path.open('rb') as stream:
-                while block:=stream.read(1024**2):
-                    if self.stopping.is_set():raise InterruptedError('SHA interrupted')
-                    for digest in hashes.values():digest.update(block)
-                os.fsync(stream.fileno())
-            return {kind:digest.hexdigest() for kind,digest in hashes.items()}
-        finally:d.HASH_LOCK.release()
+        return file_hashes.calculate(path,self.stopping,root=self.root)
 
     def retained(self,candidate,retained_hashes,retained_digests):
         remote={kind.lower():value.lower() for kind,value in re.findall(

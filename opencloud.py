@@ -20,6 +20,7 @@ import urllib.parse
 import urllib.request
 
 import download as d
+import file_hashes
 import nextcloud
 import storage
 
@@ -301,29 +302,26 @@ class Uploader(nextcloud.Sync):
                 row.update(state='existing',error_type=None,http_status=None,error_reason=None,error_errno=None)
                 self.save_record(job,row)
             print('OPENCLOUD EXISTS (metadata): '+item['path'],flush=True);return False
+        shared=file_hashes.load(local,root=root)
         cached=row.get('local_fingerprint')==list(fingerprint) and all(
             isinstance(row.get(key),str) and re.fullmatch('[0-9a-f]{'+str(length)+'}',row[key])
             for key,length in (('payload_sha256',64),('payload_sha1',40),('payload_md5',32)))
-        if cached:
+        if shared:
+            actual,sha1,md5=(shared[key] for key in file_hashes.ALGORITHMS)
+            print('OPENCLOUD HASH CACHED: '+item['path'],flush=True)
+        elif cached:
             actual,sha1,md5=(row[key] for key in ('payload_sha256','payload_sha1','payload_md5'))
+            file_hashes.save(local,dict(zip(file_hashes.ALGORITHMS,(actual,sha1,md5))),fingerprint,root=root)
             print('OPENCLOUD HASH CACHED: '+item['path'],flush=True)
         else:
             print('OPENCLOUD HASH START: '+item['path']+f'; bytes={size}',flush=True)
-            digest=hashlib.sha256();sha1=hashlib.sha1();md5=hashlib.md5()
-            started=last_log=time.monotonic();read_bytes=0
-            with local.open('rb') as stream:
-                while chunk:=stream.read(1024**2):
-                    if self.stopping.is_set():raise InterruptedError('OpenCloud upload interrupted')
-                    storage.check(local);digest.update(chunk);sha1.update(chunk);md5.update(chunk)
-                    read_bytes+=len(chunk)
-                    if time.monotonic()-last_log>=30:
-                        print(f'OPENCLOUD HASH PROGRESS: {item["path"]}; {read_bytes}/{size} bytes',flush=True)
-                        last_log=time.monotonic()
-            after=local.stat()
-            if read_bytes!=size or (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)!=fingerprint:
-                raise RuntimeError('Local video changed during hashing')
-            actual,sha1,md5=digest.hexdigest(),sha1.hexdigest(),md5.hexdigest()
-            print(f'OPENCLOUD HASH DONE: {item["path"]}; bytes={read_bytes}; seconds={time.monotonic()-started:.3f}',flush=True)
+            started=time.monotonic()
+            def progress(amount,total):
+                print(f'OPENCLOUD HASH PROGRESS: {item["path"]}; {amount}/{total} bytes',flush=True)
+            shared=file_hashes.calculate(local,self.stopping,root=root,progress=progress)
+            actual,sha1,md5=(shared[key] for key in file_hashes.ALGORITHMS)
+            print(f'OPENCLOUD HASH DONE: {item["path"]}; bytes={size}; seconds={time.monotonic()-started:.3f}',flush=True)
+        if file_hashes.fingerprint(local)!=list(fingerprint):raise RuntimeError('Local video changed during hashing')
         if variant=='original' and actual!=item['sha256'] or variant=='camrip' and actual!=item['payload_sha256']:
             raise RuntimeError('Local SHA-256 mismatch')
         stage=str(PurePosixPath(target).parent/('.yds-'+actual+'.upload'))
