@@ -576,6 +576,104 @@ class PipelineChecks(unittest.TestCase):
                 patch('pipeline.transfer_process', side_effect=transfer):
             self.assertEqual(download.download(self.data, ['First', 'Second'], self.root, retries=0), 0)
 
+    def test_restart_starts_unfinished_sha_before_earlier_course_transfer(self):
+        base=self.root
+        for state_name in ('pending','running'):
+            with self.subTest(state=state_name):
+                self.root=base/state_name;state=self.root/'.download';state.mkdir(parents=True)
+                local=self.root/'Second/video.mp4';local.parent.mkdir();local.write_bytes(self.content)
+                bg=pipeline.Background(self.root,self.data['source'],0,pipeline.resolve())
+                bg.checkpoint(self.items['Second'],'Second',1,'verifying')
+                bg.submit('sha',self.items['Second'],'Second',1)
+                next(iter(bg.futures.values())).result();bg.close()
+                task=next((state/'tasks').glob('*.json'));job=json.loads(task.read_text())
+                job.update(state=state_name);job.pop('result',None);download.write_json(task,job)
+                started=Event();real_inspect=download.inspect
+                def inspect(root,item,*args,**kwargs):
+                    if item['path']==self.items['Second']['path']:started.set()
+                    return real_inspect(root,item,*args,**kwargs)
+                def transfer(command,**kwargs):
+                    self.assertTrue(started.wait(2),'Unfinished SHA waited behind earlier course')
+                    return self.transfer(command,**kwargs)
+                with patch.object(download,'list_course',side_effect=lambda source,course,*args:[self.items[course]]), \
+                        patch.object(download,'inspect',side_effect=inspect), \
+                        patch('pipeline.transfer_process',side_effect=transfer):
+                    self.assertEqual(download.download(self.data,['First','Second'],self.root,retries=0),0)
+
+    def test_restart_never_submits_sha_for_a_superseded_resume_binding(self):
+        state=self.root/'.download';state.mkdir()
+        local=self.root/'Second/video.mp4';local.parent.mkdir();local.write_bytes(self.content)
+        bg=pipeline.Background(self.root,self.data['source'],0,pipeline.resolve())
+        bg.checkpoint(self.items['Second'],'Second',1,'verifying')
+        bg.submit('sha',self.items['Second'],'Second',1)
+        next(iter(bg.futures.values())).result();bg.close()
+        changed=b'changed';local.write_bytes(changed)
+        download.write_json(state/'resume-identities.json',{self.items['Second']['path']:
+                            dict(size=len(changed),sha256=hashlib.sha256(changed).hexdigest())})
+        real_submit=pipeline.Background.submit
+        def submit(background,kind,item,*args,**kwargs):
+            self.assertFalse(kind=='sha' and item['sha256']==self.items['Second']['sha256'],
+                             'Obsolete SHA task submitted against a replacement')
+            return real_submit(background,kind,item,*args,**kwargs)
+        class StartupChecked(Exception):pass
+        with patch.object(download,'list_course',side_effect=lambda source,course,*args:[self.items[course]]), \
+                patch.object(pipeline.Background,'submit',submit), \
+                patch('pipeline.transfer_process',side_effect=StartupChecked):
+            with self.assertRaises(StartupChecked):
+                download.download(self.data,['First','Second'],self.root,retries=0)
+        self.assertEqual(local.read_bytes(),changed)
+
+    def test_completed_old_sha_cannot_archive_a_new_download(self):
+        self.check_superseded_sha(False)
+
+    def test_failed_old_sha_cannot_abort_a_new_download(self):
+        self.check_superseded_sha(True)
+
+    def check_superseded_sha(self, raises):
+        state = self.root / '.download'
+        state.mkdir()
+        item = self.items['Second']
+        local = self.root / 'Second/video.mp4'
+        local.parent.mkdir()
+        local.write_bytes(self.content)
+        changed = b'changed'
+        replacement = dict(item, sha256=hashlib.sha256(changed).hexdigest())
+        download.bind_resume(self.root, [item], {}, {}, False)
+        started, release = Event(), Event()
+        bg = pipeline.Background(self.root, self.data['source'], 0, pipeline.resolve())
+        bg.bindings = {item['path']: item}
+        self.addCleanup(bg.close)
+        self.addCleanup(release.set)
+        bg.checkpoint(item, 'Second', 1, 'verifying')
+        def inspect(*args, **kwargs):
+            started.set()
+            self.assertTrue(release.wait(2))
+            if raises:
+                raise FileNotFoundError('Old source body was archived')
+            return 'invalid', 'File changed during SHA verification'
+        with patch.object(download, 'inspect', side_effect=inspect):
+            bg.submit('sha', item, 'Second', 1)
+            self.assertTrue(started.wait(2))
+            download.bind_resume(self.root, [replacement], {item['path']: item}, {}, False)
+            bg.bindings.update({replacement['path']: replacement})
+            bg.checkpoint(replacement, 'Second', 1, 'downloading')
+            local.write_bytes(changed)
+            control = Path(str(local) + '.aria2')
+            control.write_bytes(b'resume')
+            release.set()
+            future = next(iter(bg.futures.values()))
+            if raises:
+                with self.assertRaises(FileNotFoundError):
+                    future.result()
+            else:
+                future.result()
+            bg.poll()
+        self.assertEqual(local.read_bytes(), changed)
+        self.assertTrue(control.exists())
+        self.assertEqual(bg.continuation(replacement)['phase'], 'downloading')
+        self.assertFalse(bg.jobs)
+        self.assertFalse(list(download.read_events(state / 'events.jsonl')))
+
     def test_range_does_not_block_next_course(self):
         self.items['First']['size'] = 20
         def ranges(root, event, item, *args, **kwargs):

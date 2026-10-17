@@ -154,6 +154,7 @@ class Background:
         self.pools = {kind: ThreadPoolExecutor(max_workers=range_files if kind == 'range' else 1, thread_name_prefix=kind) for kind in ('sha', 'range')}
         self.futures = {}
         self.jobs = {}
+        self.bindings = {}
         self.deferred = {}
         self.defer_range = defer_range
         self.budget = budget
@@ -440,6 +441,14 @@ class Background:
                 break
             if not future.done():
                 continue
+            job = self.jobs[path]
+            item = job['item']
+            current = self.bindings.get(item['path'], item)
+            if (job['kind'] == 'sha'
+                    and (current.get('size'), current.get('sha256')) != (item['size'], item['sha256'])):
+                # Superseded hashes may also fail when bind_resume archives their old body.
+                completed.append((path, job))
+                continue
             try:
                 job = future.result()
             except (CancelledError, InterruptedError):
@@ -641,10 +650,19 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                                 opencloud_fallback=opencloud_fallback,download_budget=download_budget)
         if remote_index:
             remote_index.stopping=background.stopping
+        bindings = {}
+        for manifest in sorted(state.glob('*-manifest.json'), key=lambda path: path.stat().st_mtime_ns):
+            bindings.update({row['path']: row for row in json.loads(manifest.read_text())})
+        identities = state / 'resume-identities.json'
+        if identities.exists():
+            bindings.update(json.loads(identities.read_text()))
+        background.bindings = bindings
         for path in background.directory.glob('*.json'):
             job = json.loads(path.read_text())
+            current = bindings.get(job['item']['path'], job['item'])
             if (job['source'] == source and job['course'] in courses
-                    and job['kind'] == 'sha' and job['state'] == 'done'
+                    and job['kind'] == 'sha' and job['state'] in ('pending', 'running', 'done')
+                    and (current.get('size'), current.get('sha256')) == (job['item']['size'], job['item']['sha256'])
                     and background.continuation(job['item']).get('phase') == 'verifying'):
                 background.submit('sha', job['item'], job['course'], job['attempt'])
         if report_repo:
@@ -717,6 +735,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                 for manifest in sorted(state.glob('*-manifest.json'), key=lambda path: path.stat().st_mtime_ns):
                     old_entries.update({row['path']: row for row in json.loads(manifest.read_text())})
                 d.bind_resume(root, entries, old_entries, events, False)
+                background.bindings.update({item['path']: item for item in entries})
                 d.write_json(state / f'{index:02d}-manifest.json', [{key: item[key] for key in ('path', 'size', 'sha256', 'md5') if key in item} for item in entries])
                 active[course] = index, entries
                 pending = []
