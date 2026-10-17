@@ -144,7 +144,7 @@ class CloudChecks(unittest.TestCase):
         with patch.object(self.server,'listing',side_effect=TimeoutError('offline')) as listing:
             for _ in range(2):
                 with self.assertRaises(TimeoutError):index.candidates(self.data,self.item)
-            self.assertEqual(listing.call_count,1)
+            self.assertEqual(listing.call_count,3)
         self.assertEqual(self.server.gets,[])
 
     def test_existing_valid_original_skips_both_remote_sources(self):

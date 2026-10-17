@@ -22,6 +22,7 @@ import urllib.request
 import download as d
 import file_hashes
 import nextcloud
+import network
 import storage
 
 
@@ -165,7 +166,8 @@ class Uploader(nextcloud.Sync):
             if folder in seen:continue
             seen.add(folder)
             self.known_folders.add(folder)
-            for row in self.share.listing(folder):
+            rows=network.retry_request(lambda:self.share.listing(folder),self.stopping,target='OpenCloud catalog '+folder)
+            for row in rows:
                 path=row.get('download_path',row['path'])
                 if row['directory']:
                     if path and path!=folder:folders.append(path)

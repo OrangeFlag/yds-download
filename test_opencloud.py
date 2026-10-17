@@ -511,6 +511,20 @@ class UploadChecks(unittest.TestCase):
         jobs=self.uploader.jobs([partial,self.root])
         self.assertEqual([j[5] for j in jobs],['original'])
 
+    def test_scan_retries_transient_read_without_restarting_completed_folders(self):
+        import ssl
+        calls=[]
+        def listing(folder):
+            calls.append(folder)
+            if not folder:return [dict(path='Course',directory=True)]
+            if calls.count(folder)==1:
+                raise urllib.error.URLError(ssl.SSLEOFError(8,'unexpected TLS EOF'))
+            return [dict(path='Course/video.mp4',directory=False,size=1)]
+        with patch.object(self.server,'listing',side_effect=listing):
+            rows=self.uploader.scan()
+        self.assertEqual(calls,['','Course','Course'])
+        self.assertEqual([r['path'] for r in rows],['Course/video.mp4'])
+
     def test_postprocessing_visibility_delay_does_not_repeat_upload(self):
         original=self.server.listing;calls=[]
         def listing(folder):
