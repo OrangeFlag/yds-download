@@ -389,6 +389,24 @@ class UploadChecks(unittest.TestCase):
             self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
         self.assertEqual(self.server.calls,[])
 
+    def test_camrip_uses_its_own_archive_when_source_is_shared_across_roots(self):
+        (self.state/'events.jsonl').write_text('')
+        record=dict(local=str(self.local),source=self.data['source'],size=len(self.content),
+            mtime_ns=self.local.stat().st_mtime_ns,actual_sha256=self.item['sha256'],
+            original_sha256=self.item['sha256'],original_size=len(self.content),
+            match=dict(course_path='/Course',file='Lecture.mp4',sheet='2024 осень'))
+        d.write_json(self.state/'recordings.json',[record])
+        with tempfile.TemporaryDirectory() as other_dir:
+            other=Path(other_dir)
+            state=other/'.download'
+            state.mkdir()
+            d.write_json(state/'source.json',self.data)
+            d.write_json(state/'01-manifest.json',[])
+            jobs=self.uploader.jobs([self.root,other])
+        self.assertEqual(len(jobs),1)
+        self.assertEqual(jobs[0][1],self.root)
+        self.assertEqual(jobs[0][5],'camrip')
+
     def test_camrip_is_used_only_without_local_original(self):
         record=dict(local=str(self.local),source=self.data['source'],size=len(self.content),mtime_ns=self.local.stat().st_mtime_ns,
             actual_sha256=self.item['sha256'],original_sha256=self.item['sha256'],original_size=len(self.content),
