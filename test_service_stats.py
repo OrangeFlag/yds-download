@@ -91,5 +91,35 @@ class StatsTests(unittest.TestCase):
             result=stats.collect(cfg,[])
         self.assertTrue(result['directions']['download']['stale'])
 
+    def test_readable_output_preserves_unknown_zero_and_stale_aggregated_slots(self):
+        data=dict(now=2000,cutoff=None,summaries={name:dict(first=None,last=None,files=stats.Counter(),
+                  progress=stats.Counter(),errors=stats.Counter()) for name in ('queue','range','nextcloud','opencloud')},
+                  directions={'download':dict(traffic={'yandex':dict(bytes=1_500_000_000,measured=True,mbit_s=0)},
+                      members=[dict(name='yandex',active=2,waiting=1),dict(name='yandex',active=1,waiting=2)],
+                      controller={'limit':8},age=190,stale=True)},
+                  services={},queue_states={'queue.json':{'pending':3,'finished':1}},
+                  tasks={'range:pending':2},gauges={},metrics_age=None,host={},disk={},warnings=[])
+        output=io.StringIO()
+        with patch.object(stats,'collect',return_value=data),patch('sys.stdout',output):
+            stats.show({},['queue'])
+        rendered=output.getvalue()
+        for heading in ('ПЕРЕДАЧИ','СЕРВИСЫ И ПАМЯТЬ','ОЧЕРЕДИ','СЕТЬ И ДИСК','ПРОБЛЕМЫ ЗА ПЕРИОД','ОХВАТ ЖУРНАЛОВ'):
+            self.assertIn(heading,rendered)
+        yandex=next(line for line in rendered.splitlines() if 'Yandex' in line)
+        self.assertIn('≥1.5 ГБ',yandex)
+        self.assertIn('0.00',yandex)
+        self.assertEqual(yandex.split()[-2:],['3*','3*'])
+        self.assertIn('нет данных',rendered)
+        self.assertIn('УСТАРЕЛ',rendered)
+        self.assertIn('включая ротации',rendered)
+        self.assertIn('Нет свежего снимка Range/Recheck.',rendered)
+        self.assertNotIn("{'",rendered)
+        self.assertEqual(stats.size_label(0),'0.0 Б')
+        self.assertEqual(stats.age_label(None),'нет данных')
+        data['gauges']={'range_active_files':4}
+        with patch.object(stats,'collect',return_value=data),patch('sys.stdout',io.StringIO()) as output:
+            stats.show({},['queue'])
+        self.assertIn('Всего активных файлов: 4.',output.getvalue())
+
 
 if __name__=='__main__':unittest.main()

@@ -7,6 +7,7 @@ import re
 import shutil
 from string import Template
 import subprocess
+import textwrap
 import time
 
 import storage
@@ -241,52 +242,122 @@ def collect(config,names,seconds=None):
                 metrics_age=now-latest_time if latest_time else None)
 
 
+def print_table(headers,rows,right=()):
+    rows=[list(map(str,row)) for row in [headers,*rows]]
+    widths=[max(len(row[i]) for row in rows) for i in range(len(headers))]
+    for index,row in enumerate(rows):
+        print('  '.join(value.rjust(widths[i]) if i in right else value.ljust(widths[i])
+                        for i,value in enumerate(row)).rstrip())
+        if index==0:print('  '.join('─'*width for width in widths))
+
+
+def size_label(value):
+    for unit in ('Б','КБ','МБ','ГБ','ТБ'):
+        if value<1000 or unit=='ТБ':return f'{value:.1f} {unit}'
+        value/=1000
+
+
+def age_label(value):
+    if value is None or value==float('inf'):return 'нет данных'
+    if value<60:return f'{max(0,value):.0f} с'
+    if value<3600:return f'{value/60:.0f} мин'
+    return f'{value/3600:.1f} ч'
+
+
 def show(config,names,seconds=None):
     data=collect(config,names,seconds)
+    labels=dict(queue='Загрузчик',range='Range',yandex='Yandex',nextcloud='Nextcloud',opencloud='OpenCloud')
+    states=dict(finished='Готово',done='Готово',recovering='Range',running='В работе',pending='Ожидают',
+                active='работает',inactive='остановлен',failed='сбой',activating='запускается',deactivating='останавливается')
+    def date(stamp):return datetime.fromtimestamp(stamp).astimezone().strftime('%d.%m.%Y %H:%M:%S %Z')
     first=[s['first'] for s in data['summaries'].values() if s['first'] is not None]
     start=data['cutoff'] if data['cutoff'] is not None else min(first,default=data['now'])
-    print('Период: '+datetime.fromtimestamp(start).astimezone().isoformat(timespec='seconds')+' — '+
-          datetime.fromtimestamp(data['now']).astimezone().isoformat(timespec='seconds')+'; МБ=10⁶ байт, Мбит/с=10⁶ бит/с')
-    for name,row in data['services'].items():
-        stat=row.get('memory.stat',{});events=row.get('memory.events',{})
-        print(f'{name}: {row.get("ActiveState","?")}; рестартов={row.get("NRestarts","?")}; '
-              f'память={number(row.get("MemoryCurrent",0)) / 1024**2:.0f} МиБ '
-              f'(anon={number(stat.get("anon",0))/1024**2:.0f}, cache={number(stat.get("file",0))/1024**2:.0f}); '
-              f'OOM={events.get("oom_kill","?")}; memory.high={events.get("high","?")}')
-    for name,summary in data['summaries'].items():
-        if summary['first'] is not None:
-            print(f'Логи {name}: '+datetime.fromtimestamp(summary['first']).isoformat(timespec='seconds')+' — '+
-                  datetime.fromtimestamp(summary['last']).isoformat(timespec='seconds'))
-    print('\nПередачи: источник | завершения файлов | подтверждённые МБ за период | текущие Мбит/с')
+    print('СТАТИСТИКА YDS')
+    print('Период: '+date(start)+' — '+date(data['now']))
+    if seconds is None:print('Вся сохранившаяся история журналов, включая ротации.')
+
+    print('\nПЕРЕДАЧИ')
+    rows=[];budgets=[]
     for direction,label in (('download','Скачивание'),('upload','Отправка')):
         group=data['directions'].get(direction,{})
+        members=defaultdict(Counter)
+        for member in group.get('members',[]):
+            members[member['name']].update({k:member.get(k,0) for k in ('active','waiting')})
         for source in SOURCES if direction=='download' else SOURCES[1:]:
-            names_for_direction=('queue','range') if direction=='download' else (source,)
-            files=sum(data['summaries'][n]['files'][source] for n in names_for_direction)
+            logs=('queue','range') if direction=='download' else (source,)
+            files=sum(data['summaries'][n]['files'][source] for n in logs)
             row=group.get('traffic',{}).get(source,{})
-            legacy=sum(data['summaries'][n]['progress'][source] for n in names_for_direction)
+            legacy=sum(data['summaries'][n]['progress'][source] for n in logs)
             amount=row.get('bytes',0) if row.get('measured') else legacy
-            volume=f'≥{amount/1e6:.1f}' if row.get('measured') or legacy else 'нет данных'
-            rate=f'{row["mbit_s"]:.2f}' if row.get('mbit_s') is not None else 'нет свежего замера'
-            print(f'{label} {source} | {files} | {volume} | {rate}')
+            volume='≥'+size_label(amount) if row.get('measured') or legacy else 'нет данных'
+            rate=f'{row["mbit_s"]:.2f}' if row.get('mbit_s') is not None else 'нет данных'
+            active,waiting=(str(members[source][k]) if group else 'нет данных' for k in ('active','waiting'))
+            if group.get('stale'):active+='*';waiting+='*'
+            rows.append((label,labels[source],files,volume,rate,active,waiting))
         if group:
-            print('  Устаревший снимок слотов:' if group['stale'] else '  Общий лимит файлов:',
-                  group['controller'].get('limit'),f'; возраст={group["age"]:.0f} с; active/waiting:',
-                  [(m['name'],m.get('active',0),m.get('waiting',0)) for m in group['members']])
-    print('\nОчереди архивов:',data['queue_states'],'; SHA/Range по свежим метрикам:',dict(data['tasks']))
-    print('Range/Recheck:',{k:v for k,v in data['gauges'].items() if k.startswith('range_')})
-    print('Возраст свежих метрик:',f'{data["metrics_age"]:.0f} с' if data['metrics_age'] is not None else 'нет свежих данных')
-    print('Свободно ГиБ:',{k:round(v/1024**3,1) for k,v in data['disk'].items()})
-    for key,value in data['host'].items():
-        if key.startswith('rx_bytes:'):
-            iface=key.split(':',1)[1]
-            print(f'Интерфейс {iface} (весь трафик): вход={value*8/1e6:.2f}, '
-                  f'выход={data["host"].get("tx_bytes:"+iface,0)*8/1e6:.2f} Мбит/с')
-    if 'disk_busy_ms' in data['host']:print(f'Занятость диска: {data["host"]["disk_busy_ms"]/10:.1f}%')
-    for name in names:
-        summary=data['summaries'][name]
-        print(name+' ошибки за период:',sum(summary['errors'].values()))
-        for (kind,detail),count in summary['errors'].most_common(3):print(f'  {count}× {kind}: {detail}')
-    for warning in data['warnings']:print('ВНИМАНИЕ:',warning)
-    print('Объёмы — минимум по доступным снимкам/прогрессу; старые неизвестные байты не считаются нулём. '
-          'Завершения файлов — события журналов, включая проверку SHA; скорости подтверждённых байтов исключают служебный трафик и Range.')
+            status='УСТАРЕЛ' if group['stale'] else 'снимок'
+            budgets.append(f'{label}: лимит файлов — {group["controller"].get("limit","?")}; {status} {age_label(group["age"])}.')
+    print_table(('Направление','Источник','Файлы*','Объём','Мбит/с','Активно','Ждут'),rows,right=(2,3,4,5,6))
+    for line in budgets:print(line)
+    if any(g.get('stale') for g in data['directions'].values()):print('* Слоты со звёздочкой — устаревшие данные.')
+
+    print('\nСЕРВИСЫ И ПАМЯТЬ (МиБ)')
+    rows=[]
+    for name,row in data['services'].items():
+        stat=row.get('memory.stat',{});events=row.get('memory.events',{})
+        state=row.get('ActiveState','?')
+        rows.append((labels.get(name,name),states.get(state,state),f'{number(row.get("MemoryCurrent",0))/1024**2:.0f}',
+                     f'{number(stat.get("anon",0))/1024**2:.0f}',f'{number(stat.get("file",0))/1024**2:.0f}',
+                     row.get('NRestarts','?'),events.get('oom_kill','?'),events.get('high','?')))
+    if rows:print_table(('Сервис','Состояние','Всего','anon','cache','Рестарты','OOM','high'),rows,right=range(2,8))
+    else:print('Нет данных о сервисах.')
+    print('anon — память процессов; cache — файловый кэш; OOM/high — события с запуска.')
+
+    print('\nОЧЕРЕДИ')
+    queue_states=data['queue_states']
+    if queue_states:
+        keys=sorted({key for counts in queue_states.values() for key in counts})
+        queue_labels={'queue.json':'Курсы','personal-queue.json':'Личный диск'}
+        print_table(('Архивы',*(states.get(k,k) for k in keys)),
+                    [(queue_labels.get(name,name),*(counts.get(k,0) for k in keys))
+                     for name,counts in sorted(queue_states.items())],right=range(1,len(keys)+1))
+    else:print('Нет данных об очередях архивов.')
+    if data['tasks']:
+        print('\nЗадачи по свежим метрикам:')
+        print_table(('Задача','Состояние','Файлов'),[(key.partition(':')[0],states.get(key.partition(':')[2],key.partition(':')[2]),count)
+                    for key,count in sorted(data['tasks'].items())],right=(2,))
+    gauges=data['gauges']
+    if any(k.startswith('range_') for k in gauges):
+        print('\nФоновое восстановление:')
+        print_table(('Обработчик','Активных файлов','Подходящих файлов'),
+                    [('Range',gauges.get('range_regular_active_files','нет данных'),gauges.get('range_eligible_files','нет данных')),
+                     ('Recheck',gauges.get('range_recheck_active_files','нет данных'),gauges.get('range_recheck_eligible_files','нет данных'))],right=(1,2))
+        if 'range_active_files' in gauges:print(f'Всего активных файлов: {gauges["range_active_files"]}.')
+    else:print('Нет свежего снимка Range/Recheck.')
+    print('Возраст свежих метрик: '+age_label(data['metrics_age'])+'.')
+
+    print('\nСЕТЬ И ДИСК')
+    interfaces=[(key.split(':',1)[1],f'{value*8/1e6:.2f}',f'{data["host"].get("tx_bytes:"+key.split(":",1)[1],0)*8/1e6:.2f}')
+                for key,value in sorted(data['host'].items()) if key.startswith('rx_bytes:')]
+    if interfaces:print_table(('Интерфейс (весь трафик)','Вход, Мбит/с','Выход, Мбит/с'),interfaces,right=(1,2))
+    else:print('Нет свежих замеров сети.')
+    free='; '.join({'system':'системный','archive':'архивный'}.get(k,k)+f': {v/1024**3:.1f} ГиБ' for k,v in data['disk'].items())
+    print('Свободно: '+(free or 'нет данных')+'.')
+    if 'disk_busy_ms' in data['host']:print(f'Занятость диска: {data["host"]["disk_busy_ms"]/10:.1f}%.')
+
+    print('\nПРОБЛЕМЫ ЗА ПЕРИОД')
+    for warning in data['warnings']:print('ВНИМАНИЕ: '+warning)
+    errors=[(name,data['summaries'][name]['errors']) for name in names if data['summaries'][name]['errors']]
+    if not errors:print('В доступных журналах записей об ошибках нет.')
+    for name,counts in errors:
+        print(f'{labels.get(name,name)}: сообщений об ошибках — {sum(counts.values())}; частые:')
+        for (kind,detail),count in counts.most_common(3):
+            print(textwrap.fill(f'{count}× {kind.rstrip(":")}: {detail}',width=100,initial_indent='  ',subsequent_indent='    '))
+
+    print('\nОХВАТ ЖУРНАЛОВ')
+    coverage=[(labels.get(name,name),date(s['first']),date(s['last'])) for name,s in data['summaries'].items() if s['first'] is not None]
+    if coverage:print_table(('Сервис','Первая запись','Последняя запись'),coverage)
+    else:print('Нет сохранившихся записей.')
+    print('\n≥ — подтверждённый минимум; нет данных — неизвестно, а не ноль. КБ/МБ/ГБ — десятичные.')
+    print('Файлы* — события завершения, включая повторную проверку SHA. Скорость — подтверждённые байты;')
+    print('служебный трафик, Range и непринятые повторы не входят. Мбит/с: нужен свежий замер от 30 с.')
