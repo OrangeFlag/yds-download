@@ -231,7 +231,9 @@ class Fallback:
                             storage.check(self.root)
                             block=response.read(1024**2)
                             if not block:break
-                            if self.budget is not None:self.budget.confirmed(len(block))
+                            if self.budget is not None:
+                                self.budget.confirmed(len(block))
+                                self.budget.update()
                             if offset+len(block)>size:raise RuntimeError('Nextcloud sent more bytes than advertised')
                             stream.write(block);offset+=len(block)
                             if time.monotonic()-last>=30:

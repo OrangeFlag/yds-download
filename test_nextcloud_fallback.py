@@ -24,6 +24,33 @@ class Response(io.BytesIO):
 
 
 class FallbackChecks(unittest.TestCase):
+    def test_long_cloud_download_publishes_bytes_before_slot_release(self):
+        from upload_concurrency import SharedUploadBudget
+        for label in ('NEXTCLOUD', 'OPENCLOUD'):
+            with self.subTest(label=label):
+                budget = SharedUploadBudget(self.root / (label+'-budget'), label.lower())
+                self.addCleanup(budget.close)
+                reads = [0]
+                class Streaming(Response):
+                    def read(response, amount=-1):
+                        if reads[0]:
+                            state = json.loads((budget.directory / 'state.json').read_text())
+                            self.assertEqual(state['transfer_stats']['sources'][label.lower()], reads[0])
+                            self.assertEqual(state['members'][budget.key]['active'], 1)
+                        clock.return_value += 2
+                        block = super().read(min(amount, 4))
+                        reads[0] += len(block)
+                        return block
+                with patch('time.monotonic', return_value=100) as clock, \
+                        patch.object(nextcloud.Share, 'listing', return_value=[self.row]), \
+                        patch.object(nextcloud.Share, 'request', return_value=Streaming(self.content)):
+                    fallback = Fallback(self.root, self.link, Event(), budget=budget, label=label)
+                    result = fallback.recover(self.item, self.event)
+                self.assertEqual(result['status'], 'valid')
+                self.assertEqual(reads[0], len(self.content))
+                self.assertEqual(json.loads((budget.directory / 'state.json').read_text())
+                                 ['transfer_stats']['sources'][label.lower()], len(self.content))
+
     def test_fallback_urlerror_logs_reason_and_clears_it_after_success(self):
         import socket
         import time

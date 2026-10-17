@@ -74,6 +74,8 @@ class CloudChecks(unittest.TestCase):
                 finally:this.active=False
             def confirmed(this, size):
                 self.assertTrue(this.active);this.total+=size
+            def update(this):
+                self.assertTrue(this.active)
         class Interrupted(Response):
             def read(this, size=-1):
                 if this.tell():raise TimeoutError('interrupted')
