@@ -305,6 +305,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
     changes = []
     reports = []
     totals = {}
+    known_paths = events.keys() | known_external.keys() | known_partial.keys()
     for card in sorted((repo / 'courses').glob('*.md')):
         original = card.read_text(encoding='utf-8')
         year_match = re.search(r'^- Год: (\d+)$', original, re.M)
@@ -317,7 +318,8 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
         if not source_match or not path_match or source_match[1].rstrip('/') != source:
             continue
         prefix = '/' + path_match[1].strip('/') + '/'
-        if not any(key.startswith(normalized(prefix)) for key in events.keys() | known_external.keys() | known_partial.keys()):
+        normalized_prefix = normalized(prefix)
+        if not any(key.startswith(normalized_prefix) for key in known_paths):
             continue
         rows = original.splitlines(keepends=True)
         results = []
