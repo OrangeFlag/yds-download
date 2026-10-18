@@ -96,6 +96,19 @@ class ResumeChecks(unittest.TestCase):
         self.requests.append(request.get_header('Range'))
         raise urllib.error.HTTPError(request.full_url, 500, 'Unavailable', {}, None)
 
+    def test_recovery_builds_event_indexes_without_materializing_journal(self):
+        self.status('finished')
+        original=self.root/'Course/video.mp4'
+        original.parent.mkdir(parents=True)
+        original.write_bytes(self.content)
+        download.write_json(self.state/'01-manifest.json',[self.item])
+        download.append_events(self.state/'events.jsonl',[
+            dict(self.item,status='valid',local=str(original),mtime_ns=original.stat().st_mtime_ns)])
+        with patch.object(download,'read_events',side_effect=AssertionError('Event list materialized')):
+            recovery.reconcile_course(self.root,'Course')
+            self.assertEqual(recovery.recover_corrupted(self.root,self.source,courses=set()),[])
+        self.assertEqual(json.loads((self.state/'course-history.json').read_text())['Course']['verified'],1)
+
     def test_running_archive_resumes_saved_ranges_before_aria2(self):
         with patch.object(download.OPENER, 'open', side_effect=self.serve):
             self.assertEqual(self.run_download(), 0)

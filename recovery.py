@@ -636,7 +636,7 @@ def retry_ranges(root, event, item, retries, tuning=None, stopping=None, downloa
 
 
 def reconcile_course(root, course):
-    from download import read_events, write_json
+    from download import iter_events, write_json
     state = root / '.download'
     history = state / 'course-history.json'
     statuses = json.loads(history.read_text()) if history.exists() else {}
@@ -644,7 +644,7 @@ def reconcile_course(root, course):
     if not status or status.get('state') != 'finished':
         return
     source = json.loads((state / 'source.json').read_text())['source'].rstrip('/')
-    proofs = {row['path']: row for row in read_events(state / 'events.jsonl')}
+    proofs = {row['path']: row for row in iter_events(state / 'events.jsonl')}
     registry = state / 'local-copies.json'
     if registry.exists():
         for row in json.loads(registry.read_text()):
@@ -822,7 +822,7 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
 
 
 def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, mark=None, git_push=False, courses=None, force=False, tuning=None, deep=False):
-    from download import files, write_json, write_failures, read_events
+    from download import files, write_json, write_failures, iter_events
     root = root.resolve()
     candidates = {}
     for manifest in (root / 'corrupted').glob('**/failed.json'):
@@ -838,7 +838,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
             old_rank = (not previous[1].get('sha256_mismatch', False), previous[0], previous[1]['time']) if previous else None
             if previous is None or rank > old_rank:
                 candidates[row['path']] = (amount, row)
-    valid = {row['path']: row for row in read_events(root / '.download/events.jsonl', repair=True)}
+    valid = {row['path']: row for row in iter_events(root / '.download/events.jsonl', repair=True)}
     registry = root / '.download/local-copies.json'
     if registry.exists():
         for row in json.loads(registry.read_text()):
