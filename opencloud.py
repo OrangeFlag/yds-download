@@ -13,7 +13,7 @@ from pathlib import Path, PurePosixPath
 import random
 import re
 import signal
-from threading import Event
+from threading import Event, Lock
 import time
 import urllib.error
 import urllib.parse
@@ -86,6 +86,7 @@ class Uploader(nextcloud.Sync):
         self.folder='ingest/'+client.nickname
         self.index=None
         self._lookup_cache=None
+        self._lookup_lock=Lock()
         self._lookup_generation=0
         self.active_hashes=set()
         self.known_folders=set()
@@ -208,28 +209,29 @@ class Uploader(nextcloud.Sync):
         return result
 
     def _remote_lookup(self):
-        index=self.index
-        size=len(index)
-        generation=self._lookup_generation
-        cached=self._lookup_cache
-        if (cached is not None and cached[0] is index
-                and cached[1]==size and cached[2]==generation):
-            return cached[3]
-        checksums={kind:set() for kind in ('sha256','sha1','md5')}
-        unnamed=set()
-        md5_sizes=set()
-        for row in index:
-            parsed=hashes(row)
-            for kind,digest in parsed.items():
-                checksums[kind].add(digest)
-            if 'md5' in parsed:
-                md5_sizes.add(row['size'])
-            if not parsed:
-                name=re.sub(r'^\d+\s*-\s*','',PurePosixPath(row['path']).name)
-                unnamed.add((row['size'],nextcloud.normalized(name)))
-        result=(checksums,unnamed,md5_sizes)
-        self._lookup_cache=(index,size,generation,result)
-        return result
+        with self._lookup_lock:
+            index=self.index
+            size=len(index)
+            generation=self._lookup_generation
+            cached=self._lookup_cache
+            if (cached is not None and cached[0] is index
+                    and cached[1]==size and cached[2]==generation):
+                return cached[3]
+            checksums={kind:set() for kind in ('sha256','sha1','md5')}
+            unnamed=set()
+            md5_sizes=set()
+            for row in index:
+                parsed=hashes(row)
+                for kind,digest in parsed.items():
+                    checksums[kind].add(digest)
+                if 'md5' in parsed:
+                    md5_sizes.add(row['size'])
+                if not parsed:
+                    name=re.sub(r'^\d+\s*-\s*','',PurePosixPath(row['path']).name)
+                    unnamed.add((row['size'],nextcloud.normalized(name)))
+            result=(checksums,unnamed,md5_sizes)
+            self._lookup_cache=(index,size,generation,result)
+            return result
 
     def exists(self, digest, sha1=None, md5=None):
         checksums,_,_=self._remote_lookup()
@@ -507,7 +509,7 @@ def main():
             result=uploader.run_once(claim(roots),args.upload,args.limit)
             if args.poll_interval is None:break
             if stopping.wait(args.poll_interval):break
-            uploader.index=None;uploader.known_folders.clear()
+            uploader.index=None;uploader._lookup_cache=None;uploader.known_folders.clear()
         return 130 if stopping.is_set() else result
 
 
