@@ -122,6 +122,25 @@ class RegistryReports(unittest.TestCase):
                 self.assertIn('**Статус:** не все видео есть, какие-то не удается скачать', card.read_text())
 
 
+    def test_unmatched_course_prefix_is_normalized_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            state=root/'.download';state.mkdir()
+            source='https://disk.yandex.ru/d/test'
+            download.write_json(state/'source.json',dict(source=source))
+            repo=root/'report'
+            (repo/'courses').mkdir(parents=True)
+            (repo/'courses/absent.md').write_text(
+                '- Год: 2026\n- Источник: [disk]('+source+')\n'
+                '- Путь: `Absent`\n**Статус:** не все видео есть\n')
+            download.append_events(state/'events.jsonl',[
+                dict(path=f'/Other/file-{index}.mp4',source=source,status='missing')
+                for index in range(32)])
+            with patch.object(report,'normalized', wraps=report.normalized) as normalize:
+                report.update_report(root,repo,'Walterit')
+            self.assertLessEqual(
+                sum(call.args[0]=='/Absent/' for call in normalize.call_args_list),1)
+
 class ReportEventCacheChecks(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
