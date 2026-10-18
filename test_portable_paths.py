@@ -65,5 +65,20 @@ class PortablePathChecks(unittest.TestCase):
         self.assertEqual(storage.read_queue(queue_new)['archives'][0]['destination'],str(target))
 
 
+    def test_external_catalog_stays_absolute_across_different_mount_depths(self):
+        external=Path(self.tmp.name)/'config/catalog.json'
+        external.parent.mkdir()
+        external.write_text('{}')
+        queue=self.disk/'YandexDisk/.download/semester-queue/queue.json'
+        queue.parent.mkdir(parents=True)
+        d.write_json(queue,{'archives':[dict(destination=str(self.archive), catalog=str(external))]})
+        stored=json.loads(queue.read_text())
+        self.assertEqual(stored['archives'][0]['catalog'],str(external))
+        new_mount=Path(self.tmp.name)/'nested/deeper/mount'
+        new_mount.parent.mkdir(parents=True)
+        self.disk.rename(new_mount)
+        moved=new_mount/'YandexDisk/.download/semester-queue/queue.json'
+        self.assertEqual(storage.read_queue(moved)['archives'][0]['catalog'],str(external))
+
 if __name__=='__main__':
     unittest.main()

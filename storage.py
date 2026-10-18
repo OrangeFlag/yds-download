@@ -130,7 +130,9 @@ def portable_state(path, data):
     if isinstance(data, dict) and isinstance(data.get('archives'), list):
         def ref(value):
             value = Path(value)
-            return os.path.relpath(value, path.parent) if value.is_absolute() else str(value)
+            return (os.path.relpath(value, path.parent)
+                    if value.is_absolute() and value.is_relative_to(archive or path.parent)
+                    else str(value))
         data = {**data, 'archives': [
             {**entry, **{key: ref(entry[key]) for key in ('destination', 'catalog') if key in entry}}
             for entry in data['archives']]}
