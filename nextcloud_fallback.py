@@ -247,7 +247,7 @@ class Fallback:
             before=self.stamp(part);actual_hashes=self.hash_file(part);actual=actual_hashes['sha256']
             if self.stamp(part)!=before:raise RuntimeError('Fallback file changed while verifying SHA')
             matched=size==item['size'] and actual==item['sha256'].lower()
-            host=urllib.parse.urlsplit(self.index.link).hostname
+            host=urllib.parse.urlsplit(self.link).hostname
             target=d.target(self.root,item,event['course']) if matched else self.mismatch_path(item,host,actual)
             target.parent.mkdir(parents=True,exist_ok=True)
             verified_stat=before

@@ -24,6 +24,23 @@ class Response(io.BytesIO):
 
 
 class FallbackChecks(unittest.TestCase):
+    def test_ru_endpoint_resumes_the_old_download_body(self):
+        class Interrupted(Response):
+            def read(response,amount=-1):
+                if response.tell():raise TimeoutError()
+                return super(Interrupted,response).read(5)
+        with patch.object(nextcloud.Share,'listing',return_value=[self.row]), \
+                patch.object(nextcloud.Share,'request',return_value=Interrupted(self.content)):
+            original=Fallback(self.root,self.link,Event())
+            self.assertIsNone(original.recover(self.item,self.event))
+        new=Fallback(self.root,self.link.replace('://drive.', '://ru.drive.'),Event())
+        self.assertEqual(original.state_path(self.item),new.state_path(self.item))
+        response=Response(self.content[5:],206,{'Content-Range':f'bytes 5-{len(self.content)-1}/{len(self.content)}'})
+        with patch.object(nextcloud.Share,'listing',return_value=[self.row]), \
+                patch.object(nextcloud.Share,'request',return_value=response) as request:
+            self.assertEqual(new.recover(self.item,self.event)['status'],'valid')
+        self.assertEqual(request.call_args.kwargs['headers']['Range'],'bytes=5-')
+
     def test_long_cloud_download_publishes_bytes_before_slot_release(self):
         from upload_concurrency import SharedUploadBudget
         for label in ('NEXTCLOUD', 'OPENCLOUD'):

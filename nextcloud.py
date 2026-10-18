@@ -70,6 +70,14 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def share_identity(url):
+    # Both entry points serve the same shares, receipts and resumable sessions.
+    parsed=urllib.parse.urlsplit(url)
+    if parsed.scheme=='https' and parsed.netloc=='ru.drive.oleja.dev':
+        return parsed._replace(netloc='drive.oleja.dev').geturl()
+    return url
+
+
 class Share:
     def __init__(self, link, timeout=120):
         parsed = urllib.parse.urlsplit(link)
@@ -132,7 +140,7 @@ class Index:
     def __init__(self, root, link, strict=True, stopping=None):
         self.root = Path(root)
         self.share = Share(link,timeout=30)
-        self.link = self.share.url()
+        self.link = share_identity(self.share.url())
         self.strict = strict
         self.stopping = stopping if stopping is not None else Event()
         self.folders = {}
@@ -245,7 +253,7 @@ def saved_remote_files(state, link, source=None, saved=None):
         saved = json.loads(path.read_text())
     if source is None:
         source = json.loads((state/'source.json').read_text())['source']
-    if saved.get('source')!=source or saved.get('share')!=Share(link).url():
+    if saved.get('source')!=source or saved.get('share')!=share_identity(Share(link).url()):
         return {}
     return saved.get('files', {})
 
@@ -333,7 +341,7 @@ class Sync:
                     index.folders={folder:error for folder,error in index.folders.items() if folder in index.retry_at}
             started = {row['path'] for row in self.read(state/(self.ledger_name+'.json'), {}).values()
                        if row.get('state')!='uploaded' and row.get('next_chunk',0)>0
-                       and row.get('source')==data['source'] and row.get('upload_share')==self.share.url()
+                       and row.get('source')==data['source'] and row.get('upload_share')==share_identity(self.share.url())
                        and row.get('nickname')==self.share.nickname}
             proof_index=self.event_indexes.get(root)
             if proof_index is None:
@@ -500,7 +508,7 @@ class Sync:
         with d.STATE_LOCK:
             ledger=json.loads(state.read_text()) if state.exists() else {}
             stamp=local.stat();fingerprint=[stamp.st_ino,stamp.st_size,stamp.st_mtime_ns]
-            key=hashlib.sha256(json.dumps([self.share.url(),self.share.nickname,data['source'],item['path'],item['sha256'],variant,
+            key=hashlib.sha256(json.dumps([share_identity(self.share.url()),self.share.nickname,data['source'],item['path'],item['sha256'],variant,
                                         fingerprint if variant=='partial' else None]).encode()).hexdigest()
             old=ledger.get(key,{})
             journal=state.with_suffix('.jsonl')
@@ -515,7 +523,7 @@ class Sync:
             if old.get('state')=='uploaded':
                 return
             row=dict(key=key,source=data['source'],path=item['path'],size=item['size'],sha256=item['sha256'],variant=variant,
-                     target=target,upload_share=self.share.url(),read_share=Share(self.existing).url() if self.existing else None,
+                     target=target,upload_share=share_identity(self.share.url()),read_share=share_identity(Share(self.existing).url()) if self.existing else None,
                      local=str(local),local_stat=fingerprint,payload_size=size,bytes_percent=percent,state='uploading',
                      time=datetime.now().astimezone().isoformat(),nickname=self.share.nickname,
                      upload_id=old.get('upload_id') or uuid.uuid4().hex,

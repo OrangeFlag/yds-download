@@ -22,6 +22,38 @@ class Response(io.BytesIO):
 
 
 class NextcloudChecks(unittest.TestCase):
+    def test_ru_endpoint_resumes_old_session_and_keeps_completed_receipt(self):
+        old='https://drive.oleja.dev/index.php/s/upload'
+        new=old.replace('://drive.', '://ru.drive.')
+        stopping=Event();sent=[]
+        def request(share,method,path='',data=None,**kwargs):
+            if method=='PROPFIND':
+                response=Response(b'<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>')
+                response.status=207
+                return response
+            if method=='PUT':
+                sent.append((share.url(),path,data.read()))
+                if len(sent)==1:stopping.set()
+            return Response()
+        with patch.object(nextcloud.Share,'request',request):
+            nextcloud.Sync(None,old,stopping,chunk_size=4,transfers=1).run_once([self.root])
+            nextcloud.Sync(None,new,Event(),chunk_size=4,transfers=1).run_once([self.root])
+            nextcloud.Sync(None,new,Event(),chunk_size=4,transfers=1).run_once([self.root])
+        self.assertEqual([row[2] for row in sent],[b'lect',b'ure'])
+        self.assertEqual(sent[0][1].split('/')[0],sent[1][1].split('/')[0])
+        self.assertIn('://ru.drive.',sent[1][0])
+        ledger=json.loads((self.state/'nextcloud-uploads.json').read_text())
+        self.assertEqual(len(ledger),1)
+        self.assertEqual(next(iter(ledger.values()))['state'],'uploaded')
+
+    def test_ru_read_endpoint_reuses_saved_listing_without_aliasing_other_shares(self):
+        old='https://drive.oleja.dev/index.php/s/read'
+        new=old.replace('://drive.', '://ru.drive.')
+        saved=dict(source=self.data['source'],share=nextcloud.Share(old).url(),files={self.item['path']:self.item})
+        self.assertEqual(nextcloud.saved_remote_files(self.state,new,self.data['source'],saved),saved['files'])
+        self.assertEqual(nextcloud.Index(self.root,old).link,nextcloud.Index(self.root,new).link)
+        self.assertNotEqual(nextcloud.Index(self.root,new).link,nextcloud.Index(self.root,new+'-other').link)
+
     def test_backslash_filename_has_a_safe_remote_name_and_traversal_stays_forbidden(self):
         item=dict(self.item,path='/Course/Fibers with I\\O.mp4')
         path=nextcloud.remote_path(self.data,item)
