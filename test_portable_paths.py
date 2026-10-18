@@ -80,5 +80,44 @@ class PortablePathChecks(unittest.TestCase):
         moved=new_mount/'YandexDisk/.download/semester-queue/queue.json'
         self.assertEqual(storage.read_queue(moved)['archives'][0]['catalog'],str(external))
 
+    def test_queue_outside_metadata_preserves_sibling_archives_and_external_catalog(self):
+        queue=self.disk/'queues/queue.json'
+        queue.parent.mkdir()
+        external=Path(self.tmp.name)/'config/catalog.json'
+        external.parent.mkdir()
+        external.write_text('{}')
+        d.write_json(queue,{'archives':[dict(destination=str(self.archive),catalog=str(external))],
+                            'wait_for':dict(destination=str(self.archive))})
+        stored=json.loads(queue.read_text())
+        self.assertFalse(Path(stored['archives'][0]['destination']).is_absolute())
+        self.assertFalse(Path(stored['wait_for']['destination']).is_absolute())
+        self.assertEqual(stored['archives'][0]['catalog'],str(external))
+        new_mount=Path(self.tmp.name)/'nested/deeper/mount'
+        new_mount.parent.mkdir(parents=True)
+        self.disk.rename(new_mount)
+        moved=storage.read_queue(new_mount/'queues/queue.json')
+        expected=str(new_mount/'YandexDisk/Course')
+        self.assertEqual(moved['archives'][0]['destination'],expected)
+        self.assertEqual(moved['wait_for']['destination'],expected)
+        self.assertEqual(moved['archives'][0]['catalog'],str(external))
+
+    def test_outside_queue_relocates_internal_catalog_for_absolute_and_relative_destinations(self):
+        queue=self.disk/'queues/queue.json'
+        queue.parent.mkdir()
+        catalog=self.archive/'.download/catalog.json'
+        catalog.write_text('{}')
+        d.write_json(queue,{'archives':[
+            dict(destination=destination,catalog=str(catalog))
+            for destination in (str(self.archive),'../YandexDisk/Course')]})
+        stored=json.loads(queue.read_text())
+        self.assertTrue(all(not Path(row['catalog']).is_absolute() for row in stored['archives']))
+        new_mount=Path(self.tmp.name)/'nested/deeper/mount'
+        new_mount.parent.mkdir(parents=True)
+        self.disk.rename(new_mount)
+        moved=storage.read_queue(new_mount/'queues/queue.json')
+        for row in moved['archives']:
+            self.assertEqual(row['destination'],str(new_mount/'YandexDisk/Course'))
+            self.assertEqual(row['catalog'],str(new_mount/'YandexDisk/Course/.download/catalog.json'))
+
 if __name__=='__main__':
     unittest.main()

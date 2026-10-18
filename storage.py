@@ -128,13 +128,16 @@ def portable_state(path, data):
             return value
         data = convert(data)
     if isinstance(data, dict) and isinstance(data.get('archives'), list):
-        def ref(value):
+        def ref(value, destination=None):
             value = Path(value)
-            return (os.path.relpath(value, path.parent)
-                    if value.is_absolute() and value.is_relative_to(archive or path.parent)
-                    else str(value))
+            if not value.is_absolute():
+                return str(value)
+            if destination is not None and not any(value.is_relative_to(base) for base in
+                    (archive or path.parent, queue_path(path, destination))):
+                return str(value)
+            return os.path.relpath(value, path.parent)
         data = {**data, 'archives': [
-            {**entry, **{key: ref(entry[key]) for key in ('destination', 'catalog') if key in entry}}
+            {**entry, **{key: ref(entry[key], entry.get('destination', path.parent) if key == 'catalog' else None) for key in ('destination', 'catalog') if key in entry}}
             for entry in data['archives']]}
         if data.get('wait_for') and 'destination' in data['wait_for']:
             data['wait_for'] = {**data['wait_for'], 'destination': ref(data['wait_for']['destination'])}
