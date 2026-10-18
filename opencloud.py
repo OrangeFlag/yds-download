@@ -85,6 +85,8 @@ class Uploader(nextcloud.Sync):
         self.chunk_size,self.retries=chunk_size,retries
         self.folder='ingest/'+client.nickname
         self.index=None
+        self._lookup_cache=None
+        self._lookup_generation=0
         self.active_hashes=set()
         self.known_folders=set()
         self.durable_checkpoint_dirs=set()
@@ -201,18 +203,43 @@ class Uploader(nextcloud.Sync):
         if total!=row['size']:raise RuntimeError('Incomplete OpenCloud verification read')
         result=digest.hexdigest()
         row.setdefault('checksums',[]).append('SHA256:'+result)
+        self._lookup_generation+=1
+        self._lookup_cache=None
+        return result
+
+    def _remote_lookup(self):
+        index=self.index
+        size=len(index)
+        generation=self._lookup_generation
+        cached=self._lookup_cache
+        if (cached is not None and cached[0] is index
+                and cached[1]==size and cached[2]==generation):
+            return cached[3]
+        checksums={kind:set() for kind in ('sha256','sha1','md5')}
+        unnamed=set()
+        md5_sizes=set()
+        for row in index:
+            parsed=hashes(row)
+            for kind,digest in parsed.items():
+                checksums[kind].add(digest)
+            if 'md5' in parsed:
+                md5_sizes.add(row['size'])
+            if not parsed:
+                name=re.sub(r'^\d+\s*-\s*','',PurePosixPath(row['path']).name)
+                unnamed.add((row['size'],nextcloud.normalized(name)))
+        result=(checksums,unnamed,md5_sizes)
+        self._lookup_cache=(index,size,generation,result)
         return result
 
     def exists(self, digest, sha1=None, md5=None):
-        return any(hashes(row).get('sha256')==digest or sha1 is not None and hashes(row).get('sha1')==sha1
-                   or md5 is not None and hashes(row).get('md5')==md5
-                   for row in self.index)
+        checksums,_,_=self._remote_lookup()
+        return (digest in checksums['sha256'] or sha1 is not None and sha1 in checksums['sha1']
+                or md5 is not None and md5 in checksums['md5'])
 
     def name_exists(self, name, size):
-        def plain(value):
-            return nextcloud.normalized(re.sub(r'^\d+\s*-\s*','',PurePosixPath(value).name))
-        return any(row['size']==size and plain(row['path'])==plain(name) and not hashes(row)
-                   for row in self.index)
+        _,unnamed,_=self._remote_lookup()
+        name=re.sub(r'^\d+\s*-\s*','',PurePosixPath(name).name)
+        return (size,nextcloud.normalized(name)) in unnamed
 
     def original_exists(self, item, root=None, source=None):
         if self.exists(item['sha256'],item.get('sha1')):return True
@@ -224,27 +251,26 @@ class Uploader(nextcloud.Sync):
             path=root/'.download/opencloud-source-hashes'/(key+'.json')
             cached=self.read(path,{})
             if not md5 and all(cached.get(k)==v for k,v in identity.items()):md5=cached.get('md5')
+        checksums,_,md5_sizes=self._remote_lookup()
         if md5:
             item['md5']=md5.lower()
-        if md5 and any(hashes(row).get('md5')==md5.lower() for row in self.index):return True
+        if md5 and md5.lower() in checksums['md5']:return True
         if self.name_exists(item['path'],item['size']):return True
-        candidates=[row for row in self.index if hashes(row).get('md5')]
-        if not candidates:return False
-        if not md5 and path is not None:
-            if not md5 and any(row['size']==item['size'] for row in candidates):
-                try:
-                    metadata=d.api(source,item['path'],stopping=self.stopping)
-                    if (metadata.get('size'),metadata.get('sha256'))==(item['size'],item['sha256']):
-                        md5=metadata.get('md5')
-                    if md5 and re.fullmatch('[0-9a-fA-F]{32}',md5):
-                        path.parent.mkdir(mode=0o700,exist_ok=True)
-                        d.write_json(path,dict(identity,md5=md5.lower()))
-                except (OSError,http.client.HTTPException,ValueError) as error:
-                    if isinstance(error,InterruptedError) or storage.disk_error(error):raise
-                    print(f'OPENCLOUD METADATA WARNING: {item["path"]}; {type(error).__name__}; HTTP={getattr(error,"code",None)}',flush=True)
+        if not checksums['md5']:return False
+        if not md5 and path is not None and item['size'] in md5_sizes:
+            try:
+                metadata=d.api(source,item['path'],stopping=self.stopping)
+                if (metadata.get('size'),metadata.get('sha256'))==(item['size'],item['sha256']):
+                    md5=metadata.get('md5')
+                if md5 and re.fullmatch('[0-9a-fA-F]{32}',md5):
+                    path.parent.mkdir(mode=0o700,exist_ok=True)
+                    d.write_json(path,dict(identity,md5=md5.lower()))
+            except (OSError,http.client.HTTPException,ValueError) as error:
+                if isinstance(error,InterruptedError) or storage.disk_error(error):raise
+                print(f'OPENCLOUD METADATA WARNING: {item["path"]}; {type(error).__name__}; HTTP={getattr(error,"code",None)}',flush=True)
         if md5 and re.fullmatch('[0-9a-fA-F]{32}',md5):
             item['md5']=md5.lower()
-            return any(hashes(row)['md5']==md5.lower() for row in candidates)
+            return md5.lower() in checksums['md5']
         return False
 
     def confirm_publication(self, row, stage, sha1):

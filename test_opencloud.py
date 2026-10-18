@@ -331,6 +331,70 @@ class UploadChecks(unittest.TestCase):
             self.assertEqual(uploader.run_once([self.root],upload=True),0)
         self.assertEqual(sum(m=='POST' for m,p,h in self.server.calls),1)
 
+    def test_checksum_lookup_decodes_remote_rows_once_per_index(self):
+        self.uploader.index=[
+            dict(path=f'other/{i}.mp4', size=len(self.content),
+                 checksums=['SHA256:'+format(i,'064x'), 'MD5:'+format(i,'032x')],
+                 directory=False)
+            for i in range(64)]
+        with patch.object(oc, 'hashes', wraps=oc.hashes) as decoded:
+            for _ in range(5):
+                self.assertFalse(self.uploader.exists('f'*64))
+                self.assertFalse(self.uploader.name_exists('missing.mp4',len(self.content)))
+                self.assertFalse(self.uploader.original_exists(
+                    dict(self.item, md5='f'*32)))
+            self.assertLessEqual(decoded.call_count, len(self.uploader.index))
+
+    def test_checksum_lookup_tracks_new_rows_and_replaced_catalog(self):
+        known='a'*64
+        md5='b'*32
+        self.uploader.index=[]
+        self.assertFalse(self.uploader.exists(known))
+        self.uploader.index.append(dict(path='other/file.mp4',size=1,
+                                        checksums=['SHA256:'+known],directory=False))
+        self.assertTrue(self.uploader.exists(known))
+        self.uploader.index.append(dict(path='other/another.mp4',size=2,
+                                        checksums=['MD5:'+md5],directory=False))
+        self.assertTrue(self.uploader.exists('z'*64,md5=md5))
+        self.uploader.index=[dict(path='other/001 - Lecture.mp4',size=17,
+                                  checksums=[],directory=False)]
+        self.assertFalse(self.uploader.exists(known))
+        self.assertTrue(self.uploader.name_exists('Lecture.mp4',17))
+        self.assertFalse(self.uploader.name_exists('Lecture.mp4',18))
+
+    def test_checksum_lookup_refreshes_after_remote_digest_is_added(self):
+        self.server.files['remote/file.mp4']=self.content
+        row=dict(path='remote/file.mp4',size=len(self.content),checksums=[],directory=False)
+        self.uploader.index=[row]
+        self.assertFalse(self.uploader.exists(self.item['sha256']))
+        self.assertEqual(self.uploader.remote_digest(row),self.item['sha256'])
+        self.assertTrue(self.uploader.exists(self.item['sha256']))
+
+    def test_checksum_lookup_rebuilds_after_catalog_appends_during_iteration(self):
+        added=dict(path='remote/new.mp4',size=1,checksums=['SHA256:'+'b'*64],directory=False)
+        class Growing(list):
+            def __iter__(self):
+                yield from self[:]
+                if len(self)==1:
+                    self.append(added)
+        self.uploader.index=Growing([dict(path='remote/old.mp4',size=1,
+                                          checksums=['SHA256:'+'a'*64],directory=False)])
+        self.assertFalse(self.uploader.exists('b'*64))
+        self.assertTrue(self.uploader.exists('b'*64))
+
+    def test_checksum_lookup_rebuilds_after_checksum_changes_during_iteration(self):
+        self.server.files['remote/video.mp4']=self.content
+        row=dict(path='remote/video.mp4',size=len(self.content),checksums=[],directory=False)
+        uploader=self.uploader
+        class Changing(list):
+            def __iter__(self):
+                yield from self[:]
+                if not row['checksums']:
+                    uploader.remote_digest(row)
+        uploader.index=Changing([row])
+        self.assertFalse(uploader.exists(self.item['sha256']))
+        self.assertTrue(uploader.exists(self.item['sha256']))
+
     def test_conflicting_known_hash_does_not_fall_back_to_name_and_size(self):
         self.uploader.index=[dict(path='other/Lecture.mp4',size=len(self.content),
                                  checksums=['SHA256:'+'0'*64],directory=False)]
