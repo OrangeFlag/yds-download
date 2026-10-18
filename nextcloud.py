@@ -3,6 +3,7 @@ import argparse
 from contextlib import ExitStack
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
+from difflib import SequenceMatcher
 import fcntl
 import hashlib
 import http.client
@@ -39,6 +40,19 @@ def error_details(error):
 
 def normalized(value):
     return unicodedata.normalize('NFC', value).strip()
+
+
+def similar_upload_name(left, right):
+    def parts(value):
+        stem=normalized(PurePosixPath(value).stem).casefold()
+        variants=tuple(sorted(re.findall(r'\((?:partially available|partially corrupted|camrip|obs|sha mismatch)[^)]*\)',stem)))
+        truncation=re.search(r'(?:~[0-9a-f]{8,64}|-[0-9a-f]{10,64})$',stem)
+        stem=re.sub(r'^\d+\s*[-–—]\s+','',stem)
+        return re.sub(r'[\W_]+',' ',stem).strip(),variants,truncation.group(0) if truncation else None
+    left,left_variants,left_truncation=parts(left);right,right_variants,right_truncation=parts(right)
+    # Truncation can hide a partial suffix; its filename digest must agree exactly.
+    return (bool(left and right) and left_variants==right_variants and left_truncation==right_truncation
+            and SequenceMatcher(None,left,right,autojunk=False).ratio()>=.9)
 
 
 def remote_path(data, item):
@@ -188,7 +202,20 @@ class Index:
         # File-drop uploads can remain absent from the public listing indefinitely.
         return bool(uploaded) and not conflicting
 
-    def candidates(self, data, item):
+    def upload_contains(self, data, item, target, size):
+        if self.contains(data,item):
+            return True
+        name=re.sub(r'^\d{3,} - ','',PurePosixPath(target).name)
+        payload=dict(item,path=str(PurePosixPath(item['path']).with_name(name)),size=size)
+        # Unhashed remote copies prevent duplicate uploads, never verified downloads.
+        for expected in (item,payload):
+            for row in self.candidates(data,expected,approximate=True):
+                if row['size']==expected['size'] and not row.get('checksums'):
+                    print(f'NEXTCLOUD MATCH: {expected["path"]}; remote={row["path"]}; basis=name-size; bytes={row["size"]}',flush=True)
+                    return True
+        return False
+
+    def candidates(self, data, item, approximate=False):
         relative=remote_path(data,item)
         folder=str(PurePosixPath(relative).parent)
         if folder in self.retry_at and time.monotonic()>=self.retry_at[folder]:
@@ -240,7 +267,9 @@ class Index:
             return []
         return [row for row in self.folders[folder] if not row['directory']
                 and str(PurePosixPath(row['path']).parent)==folder
-                and normalized(re.sub(r'^\d{3,} - ','',PurePosixPath(row['path']).name))==PurePosixPath(relative).name]
+                and (normalized(re.sub(r'^\d{3,} - ','',PurePosixPath(row['path']).name))==PurePosixPath(relative).name
+                     or approximate and row['size']==item['size'] and not row.get('checksums')
+                     and similar_upload_name(row['path'],relative))]
 
 
 def saved_remote_files(state, link, source=None, saved=None):
@@ -439,16 +468,16 @@ class Sync:
             storage.check(local)
             if not local.is_file() or (local.stat().st_size,local.stat().st_mtime_ns)!=(expected_size,expected_mtime):
                 return
-            if index:
-                with self.index_lock:
-                    exists=index.contains(data,item)
-                if exists:
-                    print('NEXTCLOUD EXISTS: '+item['path'],flush=True)
-                    return
             relative=PurePosixPath(remote_path(data,item))
             stem=relative.stem+(f' (partially available {percent:.2f}%)' if percent is not None else '')
             name=local_path(Path('/'),f'/{ordinal:03} - {stem}{relative.suffix}').name
             target=str(relative.with_name(name))
+            if index:
+                with self.index_lock:
+                    exists=index.upload_contains(data,item,target,expected_size)
+                if exists:
+                    print('NEXTCLOUD EXISTS: '+item['path'],flush=True)
+                    return
             self.upload(root,data,item,local,variant,target,expected_size,percent)
         except (OSError,http.client.HTTPException,RuntimeError,ValueError,ET.ParseError) as error:
             if storage.disk_error(error):

@@ -22,6 +22,57 @@ class Response(io.BytesIO):
 
 
 class NextcloudChecks(unittest.TestCase):
+    def test_upload_skips_name_size_match_without_claiming_verified_download(self):
+        row=dict(path='2023-fall/Course/001 - 2023-09-15 Лекция.mp4',size=7,directory=False,checksums=[])
+        with patch.object(nextcloud.Share,'listing',return_value=[row]), \
+                patch.object(nextcloud.Share,'request',side_effect=AssertionError('existing file uploaded')):
+            nextcloud.Sync(self.read,self.upload,Event()).run_once([self.root])
+            self.assertFalse(nextcloud.Index(self.root,self.read).contains(self.data,self.item))
+        self.assertFalse((self.state/'nextcloud-uploads.json').exists())
+
+    def test_upload_existence_keeps_scope_size_hash_and_partial_suffix(self):
+        original='2023-fall/Course/001 - 2023-09-15 Лекция.mp4'
+        partial=original.replace('.mp4',' (partially available 71.43%).mp4')
+        cases=[(original,7,[],original,7,True),
+               (original,8,[],original,7,False),
+               (original,7,['SHA256:'+'0'*64],original,7,False),
+               (original.replace('Course/','Other/'),7,[],original,7,False),
+               (original.replace('2023-fall/','2024-fall/'),7,[],original,7,False),
+               (partial,5,[],partial,5,True),
+               (partial,5,[],original,7,False),
+               (partial.replace('71.43%','60.00%'),5,[],partial,5,False),
+               (original.replace('Лекция','лекциЯ!'),7,[],original,7,True),
+               (original.replace('Лекция','Лекцыя'),7,[],original,7,True),
+               (original.replace('Лекция','Совершенно другая тема'),7,[],original,7,False),
+               (original.replace('Лекция','Лекцыя'),7,['SHA256:'+'0'*64],original,7,False)]
+        for path,size,checksums,target,payload_size,expected in cases:
+            with self.subTest(path=path,size=size,target=target,checksums=checksums), \
+                    patch.object(nextcloud.Share,'listing',return_value=[dict(path=path,size=size,checksums=checksums,directory=False)]):
+                index=nextcloud.Index(self.root,self.read)
+                self.assertEqual(index.upload_contains(self.data,self.item,target,payload_size),expected)
+
+    def test_fuzzy_upload_match_does_not_hide_partial_suffix_on_long_names(self):
+        name='Лекция о современном системном программировании ' * 5
+        original='001 - '+name+'.mp4'
+        self.assertFalse(nextcloud.similar_upload_name(original,original.replace('.mp4',' (partially available 99.99%).mp4')))
+        self.assertFalse(nextcloud.similar_upload_name(original,original.replace('.mp4',' (CamRip).mp4')))
+        self.assertFalse(nextcloud.similar_upload_name('Lecture (OBS) (partially available 70.00%).mp4',
+                                                       'Lecture (OBS) (partially available 80.00%).mp4'))
+
+    def test_truncated_partial_upload_does_not_suppress_original_or_other_percent(self):
+        item=dict(self.item,path='/Course/'+('Лекция о системном программировании '*30)+'.mp4')
+        relative=Path(nextcloud.remote_path(self.data,item))
+        def target(suffix):
+            name=nextcloud.local_path(Path('/'),'/001 - '+relative.stem+suffix+relative.suffix).name
+            return str(relative.with_name(name))
+        original=target('');partial=target(' (partially available 71.43%)')
+        row=dict(path=partial,size=item['size'],checksums=[],directory=False)
+        with patch.object(nextcloud.Share,'listing',return_value=[row]):
+            index=nextcloud.Index(self.root,self.read)
+            self.assertFalse(index.upload_contains(self.data,item,original,item['size']))
+            self.assertFalse(index.upload_contains(self.data,item,target(' (partially available 60.00%)'),item['size']))
+            self.assertTrue(index.upload_contains(self.data,item,partial,item['size']))
+
     def test_ru_endpoint_resumes_old_session_and_keeps_completed_receipt(self):
         old='https://drive.oleja.dev/index.php/s/upload'
         new=old.replace('://drive.', '://ru.drive.')
