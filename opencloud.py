@@ -86,6 +86,7 @@ class Uploader(nextcloud.Sync):
         self.folder='ingest/'+client.nickname
         self.index=None
         self._lookup_cache=None
+        self._lookup_generation=0
         self.active_hashes=set()
         self.known_folders=set()
         self.durable_checkpoint_dirs=set()
@@ -202,17 +203,21 @@ class Uploader(nextcloud.Sync):
         if total!=row['size']:raise RuntimeError('Incomplete OpenCloud verification read')
         result=digest.hexdigest()
         row.setdefault('checksums',[]).append('SHA256:'+result)
+        self._lookup_generation+=1
         self._lookup_cache=None
         return result
 
     def _remote_lookup(self):
+        index=self.index
+        size=len(index)
+        generation=self._lookup_generation
         cached=self._lookup_cache
-        if cached is not None and cached[0] is self.index and cached[1]==len(self.index):
-            return cached[2]
+        if cached is not None and cached[:3]==(index,size,generation) and cached[0] is index:
+            return cached[3]
         checksums={kind:set() for kind in ('sha256','sha1','md5')}
         unnamed=set()
         md5_sizes=set()
-        for row in self.index:
+        for row in index:
             parsed=hashes(row)
             for kind,digest in parsed.items():
                 checksums[kind].add(digest)
@@ -222,7 +227,7 @@ class Uploader(nextcloud.Sync):
                 name=re.sub(r'^\d+\s*-\s*','',PurePosixPath(row['path']).name)
                 unnamed.add((row['size'],nextcloud.normalized(name)))
         result=(checksums,unnamed,md5_sizes)
-        self._lookup_cache=(self.index,len(self.index),result)
+        self._lookup_cache=(index,size,generation,result)
         return result
 
     def exists(self, digest, sha1=None, md5=None):
