@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main, review/recovery-streamed-events-20261018]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
