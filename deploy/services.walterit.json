@@ -147,6 +147,9 @@
       }
     },
     "opencloud": {
+      "properties": {
+        "IOWeight": "25"
+      },
       "command": [
         "/usr/bin/python3",
         "$repo/opencloud.py",
