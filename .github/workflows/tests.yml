@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, review/opencloud-hash-lookup-20261018]
   workflow_dispatch:
 
 jobs:
