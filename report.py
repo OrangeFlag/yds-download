@@ -2,6 +2,7 @@
 import atexit
 import fcntl
 from datetime import datetime
+from functools import lru_cache
 import json
 from local_paths import local_path
 import os
@@ -21,6 +22,60 @@ END = '<!-- yds-download:end -->'
 BLOCK = re.compile(re.escape(BEGIN) + r'.*?' + re.escape(END) + r'\n?', re.S)
 PUBLISHERS = {}
 PUBLISH_LOCK = Lock()
+
+
+class ReportEvents:
+    # shortcut: journals are append-only; replace the file atomically to edit committed history.
+    FIELDS = ('path', 'source', 'status', 'local', 'size', 'sha256', 'mtime_ns',
+              'time', 'detail', 'attempt', 'source_current', 'downloaded_percent', 'downloaded_bytes')
+
+    def __init__(self, path):
+        self.path = path
+        self.identity = self.stamp = None
+        self.offset = 0
+        self.events, self.observations = {}, {}
+        self.lock = Lock()
+
+    @classmethod
+    def add(cls, row, events, observations):
+        if row is None:
+            return
+        key = normalized(row['path'])
+        compact = {field: row[field] for field in cls.FIELDS if field in row}
+        events[key] = compact
+        if row.get('source_current'):
+            observations[key] = compact
+
+    def refresh(self):
+        from download import scan_events
+        with self.lock:
+            try:
+                stat = self.path.stat()
+            except FileNotFoundError:
+                self.events.clear(); self.observations.clear()
+                self.identity = self.stamp = None
+                self.offset = 0
+                return {}, {}
+            identity = stat.st_dev, stat.st_ino
+            stamp = stat.st_size, stat.st_mtime_ns
+            if (identity != self.identity or stat.st_size < self.offset
+                    or self.stamp and stat.st_size <= self.stamp[0] and stamp != self.stamp):
+                self.events.clear(); self.observations.clear()
+                self.offset = 0
+            self.identity, self.stamp = identity, stamp
+            for offset, row in scan_events(self.path, start=self.offset, complete_lines=True):
+                self.offset = offset
+                self.add(row, self.events, self.observations)
+            events, observations = dict(self.events), dict(self.observations)
+            # A valid final row without newline is visible, but must be reread if it changes.
+            for _, row in scan_events(self.path, start=self.offset):
+                self.add(row, events, observations)
+            return events, observations
+
+
+@lru_cache(maxsize=32)
+def _event_index(path):
+    return ReportEvents(path)
 
 
 def stop_reports():
@@ -173,7 +228,6 @@ def update_report(destination, repo, mark, git_push=False, message=None, stoppin
 
 
 def _update_report(destination, repo, mark, git_push=False, message=None, stopping=None, transaction=None):
-    from download import iter_events
     if not mark or any(c in mark for c in '|\n\r'):
         raise ValueError('Mark must be nonempty and contain no pipes or line breaks')
     repo = repo.resolve()
@@ -187,13 +241,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
         dirty = set(subprocess.check_output(['git', '-C', str(repo), 'diff', '--name-only', '-z'], timeout=git_timeout).decode().split('\0'))
     state = destination / '.download'
     source = json.loads((state / 'source.json').read_text(encoding='utf-8'))['source'].rstrip('/')
-    events = {}
-    observations = {}
-    for event in iter_events(state / 'events.jsonl'):
-        key = normalized(event['path'])
-        events[key] = event
-        if event.get('source_current'):
-            observations[key] = event
+    events, observations = _event_index(state / 'events.jsonl').refresh()
     expected = dict(events)
     manifest_times = {}
     for manifest in sorted(state.glob('*-manifest.json'), key=lambda path: path.stat().st_mtime_ns):

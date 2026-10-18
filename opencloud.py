@@ -87,6 +87,7 @@ class Uploader(nextcloud.Sync):
         self.index=None
         self.active_hashes=set()
         self.known_folders=set()
+        self.durable_checkpoint_dirs=set()
 
     def jobs(self, roots):
         jobs=super().jobs(roots) or []
@@ -163,13 +164,16 @@ class Uploader(nextcloud.Sync):
     def save_record(self, job, row):
         path=self.checkpoint(job)
         storage.check(path)
-        path.parent.parent.mkdir(mode=0o700,exist_ok=True)
-        path.parent.mkdir(mode=0o700,exist_ok=True)
-        row['time']=datetime.now().astimezone().isoformat()
-        d.write_json(path,row)
-        storage.sync_directory(path.parent.parent)
-        public={key:value for key,value in row.items() if key!='session_url'}
-        d.append_events(job[1]/'.download/opencloud-uploads.jsonl',[public])
+        with d.STATE_LOCK:
+            for directory in (path.parent.parent, path.parent):
+                directory.mkdir(mode=0o700, exist_ok=True)
+                if directory not in self.durable_checkpoint_dirs:
+                    storage.sync_directory(directory.parent)
+                    self.durable_checkpoint_dirs.add(directory)
+            row['time']=datetime.now().astimezone().isoformat()
+            d.write_json(path,row)
+            public={key:value for key,value in row.items() if key!='session_url'}
+            d.append_events(job[1]/'.download/opencloud-uploads.jsonl',[public])
 
     def scan(self):
         result=[];folders=[''];seen=set()

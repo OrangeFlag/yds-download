@@ -89,6 +89,52 @@ class UploadChecks(unittest.TestCase):
             job[3]['path'],job[5],str(job[4]),job[6],job[10]],ensure_ascii=False).encode()).hexdigest()
         return job[1]/'.download/opencloud-uploads'/key[:2]/(key+'.json')
 
+    def test_checkpoint_updates_reuse_durable_parent_directories(self):
+        job = self.job()
+        row = dict(state='uploading', sent_bytes=4, session_url='https://cloud.example/private')
+        parent = self.uploader.checkpoint(job).parent.parent
+        real_sync = oc.storage.sync_directory
+        with patch.object(oc.storage, 'sync_directory', wraps=real_sync) as sync:
+            self.uploader.save_record(job, row)
+            self.assertIn(parent, [call.args[0] for call in sync.call_args_list])
+            sync.reset_mock()
+            row['sent_bytes'] = 8
+            self.uploader.save_record(job, row)
+            self.assertNotIn(parent, [call.args[0] for call in sync.call_args_list],
+                             'Already durable checkpoint parent was flushed again')
+        self.assertEqual(json.loads(self.uploader.checkpoint(job).read_text())['sent_bytes'], 8)
+        events = list(d.iter_events(self.state/'opencloud-uploads.jsonl'))
+        self.assertEqual([event['sent_bytes'] for event in events], [4, 8])
+        self.assertTrue(all('session_url' not in event for event in events))
+
+    def test_checkpoint_retries_failed_parent_sync_before_confirming_progress(self):
+        job = self.job()
+        checkpoint = self.uploader.checkpoint(job)
+        parent = checkpoint.parent.parent
+        row = dict(state='uploading', sent_bytes=4)
+        real_sync = oc.storage.sync_directory
+        def fail_parent(path):
+            if path == parent:
+                raise OSError(5, 'injected directory sync failure')
+            real_sync(path)
+        with patch.object(oc.storage, 'sync_directory', side_effect=fail_parent):
+            with self.assertRaises(OSError):
+                self.uploader.save_record(job, row)
+        self.assertTrue(checkpoint.parent.is_dir())
+        self.assertFalse(checkpoint.exists())
+        with patch.object(oc.storage, 'sync_directory', wraps=real_sync) as sync:
+            self.uploader.save_record(job, row)
+            self.assertIn(parent, [call.args[0] for call in sync.call_args_list])
+        self.assertEqual(json.loads(checkpoint.read_text())['sent_bytes'], 4)
+
+    def test_checkpoint_first_touch_confirms_existing_directory_entries(self):
+        job = self.job()
+        checkpoint = self.uploader.checkpoint(job)
+        checkpoint.parent.mkdir(parents=True)
+        with patch.object(oc.storage, 'sync_directory', wraps=oc.storage.sync_directory) as sync:
+            self.uploader.save_record(job, dict(state='uploading', sent_bytes=4))
+            self.assertIn(checkpoint.parent.parent, [call.args[0] for call in sync.call_args_list])
+
     def test_checkpoint_identity_survives_remount_and_reads_legacy_session(self):
         import shutil
         job=self.job()
