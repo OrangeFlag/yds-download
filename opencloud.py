@@ -212,7 +212,8 @@ class Uploader(nextcloud.Sync):
         size=len(index)
         generation=self._lookup_generation
         cached=self._lookup_cache
-        if cached is not None and cached[:3]==(index,size,generation) and cached[0] is index:
+        if (cached is not None and cached[0] is index
+                and cached[1]==size and cached[2]==generation):
             return cached[3]
         checksums={kind:set() for kind in ('sha256','sha1','md5')}
         unnamed=set()
