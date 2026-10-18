@@ -1,5 +1,10 @@
 """OpenCloud only publishes confirmed uploads and never overwrites existing videos."""
 import hashlib
+import gc
+import sys
+import time
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 import io
 import json
 import os
@@ -344,6 +349,55 @@ class UploadChecks(unittest.TestCase):
                 self.assertFalse(self.uploader.original_exists(
                     dict(self.item, md5='f'*32)))
             self.assertLessEqual(decoded.call_count, len(self.uploader.index))
+
+    def test_concurrent_checksum_lookup_builds_only_one_index(self):
+        self.uploader.index=[dict(path=f'other/{i}.mp4',size=i+1,
+                                  checksums=['SHA256:'+format(i,'064x')],directory=False)
+                             for i in range(64)]
+        barrier=Barrier(4)
+        original=oc.hashes
+        def parse(row):
+            time.sleep(.002)
+            return original(row)
+        def lookup(_):
+            barrier.wait(timeout=5)
+            return self.uploader.exists('f'*64)
+        with patch.object(oc,'hashes',side_effect=parse) as parsed:
+            with ThreadPoolExecutor(max_workers=4) as workers:
+                self.assertEqual(list(workers.map(lookup,range(4))),[False]*4)
+        self.assertEqual(parsed.call_count,len(self.uploader.index))
+
+    def test_polling_releases_previous_checksum_index_and_catalog(self):
+        class Rows(list):pass
+        rows=Rows([dict(path='remote/video.mp4',size=10,
+                        checksums=['SHA256:'+'a'*64],directory=False)])
+        self.uploader.index=rows
+        self.assertFalse(self.uploader.exists('f'*64))
+        old=weakref.ref(rows)
+        del rows
+        password=self.root/'password.txt';password.write_text('secret')
+        class Stop:
+            def __init__(self):self.polls=0
+            def is_set(self):return False
+            def wait(self,_):
+                self.polls+=1
+                return self.polls>=2
+        from contextlib import contextmanager
+        @contextmanager
+        def locked(*_):
+            yield lambda roots:roots
+        argv=['opencloud.py','--destination',str(self.root),'--server','https://cloud.example',
+              '--username','Walterit','--password-file',str(password),
+              '--upload','--poll-interval','1']
+        with patch.object(oc,'Uploader',return_value=self.uploader), \
+                patch.object(self.uploader,'run_once',return_value=0), \
+                patch.object(oc,'Client'),patch.object(oc.storage,'lock_archives',side_effect=locked), \
+                patch.object(oc.storage,'check'),patch.object(oc.signal,'signal'), \
+                patch.object(oc.os,'umask'),patch.object(oc,'Event',return_value=Stop()), \
+                patch.object(sys,'argv',argv):
+            self.assertEqual(oc.main(),0)
+        gc.collect()
+        self.assertIsNone(old())
 
     def test_checksum_lookup_tracks_new_rows_and_replaced_catalog(self):
         known='a'*64
