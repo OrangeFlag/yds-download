@@ -370,6 +370,31 @@ class UploadChecks(unittest.TestCase):
         self.assertEqual(self.uploader.remote_digest(row),self.item['sha256'])
         self.assertTrue(self.uploader.exists(self.item['sha256']))
 
+    def test_checksum_lookup_rebuilds_after_catalog_appends_during_iteration(self):
+        added=dict(path='remote/new.mp4',size=1,checksums=['SHA256:'+'b'*64],directory=False)
+        class Growing(list):
+            def __iter__(self):
+                yield from self[:]
+                if len(self)==1:
+                    self.append(added)
+        self.uploader.index=Growing([dict(path='remote/old.mp4',size=1,
+                                          checksums=['SHA256:'+'a'*64],directory=False)])
+        self.assertFalse(self.uploader.exists('b'*64))
+        self.assertTrue(self.uploader.exists('b'*64))
+
+    def test_checksum_lookup_rebuilds_after_checksum_changes_during_iteration(self):
+        self.server.files['remote/video.mp4']=self.content
+        row=dict(path='remote/video.mp4',size=len(self.content),checksums=[],directory=False)
+        uploader=self.uploader
+        class Changing(list):
+            def __iter__(self):
+                yield from self[:]
+                if not row['checksums']:
+                    uploader.remote_digest(row)
+        uploader.index=Changing([row])
+        self.assertFalse(uploader.exists(self.item['sha256']))
+        self.assertTrue(uploader.exists(self.item['sha256']))
+
     def test_conflicting_known_hash_does_not_fall_back_to_name_and_size(self):
         self.uploader.index=[dict(path='other/Lecture.mp4',size=len(self.content),
                                  checksums=['SHA256:'+'0'*64],directory=False)]
