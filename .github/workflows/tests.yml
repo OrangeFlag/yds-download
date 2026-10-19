@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/nextcloud-year-only-archives-20261020]
   workflow_dispatch:
 
 jobs:
