@@ -100,7 +100,8 @@ class DiscoveryProfile:
                 return index.refresh()
             finally:
                 counts.update(records=index.scanned_events - records, bytes=index.scanned_bytes - size,
-                              journal_bytes=index.journal_bytes)
+                              journal_bytes=index.journal_bytes,
+                              checkpoint_loaded=int(index.checkpoint_loaded))
 
     def manifests(self, cache, state):
         reads = cache.json_reads
@@ -548,7 +549,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                             if dirty_courses:
                                 changed_courses_by_root[root] = set(dirty_courses)
                             priorities[root] = priority
-                            background.event_index = EventIndex(state / 'events.jsonl')
+                            background.event_index = EventIndex(state / 'events.jsonl', checkpoint=True)
                             background.cached_events = profile.events(background.event_index)
                             background.task_cache = cache
                             if legacy:

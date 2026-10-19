@@ -471,6 +471,125 @@ class SharedRangeChecks(unittest.TestCase):
             self.assertFalse((bg.state / 'course-history.json').exists())
             self.assertFalse((bg.state / 'summary.json').exists())
 
+    def test_event_checkpoint_restores_compact_index_and_reads_only_new_tail(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/'events.jsonl'
+            rows = [dict(path=f'/Course/{i}.mp4', status='invalid', size=i,
+                         sha256='a'*64, range_attempts=['x'*4096]*10) for i in range(30)]
+            d.append_events(path,rows)
+            first = d.EventIndex(path,checkpoint=True)
+            self.assertEqual(len(first.refresh()),30)
+            saved_offset=first.offset
+            checkpoint=path.with_name(path.name+'.index.json')
+            self.assertTrue(checkpoint.exists())
+            d.append_events(path,[dict(rows[0],status='valid')])
+            with patch.object(d,'scan_events',wraps=d.scan_events) as scanner:
+                restored = d.EventIndex(path,checkpoint=True)
+                events=restored.refresh()
+            self.assertEqual(scanner.call_args.kwargs['start'],saved_offset)
+            self.assertEqual(events[rows[0]['path']]['status'],'valid')
+            self.assertNotIn('range_attempts',str(events))
+            self.assertNotIn('range_attempts',checkpoint.read_text())
+            self.assertEqual(len(events),30)
+
+    def test_event_checkpoint_corruption_falls_back_to_full_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'events.jsonl'
+            row=dict(path='/one',status='valid')
+            d.append_events(path,[row])
+            d.EventIndex(path,checkpoint=True).refresh()
+            checkpoint=path.with_name(path.name+'.index.json')
+            corrupted=json.loads(checkpoint.read_text())
+            corrupted['payload']['events']['/one']['status']='invalid'
+            checkpoint.write_text(json.dumps(corrupted))
+            with patch.object(d,'scan_events',wraps=d.scan_events) as scanner:
+                restored=d.EventIndex(path,checkpoint=True).refresh()
+            self.assertEqual(scanner.call_args.kwargs['start'],0)
+            self.assertEqual(restored['/one']['status'],'valid')
+
+    def test_event_index_replays_when_device_changes_but_inode_matches(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'events.jsonl'
+            d.append_events(path,[dict(path='/one',status='valid')])
+            index=d.EventIndex(path)
+            index.refresh()
+            self.assertEqual(index.scanned_events,1)
+            original_stat=Path.stat
+            def changed_device(p, *args, **kwargs):
+                stat=original_stat(p,*args,**kwargs)
+                if p == path:
+                    return SimpleNamespace(st_ino=stat.st_ino,st_dev=stat.st_dev+1,
+                                           st_size=stat.st_size,st_mtime_ns=stat.st_mtime_ns)
+                return stat
+            with patch.object(Path,'stat',changed_device):
+                index.refresh()
+            self.assertEqual(index.scanned_events,2,
+                             'Device switch must not reuse proofs solely by inode')
+
+    def test_event_checkpoint_invalidates_replaced_and_rewritten_journal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'events.jsonl'
+            original=dict(path='/one',status='valid')
+            d.append_events(path,[original])
+            d.EventIndex(path,checkpoint=True).refresh()
+            # Same-size in-place rewrite must not inherit previous verified results.
+            path.write_text(json.dumps(dict(original,status='other'))+chr(10))
+            self.assertEqual(d.EventIndex(path,checkpoint=True).refresh()['/one']['status'],'other')
+            replacement=path.with_name('replacement.jsonl')
+            d.append_events(replacement,[dict(original,status='lost')])
+            replacement.replace(path)
+            self.assertEqual(d.EventIndex(path,checkpoint=True).refresh()['/one']['status'],'lost')
+            path.write_bytes(b'')
+            d.append_events(path,[dict(original,status='new')])
+            self.assertEqual(d.EventIndex(path,checkpoint=True).refresh()['/one']['status'],'new')
+
+    def test_event_checkpoint_repairs_crash_torn_final_jsonl_row(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'events.jsonl'
+            row=dict(path='/one',status='valid')
+            path.write_text(json.dumps(row)+chr(10)+'{"path":')
+            initial=d.EventIndex(path,checkpoint=True)
+            self.assertEqual(initial.refresh()['/one']['status'],'valid')
+            self.assertEqual(path.read_text(),json.dumps(row)+chr(10))
+            d.append_events(path,[dict(row,status='other')])
+            self.assertEqual(d.EventIndex(path,checkpoint=True).refresh()['/one']['status'],'other')
+
+    def test_event_checkpoint_keeps_appends_during_snapshot_publication(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'events.jsonl'
+            first=dict(path='/one',status='invalid')
+            last=dict(path='/one',status='valid')
+            d.append_events(path,[first])
+            snapshot=path.with_name(path.name+'.index.json')
+            original_write=d.write_json
+            appended=[]
+            def append_during_save(destination, data):
+                if destination==snapshot and not appended:
+                    d.append_events(path,[last])
+                    appended.append(True)
+                return original_write(destination,data)
+            with patch.object(d,'write_json',side_effect=append_during_save):
+                old=d.EventIndex(path,checkpoint=True).refresh()
+            self.assertEqual(old['/one']['status'],'invalid')
+            self.assertTrue(appended)
+            restored=d.EventIndex(path,checkpoint=True)
+            self.assertEqual(restored.refresh()['/one']['status'],'valid')
+            self.assertEqual(restored.scanned_events,1,
+                             'Only the concurrent append should be replayed')
+
+    def test_event_checkpoint_failed_publication_preserves_history(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'events.jsonl'
+            row=dict(path='/one',status='valid')
+            d.append_events(path,[row])
+            original=path.read_bytes()
+            with patch.object(d,'write_json',side_effect=OSError('checkpoint write interrupted')):
+                with self.assertRaises(OSError):
+                    d.EventIndex(path,checkpoint=True).refresh()
+            self.assertEqual(path.read_bytes(),original)
+            self.assertEqual(d.EventIndex(path,checkpoint=True).refresh()['/one']['status'],'valid')
+
     def test_event_index_streams_latest_proofs_without_holding_range_history(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'events.jsonl'
