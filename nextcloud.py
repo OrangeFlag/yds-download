@@ -306,7 +306,6 @@ class Body:
     def __init__(self, stream, size, stopping, path):
         self.stream, self.size, self.stopping, self.path = stream,size,stopping,path
         self.sent = 0
-        self.digest = hashlib.sha256()
         self.last_progress=time.monotonic()
 
     def read(self, amount=-1):
@@ -315,7 +314,6 @@ class Body:
         storage.check(self.path)
         data = self.stream.read(min(self.size-self.sent,1024**2 if amount<0 else amount))
         self.sent += len(data)
-        self.digest.update(data)
         if time.monotonic()-self.last_progress>=30:
             print(f'NEXTCLOUD UPLOAD PROGRESS: {self.path.name}; {self.sent}/{self.size} bytes',flush=True)
             self.last_progress=time.monotonic()
@@ -536,7 +534,6 @@ class Sync:
                 if isinstance(data, Body):
                     data.stream.seek(0)
                     data.sent = 0
-                    data.digest = hashlib.sha256()
                 details = error_details(error)
                 print(f'NEXTCLOUD REQUEST RETRY: {method}; session={path}; '
                       f'{type(error).__name__}; HTTP={details["http_status"]}; '
