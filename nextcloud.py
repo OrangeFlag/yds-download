@@ -124,24 +124,34 @@ class Share:
         request = urllib.request.Request(url,data=data,method=method,headers=request_headers)
         return self.opener.open(request,timeout=self.timeout)
 
-    def listing(self, folder):
+    def listing(self, folder, strict=False):
         with self.request('PROPFIND',folder,data=PROPERTIES,
                           headers={'Depth':'1','Content-Type':'application/xml'}) as response:
             if response.status != 207:
                 raise RuntimeError('Nextcloud did not return a WebDAV listing')
             tree = ET.fromstring(response.read())
+        if strict and (tree.tag!='{DAV:}multistatus' or not tree.findall('{DAV:}response')):
+            raise ValueError('Incomplete WebDAV catalog response')
         prefix = urllib.parse.unquote(urllib.parse.urlsplit(self.url()).path).rstrip('/')+'/'
         result = []
         for row in tree.findall('{DAV:}response'):
             href = urllib.parse.urlsplit(row.findtext('{DAV:}href',''))
             path = urllib.parse.unquote(href.path)
             if not path.startswith(prefix):
-                continue
+                if strict:
+                    if path.rstrip('/')!=prefix.rstrip('/'):
+                        raise ValueError('WebDAV catalog entry outside requested Space')
+                    path=prefix
+                else:continue
             properties = next((p.find('{DAV:}prop') for p in row.findall('{DAV:}propstat')
                                if ' 200 ' in p.findtext('{DAV:}status','')),None)
             if properties is None:
+                if strict:raise ValueError('Unreadable WebDAV catalog entry')
                 continue
             length = properties.findtext('{DAV:}getcontentlength')
+            if strict and (properties.find('{DAV:}resourcetype') is None or
+                    properties.find('{DAV:}resourcetype/{DAV:}collection') is None and length is None):
+                raise ValueError('Incomplete WebDAV catalog properties')
             result.append(dict(path=unicodedata.normalize('NFC', path[len(prefix):].rstrip('/')),
                 download_path=path[len(prefix):].rstrip('/'),etag=properties.findtext('{DAV:}getetag'),
                 directory=properties.find('{DAV:}resourcetype/{DAV:}collection') is not None,

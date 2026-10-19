@@ -26,6 +26,10 @@ import network
 import storage
 
 
+class PublicationPending(RuntimeError):
+    pass
+
+
 class Client(nextcloud.Share):
     def __init__(self, server, username, password, timeout=120):
         parsed=urllib.parse.urlsplit(server)
@@ -67,6 +71,9 @@ class Client(nextcloud.Share):
             headers={'Authorization':self.authorization,**(headers or {})})
         return self.opener.open(request,timeout=self.timeout)
 
+    def listing(self, folder):
+        return super().listing(folder,strict=True)
+
 
 def hashes(row):
     return {kind.lower():value.lower() for kind,value in re.findall(
@@ -87,6 +94,7 @@ class Uploader(nextcloud.Sync):
         self.index=None
         self._lookup_cache=None
         self._lookup_lock=Lock()
+        self._catalog_refresh_lock=Lock()
         self._lookup_generation=0
         self.active_hashes=set()
         self.known_folders=set()
@@ -195,6 +203,19 @@ class Uploader(nextcloud.Sync):
                     result.append(row)
         return result
 
+    def refresh_index(self, observed):
+        with self._catalog_refresh_lock:
+            if self.stopping.is_set():raise InterruptedError('OpenCloud catalog refresh interrupted')
+            if self.index is not observed:return
+            with self.index_lock:
+                appended=len(observed)
+            rows=self.scan()
+            with self.index_lock:
+                # Retain publications completed while the remote walk was running.
+                rows.extend(observed[appended:])
+                self.index=rows
+                self._lookup_cache=None
+
     def remote_digest(self, row):
         digest=hashlib.sha256();total=0
         with self.share.request('GET',row.get('download_path',row['path'])) as response:
@@ -243,7 +264,7 @@ class Uploader(nextcloud.Sync):
         name=re.sub(r'^\d+\s*-\s*','',PurePosixPath(name).name)
         return (size,nextcloud.normalized(name)) in unnamed
 
-    def original_exists(self, item, root=None, source=None):
+    def original_exists(self, item, root=None, source=None, strict=False):
         if self.exists(item['sha256'],item.get('sha1')):return True
         md5=item.get('md5')
         path=None
@@ -264,18 +285,22 @@ class Uploader(nextcloud.Sync):
                 metadata=d.api(source,item['path'],stopping=self.stopping)
                 if (metadata.get('size'),metadata.get('sha256'))==(item['size'],item['sha256']):
                     md5=metadata.get('md5')
+                elif strict:
+                    raise ValueError('OpenCloud source metadata identity changed; session retained')
                 if md5 and re.fullmatch('[0-9a-fA-F]{32}',md5):
                     path.parent.mkdir(mode=0o700,exist_ok=True)
                     d.write_json(path,dict(identity,md5=md5.lower()))
+                elif strict:
+                    raise ValueError('OpenCloud source metadata lacks a valid MD5; session retained')
             except (OSError,http.client.HTTPException,ValueError) as error:
-                if isinstance(error,InterruptedError) or storage.disk_error(error):raise
+                if strict or isinstance(error,InterruptedError) or storage.disk_error(error):raise
                 print(f'OPENCLOUD METADATA WARNING: {item["path"]}; {type(error).__name__}; HTTP={getattr(error,"code",None)}',flush=True)
         if md5 and re.fullmatch('[0-9a-fA-F]{32}',md5):
             item['md5']=md5.lower()
             return md5.lower() in checksums['md5']
         return False
 
-    def confirm_publication(self, row, stage, sha1):
+    def confirm_publication(self, row, stage, sha1, wait=True):
         deadline=time.monotonic()+getattr(self.share,'timeout',120)
         delay=1
         while True:
@@ -291,11 +316,72 @@ class Uploader(nextcloud.Sync):
                         or not comparable and self.remote_digest(found)!=row['payload_sha256']):
                     raise FileExistsError('OpenCloud target checksum conflict; refusing overwrite')
                 return path
+            if not wait:return None
             remaining=deadline-time.monotonic()
-            if remaining<=0:raise RuntimeError('OpenCloud upload not published yet; session retained')
+            if remaining<=0:raise PublicationPending('OpenCloud upload not published yet; session retained')
             if self.stopping.wait(min(remaining,delay)*random.uniform(.75,1)):
                 raise InterruptedError('OpenCloud publication interrupted')
             delay=min(5,delay*2)
+
+    def session_offset(self, row):
+        if self.stopping.is_set():raise InterruptedError('OpenCloud upload interrupted')
+        with self.share.request('HEAD',row['session_url'],headers={'Tus-Resumable':'1.0.0'}) as response:
+            offset=int(response.headers['Upload-Offset'])
+            if int(response.headers.get('Upload-Length',row['size']))!=row['size'] or not 0<=offset<=row['size']:
+                raise RuntimeError('Invalid OpenCloud upload offset/length')
+            return offset
+
+    def create_session(self, job, row, stage, sha1, mtime):
+        if self.stopping.is_set():raise InterruptedError('OpenCloud upload interrupted')
+        storage.check(job[4])
+        metadata={'filename':PurePosixPath(stage).name,'checksum':'SHA1 '+sha1,'mtime':str(mtime//10**9)}
+        headers={'Tus-Resumable':'1.0.0','Upload-Length':str(row['size']),'Content-Length':'0',
+                 'Upload-Metadata':','.join(k+' '+base64.b64encode(v.encode()).decode() for k,v in metadata.items())}
+        row['state']='creating';self.save_record(job,row)
+        with self.share.request('POST',str(PurePosixPath(stage).parent),data=b'',headers=headers) as response:
+            if response.status!=201:raise RuntimeError('OpenCloud did not create upload')
+            session=self.share.safe_url(response.headers['Location'])
+        row.update(session_url=session,sent_bytes=0,state='uploading')
+        self.save_record(job,row)
+
+    def recover_session(self, job, row, stage, sha1, mtime, may_restart):
+        observed=self.index
+        try:
+            self.confirm_publication(row,stage,sha1)
+            return row['size']
+        except PublicationPending:
+            pass
+        if not may_restart:raise RuntimeError('OpenCloud session lost again; latest session retained for next pass')
+        self.refresh_index(observed)
+        del observed
+        if (self.exists(row['payload_sha256'],sha1,row['payload_md5']) or self.name_exists(row['target'],row['size'])
+                or self.original_exists(job[3],job[1],job[2]['source'],strict=True)):
+            row.update(state='existing',error_type=None,http_status=None,error_reason=None,error_errno=None)
+            self.save_record(job,row)
+            print('OPENCLOUD EXISTS AFTER SESSION LOSS: '+row['path'],flush=True)
+            return None
+        # Publication or the session itself may have appeared during the full walk.
+        if self.confirm_publication(row,stage,sha1,wait=False):return row['size']
+        try:
+            return self.session_offset(row)
+        except urllib.error.HTTPError as error:
+            if error.code not in (404,410):raise
+            status=error.code;error.close()
+        if self.stopping.is_set():raise InterruptedError('OpenCloud upload interrupted')
+        storage.check(job[4])
+        if file_hashes.fingerprint(job[4])!=row['local_fingerprint']:
+            raise RuntimeError('Local video changed; previous session retained')
+        row['last_lost_session']=dict(id=hashlib.sha256(row['session_url'].encode()).hexdigest()[:16],
+                                      confirmed_bytes=row['sent_bytes'],http_status=status,
+                                      time=datetime.now().astimezone().isoformat())
+        row['session_restarts']=row.get('session_restarts',0)+1
+        row.pop('session_url')
+        row.update(state='session_lost',sent_bytes=0)
+        self.save_record(job,row)
+        print(f'OPENCLOUD SESSION LOST: {row["path"]}; confirmed_bytes={row["last_lost_session"]["confirmed_bytes"]}; '
+              f'restart={row["session_restarts"]}',flush=True)
+        self.create_session(job,row,stage,sha1,mtime)
+        return 0
 
     def run_once(self, roots, upload=False, limit=None):
         jobs=self.jobs(roots)
@@ -396,34 +482,23 @@ class Uploader(nextcloud.Sync):
                     except urllib.error.HTTPError as error:
                         if error.code!=405:raise
                     self.known_folders.add(folder)
+            offset=None
             if not row.get('session_url'):
-                metadata={'filename':PurePosixPath(stage).name,'checksum':'SHA1 '+sha1,'mtime':str(mtime//10**9)}
-                headers={'Tus-Resumable':'1.0.0','Upload-Length':str(size),'Content-Length':'0',
-                         'Upload-Metadata':','.join(k+' '+base64.b64encode(v.encode()).decode() for k,v in metadata.items())}
-                row['state']='creating';self.save_record(job,row)
-                with self.share.request('POST',str(PurePosixPath(stage).parent),data=b'',headers=headers) as response:
-                    if response.status!=201:raise RuntimeError('OpenCloud did not create upload')
-                    row['session_url']=self.share.safe_url(response.headers['Location'])
-                row['state']='uploading';self.save_record(job,row)
+                if row.get('session_restarts') and self.confirm_publication(row,stage,sha1,wait=False):
+                    row['sent_bytes']=offset=size
+                else:
+                    self.create_session(job,row,stage,sha1,mtime)
             print('OPENCLOUD UPLOAD START: '+target,flush=True)
-            failures=0;offset=None;confirmed_offset=None
+            failures=0;confirmed_offset=None;restarted=False
             with local.open('rb') as stream:
-                while row['sent_bytes']<size:
+                while offset is None or row['sent_bytes']<size:
                     if self.stopping.is_set():raise InterruptedError('OpenCloud upload interrupted')
                     storage.check(local)
                     after=local.stat()
                     if (after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns)!=fingerprint:raise RuntimeError('Local video changed')
                     try:
                         if offset is None:
-                            try:
-                                with self.share.request('HEAD',row['session_url'],headers={'Tus-Resumable':'1.0.0'}) as response:
-                                    offset=int(response.headers['Upload-Offset'])
-                                    if int(response.headers.get('Upload-Length',size))!=size or not 0<=offset<=size:
-                                        raise RuntimeError('Invalid OpenCloud upload offset/length')
-                            except urllib.error.HTTPError as error:
-                                if error.code not in (404,410):raise
-                                self.confirm_publication(row,stage,sha1)
-                                offset=size
+                            offset=self.session_offset(row)
                             if self.upload_budget and confirmed_offset is not None:
                                 self.upload_budget.confirmed(max(0,offset-confirmed_offset))
                             confirmed_offset=offset
@@ -443,6 +518,17 @@ class Uploader(nextcloud.Sync):
                         failures=0
                     except (OSError,http.client.HTTPException) as error:
                         offset=None
+                        if isinstance(error,urllib.error.HTTPError) and error.code in (404,410):
+                            error.close()
+                            previous=row.get('session_restarts',0)
+                            offset=self.recover_session(job,row,stage,sha1,mtime,not restarted)
+                            if offset is None:return False
+                            restarted=restarted or row.get('session_restarts',0)>previous
+                            if self.upload_budget and confirmed_offset is not None:
+                                self.upload_budget.confirmed(max(0,offset-confirmed_offset))
+                            confirmed_offset=offset
+                            row.update(sent_bytes=offset,state='uploading');self.save_record(job,row)
+                            continue
                         if storage.disk_error(error) or isinstance(error,urllib.error.HTTPError) and error.code not in (408,409,429,500,502,503,504):raise
                         failures+=1
                         if failures>self.retries:raise
@@ -457,7 +543,8 @@ class Uploader(nextcloud.Sync):
                     if response.status!=201:raise RuntimeError('OpenCloud did not confirm file publication')
             row.update(state='uploaded',sent_bytes=size,error_type=None,http_status=None,error_reason=None,error_errno=None)
             self.save_record(job,row)
-            self.index.append(dict(path=target,size=size,directory=False,checksums=['SHA256:'+actual]))
+            with self.index_lock:
+                self.index.append(dict(path=target,size=size,directory=False,checksums=['SHA256:'+actual]))
             print('OPENCLOUD UPLOADED: '+target,flush=True)
             return True
         except BaseException as error:

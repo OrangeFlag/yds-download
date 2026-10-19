@@ -94,6 +94,18 @@ class UploadChecks(unittest.TestCase):
             job[3]['path'],job[5],str(job[4]),job[6],job[10]],ensure_ascii=False).encode()).hexdigest()
         return job[1]/'.download/opencloud-uploads'/key[:2]/(key+'.json')
 
+    def seed_lost_session(self, sent_bytes=7):
+        self.server.timeout=0
+        job=self.job()
+        row=dict(source=self.data['source'],path=self.item['path'],variant='original',
+                 target='ingest/Walterit/2024-fall/Course/001 - Lecture.mp4',
+                 payload_sha256=self.item['sha256'],payload_sha1=hashlib.sha1(self.content).hexdigest(),
+                 payload_md5=hashlib.md5(self.content).hexdigest(),size=len(self.content),
+                 sent_bytes=sent_bytes,state='pending',session_url='https://cloud.example/data/lost',
+                 local_fingerprint=oc.file_hashes.fingerprint(self.local))
+        self.uploader.save_record(job,row);self.uploader.index=[]
+        return job,row
+
     def test_checkpoint_updates_reuse_durable_parent_directories(self):
         job = self.job()
         row = dict(state='uploading', sent_bytes=4, session_url='https://cloud.example/private')
@@ -642,14 +654,294 @@ class UploadChecks(unittest.TestCase):
             self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
         self.assertEqual(self.uploader.record(self.job())['state'],'uploaded')
 
-    def test_expired_session_without_published_file_is_preserved(self):
+    def test_repeated_session_loss_is_bounded_and_keeps_the_latest_session(self):
         self.server.timeout=0
         with patch.object(self.server,'request',side_effect=lambda method,path='',**kwargs:
-                (_ for _ in ()).throw(urllib.error.HTTPError(path,410,'expired',{},None)) if method=='HEAD'
+                (_ for _ in ()).throw(urllib.error.HTTPError(path,410,'expired',{},None)) if method in ('HEAD','PATCH')
                 else Server.request(self.server,method,path,**kwargs)):
             self.assertEqual(self.uploader.run_once([self.root],upload=True),1)
         row=self.uploader.record(self.job())
         self.assertEqual(row['state'],'pending');self.assertIn('session_url',row)
+        self.assertEqual(row['session_restarts'],1)
+        self.assertEqual(sum(m=='POST' for m,p,h in self.server.calls),2)
+
+    def test_lost_session_reuploads_only_after_a_successful_fresh_scan(self):
+        job,old=self.seed_lost_session();request=self.server.request
+        def lost(method,path='',**kwargs):
+            if method=='HEAD' and path==old['session_url']:
+                raise urllib.error.HTTPError(path,404,'gone',{},None)
+            return request(method,path,**kwargs)
+        with patch.object(self.server,'request',side_effect=lost),patch.object(self.uploader,'scan',return_value=[]) as scan:
+            self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        row=self.uploader.record(job)
+        self.assertEqual(row['state'],'uploaded');self.assertEqual(row['session_restarts'],1)
+        self.assertEqual(row['last_lost_session']['confirmed_bytes'],7)
+        self.assertEqual(scan.call_count,1)
+        self.assertEqual(self.server.files[row['target']],self.content)
+        self.assertEqual(sum(m=='POST' for m,p,h in self.server.calls),1)
+        self.assertNotIn(old['session_url'],(self.state/'opencloud-uploads.jsonl').read_text())
+
+    def test_completed_lost_session_finds_a_renamed_copy_in_the_refreshed_space(self):
+        job,old=self.seed_lost_session(len(self.content));request=self.server.request
+        other=dict(path='other-user/renamed.mp4',size=len(self.content),directory=False,
+                   checksums=['SHA256:'+self.item['sha256']])
+        def lost(method,path='',**kwargs):
+            if method=='HEAD':raise urllib.error.HTTPError(path,404,'gone',{},None)
+            return request(method,path,**kwargs)
+        with patch.object(self.server,'request',side_effect=lost),patch.object(self.uploader,'scan',return_value=[other]) as scan:
+            self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(self.uploader.record(job)['state'],'existing')
+        self.assertEqual(scan.call_count,1)
+        self.assertFalse(any(m in ('POST','PATCH','GET') for m,p,h in self.server.calls))
+
+    def test_complete_lost_session_without_any_copy_restarts_upload(self):
+        job,old=self.seed_lost_session(len(self.content));request=self.server.request
+        def lost(method,path='',**kwargs):
+            if method=='HEAD' and path==old['session_url']:
+                raise urllib.error.HTTPError(path,404,'gone',{},None)
+            return request(method,path,**kwargs)
+        with patch.object(self.server,'request',side_effect=lost),patch.object(self.uploader,'scan',return_value=[]):
+            self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(self.uploader.record(job)['state'],'uploaded')
+        self.assertEqual(sum(m=='POST' for m,p,h in self.server.calls),1)
+
+    def test_catalog_failure_preserves_lost_session_and_confirmed_position(self):
+        job,old=self.seed_lost_session();request=self.server.request
+        def lost(method,path='',**kwargs):
+            if method=='HEAD':raise urllib.error.HTTPError(path,404,'gone',{},None)
+            return request(method,path,**kwargs)
+        with patch.object(self.server,'request',side_effect=lost),patch.object(self.uploader,'scan',side_effect=TimeoutError('catalog offline')):
+            self.assertEqual(self.uploader.run_once([self.root],upload=True),1)
+        row=self.uploader.record(job)
+        self.assertEqual((row['session_url'],row['sent_bytes']),(old['session_url'],old['sent_bytes']))
+        self.assertNotIn('session_restarts',row)
+        self.assertFalse(any(m in ('POST','PATCH') for m,p,h in self.server.calls))
+
+    def test_late_stage_publication_avoids_reupload_after_catalog_refresh(self):
+        job,old=self.seed_lost_session();request=self.server.request
+        stage=str(Path(old['target']).parent/('.yds-'+self.item['sha256']+'.upload'))
+        def scan():
+            self.server.files[stage]=self.content
+            return []
+        def lost(method,path='',**kwargs):
+            if method=='HEAD':raise urllib.error.HTTPError(path,404,'gone',{},None)
+            return request(method,path,**kwargs)
+        with patch.object(self.server,'request',side_effect=lost),patch.object(self.uploader,'scan',side_effect=scan):
+            self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(self.uploader.record(job)['state'],'uploaded')
+        self.assertFalse(any(m in ('POST','PATCH') for m,p,h in self.server.calls))
+
+    def test_session_that_reappears_during_scan_keeps_accepted_blocks(self):
+        job,old=self.seed_lost_session();request=self.server.request;heads=[]
+        self.server.payload=bytearray(self.content[:7])
+        self.server.stage=str(Path(old['target']).parent/('.yds-'+self.item['sha256']+'.upload'))
+        def lost(method,path='',**kwargs):
+            if method=='HEAD':
+                heads.append(path)
+                if len(heads)==1:raise urllib.error.HTTPError(path,404,'gone',{},None)
+            return request(method,path,**kwargs)
+        with patch.object(self.server,'request',side_effect=lost),patch.object(self.uploader,'scan',return_value=[]):
+            self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(self.uploader.record(job)['state'],'uploaded')
+        self.assertFalse(any(m=='POST' for m,p,h in self.server.calls))
+        self.assertEqual([int(h['Upload-Offset']) for m,p,h in self.server.calls if m=='PATCH'],[7,14,21])
+
+    def test_patch_404_uses_the_same_lost_session_recovery(self):
+        job,old=self.seed_lost_session();request=self.server.request;lost=[False]
+        self.server.payload=bytearray(self.content[:7])
+        def respond(method,path='',**kwargs):
+            if path==old['session_url'] and (method=='PATCH' or method=='HEAD' and lost[0]):
+                lost[0]=True
+                raise urllib.error.HTTPError(path,404,'gone',{},None)
+            return request(method,path,**kwargs)
+        with patch.object(self.server,'request',side_effect=respond),patch.object(self.uploader,'scan',return_value=[]):
+            self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(self.uploader.record(job)['session_restarts'],1)
+        self.assertEqual(self.uploader.record(job)['state'],'uploaded')
+
+    def test_lost_session_checks_other_metadata_hashes_and_unhashed_names(self):
+        request=self.server.request
+        copies=[dict(path='other/renamed.mp4',checksums=[kind+':'+digest]) for kind,digest in (
+            ('SHA1',hashlib.sha1(self.content).hexdigest()),('MD5',hashlib.md5(self.content).hexdigest()))]
+        copies.append(dict(path='other/999 - Lecture.mp4',checksums=[]))
+        for copy in copies:
+            with self.subTest(copy=copy):
+                job,old=self.seed_lost_session()
+                def lost(method,path='',**kwargs):
+                    if method=='HEAD':raise urllib.error.HTTPError(path,404,'gone',{},None)
+                    return request(method,path,**kwargs)
+                row=dict(copy,size=len(self.content),directory=False)
+                with patch.object(self.server,'request',side_effect=lost),patch.object(self.uploader,'scan',return_value=[row]):
+                    self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+                self.assertEqual(self.uploader.record(job)['state'],'existing')
+        self.assertFalse(any(m in ('POST','PATCH','GET') for m,p,h in self.server.calls))
+
+    def test_interrupted_catalog_refresh_preserves_lost_session(self):
+        job,old=self.seed_lost_session();request=self.server.request
+        def lost(method,path='',**kwargs):
+            if method=='HEAD':raise urllib.error.HTTPError(path,404,'gone',{},None)
+            return request(method,path,**kwargs)
+        with patch.object(self.server,'request',side_effect=lost),patch.object(self.uploader,'scan',side_effect=InterruptedError('stop')):
+            self.assertEqual(self.uploader.run_once([self.root],upload=True),1)
+        row=self.uploader.record(job)
+        self.assertEqual((row['session_url'],row['sent_bytes']),(old['session_url'],7))
+        self.assertNotIn('session_restarts',row)
+        self.assertFalse(any(m=='POST' for m,p,h in self.server.calls))
+
+    def test_completed_stage_after_restart_checkpoint_is_published_without_new_session(self):
+        job,row=self.seed_lost_session(0)
+        row.pop('session_url');row.update(state='session_lost',session_restarts=1)
+        self.uploader.save_record(job,row)
+        stage=str(Path(row['target']).parent/('.yds-'+self.item['sha256']+'.upload'))
+        self.server.files[stage]=self.content
+        self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(self.uploader.record(job)['state'],'uploaded')
+        self.assertFalse(any(m in ('POST','PATCH') for m,p,h in self.server.calls))
+
+    def test_catalog_refresh_is_shared_and_keeps_concurrent_publications(self):
+        self.uploader.index=[];observed=self.uploader.index
+        started=Event();release=Event()
+        published=dict(path='our/just-published.mp4',directory=False,size=1,checksums=['SHA256:'+'a'*64])
+        def scan():
+            started.set()
+            if not release.wait(3):raise AssertionError('refresh was not released')
+            with self.uploader.index_lock:self.uploader.index.append(published)
+            return []
+        with patch.object(self.uploader,'scan',side_effect=scan) as scanned,ThreadPoolExecutor(max_workers=2) as pool:
+            first=pool.submit(self.uploader.refresh_index,observed)
+            self.assertTrue(started.wait(3))
+            second=pool.submit(self.uploader.refresh_index,observed)
+            release.set();first.result(timeout=3);second.result(timeout=3)
+        self.assertEqual(scanned.call_count,1)
+        self.assertEqual(self.uploader.index,[published])
+        self.assertIsNot(self.uploader.index,observed)
+
+    def test_session_restart_counts_only_new_transferred_bytes(self):
+        job,old=self.seed_lost_session();request=self.server.request
+        def lost(method,path='',**kwargs):
+            if method=='HEAD' and path==old['session_url']:
+                raise urllib.error.HTTPError(path,404,'gone',{},None)
+            return request(method,path,**kwargs)
+        with oc.nextcloud.SharedUploadBudget(self.root/'budget','opencloud',2,8) as budget:
+            self.uploader.upload_budget=budget
+            with patch.object(self.server,'request',side_effect=lost),patch.object(self.uploader,'scan',return_value=[]):
+                self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+            state=json.loads((self.root/'budget/state.json').read_text())
+            self.assertEqual(state['controller']['total'],len(self.content))
+
+    def test_disappearing_session_waits_for_delayed_publication_before_restart(self):
+        job,row=self.seed_lost_session(len(self.content));request=self.server.request;listing=self.server.listing
+        self.server.timeout=60;lookups=[]
+        parent=str(Path(row['target']).parent);stage=str(Path(parent)/('.yds-'+self.item['sha256']+'.upload'))
+        def delayed(folder):
+            if folder==parent:
+                lookups.append(folder)
+                if len(lookups)==3:self.server.files[stage]=self.content
+            return listing(folder)
+        def lost(method,path='',**kwargs):
+            if method=='HEAD':raise urllib.error.HTTPError(path,404,'gone',{},None)
+            return request(method,path,**kwargs)
+        with patch.object(self.server,'request',side_effect=lost),patch.object(self.server,'listing',side_effect=delayed), \
+                patch.object(self.uploader,'scan',return_value=[]),patch.object(self.uploader.stopping,'wait',return_value=False):
+            self.assertEqual(self.uploader.run_once([self.root],upload=True),0)
+        self.assertEqual(self.uploader.record(job)['state'],'uploaded')
+        self.assertFalse(any(m in ('POST','PATCH') for m,p,h in self.server.calls))
+
+    def test_fresh_original_suppresses_reupload_of_a_lost_partial_or_camrip(self):
+        for variant in ('partial','camrip'):
+            with self.subTest(variant=variant):
+                job,row=self.seed_lost_session()
+                job=(*job[:5],variant,*job[6:])
+                row.update(variant=variant,payload_sha256='f'*64,payload_sha1='a'*40,payload_md5='b'*32)
+                original=dict(path='organized/renamed.mp4',directory=False,size=len(self.content),
+                              checksums=['SHA256:'+self.item['sha256']])
+                with patch.object(self.uploader,'scan',return_value=[original]), \
+                        patch.object(self.uploader,'session_offset',side_effect=urllib.error.HTTPError('unused',404,'gone',{},None)):
+                    result=self.uploader.recover_session(job,row,'unpublished.upload',row['payload_sha1'],job[10],True)
+                self.assertIsNone(result)
+                self.assertEqual(self.uploader.record(job)['state'],'existing')
+        self.assertFalse(any(m=='POST' for m,p,h in self.server.calls))
+
+    def test_failed_original_metadata_preserves_lost_partial_session(self):
+        failures=[urllib.error.HTTPError('unused',401,'denied',{},None),ValueError('bad JSON'),
+                  dict(size=1,sha256='0'*64,md5='c'*32),dict(self.item,md5=None)]
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                job,row=self.seed_lost_session();job=(*job[:5],'partial',*job[6:])
+                row.update(variant='partial',payload_sha256='f'*64,payload_sha1='a'*40,payload_md5='b'*32)
+                self.uploader.save_record(job,row)
+                original=dict(path='organized/original.mp4',directory=False,size=self.item['size'],checksums=['MD5:'+'c'*32])
+                with patch.object(self.uploader,'scan',return_value=[original]), \
+                        patch.object(d,'api',side_effect=failure if isinstance(failure,Exception) else None,
+                                     return_value=failure):
+                    with self.assertRaises((OSError,ValueError)):
+                        self.uploader.recover_session(job,row,'unpublished.upload',row['payload_sha1'],job[10],True)
+                saved=self.uploader.record(job)
+                self.assertEqual(saved['session_url'],'https://cloud.example/data/lost')
+                self.assertEqual(saved['sent_bytes'],7)
+        self.assertFalse(any(m=='POST' for m,p,h in self.server.calls))
+
+    def test_opencloud_listing_rejects_unreadable_subtrees_but_allows_optional_missing_hash(self):
+        client=oc.Client('https://cloud.example','Walterit','secret');client.base=self.server.base
+        for props,accepted in [('<d:propstat><d:prop/><d:status>HTTP/1.1 403 Forbidden</d:status></d:propstat>',False),
+                ('<d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>'
+                 '<d:propstat><d:prop><o:checksums/></d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>',True)]:
+            body=('<d:multistatus xmlns:d="DAV:" xmlns:o="http://owncloud.org/ns"><d:response>'
+                  '<d:href>/dav/spaces/project/subtree/</d:href>'+props+'</d:response></d:multistatus>').encode()
+            with self.subTest(accepted=accepted),patch.object(client,'request',return_value=Response(207,body=body)):
+                if accepted:self.assertTrue(client.listing('')[0]['directory'])
+                else:
+                    with self.assertRaises(ValueError):client.listing('')
+
+    def test_stop_or_local_change_during_final_head_preserves_old_session(self):
+        job=self.job()
+        for action in ('stop','change','missing'):
+            with self.subTest(action=action):
+                self.uploader.stopping.clear();self.local.write_bytes(self.content)
+                with patch.object(self.uploader,'jobs',return_value=[job]):job,row=self.seed_lost_session()
+                def lost(current):
+                    if action=='stop':self.uploader.stopping.set()
+                    elif action=='change':self.local.write_bytes(b'changed video')
+                    else:self.local.unlink()
+                    raise urllib.error.HTTPError('unused',404,'gone',{},None)
+                with patch.object(self.uploader,'scan',return_value=[]),patch.object(self.uploader,'session_offset',side_effect=lost):
+                    with self.assertRaises((OSError,RuntimeError)):
+                        self.uploader.recover_session(job,row,'stage',row['payload_sha1'],job[10],True)
+                saved=self.uploader.record(job)
+                self.assertEqual(saved['session_url'],'https://cloud.example/data/lost')
+                self.assertEqual(saved['sent_bytes'],7)
+                self.assertNotIn('session_restarts',saved)
+        self.assertFalse(any(m=='POST' for m,p,h in self.server.calls))
+
+    def test_opencloud_listing_rejects_denied_root_without_slash_and_empty_multistatus(self):
+        client=oc.Client('https://cloud.example','Walterit','secret');client.base=self.server.base
+        for rows in ('<d:response><d:href>/dav/spaces/project</d:href>'
+                     '<d:status>HTTP/1.1 403 Forbidden</d:status></d:response>',''):
+            body=('<d:multistatus xmlns:d="DAV:">'+rows+'</d:multistatus>').encode()
+            with self.subTest(rows=rows),patch.object(client,'request',return_value=Response(207,body=body)):
+                with self.assertRaises(ValueError):client.listing('')
+
+    def test_staggered_publication_waits_share_the_same_catalog_refresh(self):
+        job,row=self.seed_lost_session();entered=Event();refreshed=Event()
+        def publication(current,*args,**kwargs):
+            if kwargs.get('wait') is False:return None
+            if current['worker']=='second':
+                entered.set()
+                if not refreshed.wait(3):raise AssertionError('first refresh missing')
+            else:
+                if not entered.wait(3):raise AssertionError('second recovery missing')
+            raise oc.PublicationPending('not published')
+        refresh=self.uploader.refresh_index
+        def refresh_index(observed):
+            refresh(observed);refreshed.set()
+        with patch.object(self.uploader,'confirm_publication',side_effect=publication), \
+                patch.object(self.uploader,'scan',return_value=[]) as scanned, \
+                patch.object(self.uploader,'refresh_index',side_effect=refresh_index), \
+                patch.object(self.uploader,'session_offset',return_value=7),ThreadPoolExecutor(max_workers=2) as pool:
+            first=pool.submit(self.uploader.recover_session,job,dict(row,worker='first'),'stage',row['payload_sha1'],job[10],True)
+            second=pool.submit(self.uploader.recover_session,job,dict(row,worker='second'),'stage',row['payload_sha1'],job[10],True)
+            self.assertEqual(first.result(timeout=3),7);self.assertEqual(second.result(timeout=3),7)
+        self.assertEqual(scanned.call_count,1)
 
     def test_lost_move_response_without_remote_checksums_is_reconciled(self):
         original=self.server.request
