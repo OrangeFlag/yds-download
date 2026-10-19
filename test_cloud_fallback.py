@@ -106,6 +106,16 @@ class CloudChecks(unittest.TestCase):
         state=''.join(path.read_text() for path in self.state.rglob('*.json'))
         self.assertNotIn('app token',state+cloud.link)
 
+    def test_annual_archive_opencloud_fallback_matches_only_year_folder(self):
+        self.data['title']='ШАД 2017'
+        d.write_json(self.state/'source.json',self.data)
+        expected=dict(self.rows[-1],path='ingest/Other/2017/Course/001 - Lecture.mp4')
+        wrong=[dict(expected,path=f'ingest/Other/{year}/Course/001 - Lecture.mp4')
+               for year in ('2017-fall','2017-spring','2018')]
+        self.server.rows=wrong+[expected]
+        index=self.cloud().sources[0].index
+        self.assertEqual(index.candidates(self.data,self.item),[expected])
+
     def test_hash_matches_renamed_file_but_conflict_cannot_fall_back_to_name(self):
         cloud=self.cloud();index=cloud.sources[0].index
         self.rows[-1]['checksums']=['SHA256:'+'0'*64,'MD5:'+'a'*32]
