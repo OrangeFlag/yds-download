@@ -14,6 +14,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from threading import RLock
 import urllib.error
@@ -170,16 +171,16 @@ def write_json(path, data):
     storage.check(path)
     with STATE_LOCK:
         data = storage.portable_state(path, data)
-        temporary = path.with_name(path.name + '.tmp')
-        with temporary.open('w', encoding='utf-8') as stream:
-            json.dump(data, stream, ensure_ascii=False, indent=2)
-            stream.flush(); os.fsync(stream.fileno())
-        temporary.replace(path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        descriptor, name = tempfile.mkstemp(prefix=path.name + '.', suffix='.tmp', dir=path.parent)
+        temporary = Path(name)
         try:
-            os.fsync(directory)
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+                json.dump(data, stream, ensure_ascii=False, indent=2)
+                stream.flush(); os.fsync(stream.fileno())
+            temporary.replace(path)
+            storage.sync_directory(path.parent)
         finally:
-            os.close(directory)
+            temporary.unlink(missing_ok=True)
 
 
 def write_failures(path, events):
