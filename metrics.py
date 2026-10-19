@@ -28,6 +28,8 @@ class Metrics:
         self.path, self.role, self.interval = Path(path), role, interval
         self.settings = settings or {}
         self.run_id = uuid.uuid4().hex
+        self.started_at = datetime.now().astimezone().isoformat()
+        self.range_reported = False
         self.lock, self.snapshot_lock, self.stop = RLock(), RLock(), Event()
         self.counters, self.previous = Counter(), Counter()
         self.errors, self.gauges, self.tasks = {}, {}, {}
@@ -237,6 +239,15 @@ class Metrics:
                         while buffer and buffer[0]['sequence'] <= cutoff:
                             buffer.popleft()
                 self.previous = row['counters']; self.previous_time = now; self.host_previous = host
+                if row['counters'].get('range_requests') or self.range_reported:
+                    packet=dict(budget='range:'+str(self.path.absolute()),epoch=self.run_id)
+                    if not self.range_reported:
+                        print('TRANSFER STATS: '+json.dumps(dict(packet,time=self.started_at,
+                              sources={'yandex_range':0})),flush=True)
+                        self.range_reported=True
+                    print('TRANSFER STATS: '+json.dumps(dict(packet,time=row['time'],
+                          sources={'yandex_range':row['counters'].get('range_received_bytes',0)},
+                          closed=self.closed)),flush=True)
         except (OSError, ValueError, KeyError, TypeError) as error:
             self.warning(error)
 

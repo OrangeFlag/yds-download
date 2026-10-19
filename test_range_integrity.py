@@ -35,10 +35,28 @@ class RangeIntegrityTest(unittest.TestCase):
                            range_linear_block_size_kib=1, range_max_passes=1,
                            range_workers=1, range_rps=100000)
 
-    def ranges(self, response):
+    def ranges(self, response, metrics=None):
         with patch.object(download, 'api', return_value=self.item), \
                 patch.object(download.OPENER, 'open', return_value=response), redirect_stdout(io.StringIO()):
-            return recovery.retry_ranges(self.root, self.event, self.item, 0, self.tuning)
+            return recovery.retry_ranges(self.root, self.event, self.item, 0, self.tuning, metrics=metrics)
+
+    def test_traffic_counts_new_durable_blocks_not_the_existing_body(self):
+        from metrics import Metrics
+        import service_stats
+        m=Metrics(self.root/'.download/metrics.jsonl','range-worker',start=False)
+        self.addCleanup(m.close)
+        self.assertEqual(self.ranges(Response(0,1024,1024,self.content),metrics=m),[[0,1024]])
+        output=io.StringIO()
+        with redirect_stdout(output):
+            m.snapshot()
+            with patch.object(download.OPENER,'open',side_effect=AssertionError('Already saved')):
+                recovery.retry_ranges(self.root,self.event,self.item,0,self.tuning,metrics=m)
+            m.snapshot();m.close()
+        rows=[json.loads(s.split('TRANSFER STATS: ',1)[1]) for s in output.getvalue().splitlines()
+              if s.startswith('TRANSFER STATS: ')]
+        for row in rows:row['time']=service_stats.timestamp(row['time'])
+        self.assertEqual(service_stats.traffic(rows,None,rows[-1]['time'])['yandex_range']['bytes'],1024)
+        self.assertEqual(self.body.read_bytes(),self.content)
 
     def test_unbounded_surplus_is_rejected(self):
         self.assertEqual(self.ranges(Response(0, 1024, 1024, self.content + b'EXTRA')), [])

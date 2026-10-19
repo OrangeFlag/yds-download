@@ -11,6 +11,48 @@ import service_stats as stats
 
 
 class StatsTests(unittest.TestCase):
+    def test_range_traffic_adds_parallel_archives_without_mixing_restarts(self):
+        rows=[dict(time=t,budget=b,epoch=e,sources={'yandex_range':n}) for t,b,e,n in
+              [(100,'archive-a','a',0),(160,'archive-a','a',600),
+               (170,'archive-a','restart',0),(230,'archive-a','restart',1200),
+               (170,'archive-b','b',0),(230,'archive-b','b',600)]]
+        result=stats.traffic(rows,None,230)['yandex_range']
+        self.assertEqual(result['bytes'],2400)
+        self.assertAlmostEqual(result['mbit_s'],(1200+600)*8/60/1e6)
+        self.assertEqual(stats.traffic(rows,180,230)['yandex_range']['bytes'],0)
+
+    def test_range_completions_include_attempt_zero_but_not_old_local_checks(self):
+        rows=[(1,'VALID: /Course/a.mp4 (attempt 0) Recovered all ranges and SHA-256 verified'),
+              (2,'VALID: /Course/b.mp4 (attempt 3) Recovered all ranges and SHA-256 verified'),
+              (3,'VALID: /Course/c.mp4 (attempt 0) Existing local original; SHA-256 verified'),
+              (4,'VALID: /Course/d.mp4 (attempt 1) SHA-256 verified')]
+        result=stats.log_summary(rows,'range',None)
+        self.assertEqual(result['files']['yandex_range'],2)
+        self.assertEqual(result['files']['yandex'],1)
+
+    def test_closed_range_stream_keeps_volume_but_no_longer_contributes_speed(self):
+        rows=[dict(time=100,budget='archive',epoch='a',sources={'yandex_range':0}),
+              dict(time=160,budget='archive',epoch='a',sources={'yandex_range':600},closed=True)]
+        result=stats.traffic(rows,None,170)['yandex_range']
+        self.assertEqual(result['bytes'],600)
+        self.assertEqual(result['mbit_s'],0)
+        rows.append(dict(time=170,budget='archive',epoch='restart',sources={'yandex_range':0}))
+        self.assertIsNone(stats.traffic(rows,None,170)['yandex_range']['mbit_s'])
+
+    def test_collect_includes_range_packets_without_a_fresh_file_controller(self):
+        state=self.root/'state';state.mkdir()
+        baseline=dict(time='1970-01-01T00:01:40+00:00',budget='range:archive',epoch='a',sources={'yandex_range':0})
+        packet=dict(baseline,time='1970-01-01T00:02:40+00:00',sources={'yandex_range':600})
+        (state/'range.log').write_text(''.join('1970-01-01 00:02:40,000 TRANSFER STATS: '+json.dumps(p)+'\n' for p in (baseline,packet)))
+        cfg=dict(state_dir=str(state),mount_root=str(self.root),disk_uuid='missing',repo=str(self.root),services={})
+        with patch('storage.mounts',return_value=[]),patch('service_stats.systemd',return_value={}),patch('time.time',return_value=160):
+            result=stats.collect(cfg,[])
+        self.assertEqual(result['directions']['download']['traffic']['yandex_range']['bytes'],600)
+        with patch.object(stats,'collect',return_value=result),patch('sys.stdout',new_callable=io.StringIO) as output:
+            stats.show(cfg,[])
+        yandex=next(line for line in output.getvalue().splitlines() if line.split()[:2]==['Скачивание','Yandex'])
+        self.assertTrue(' '.join(yandex.split()).endswith('нет данных нет данных'))
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name)
@@ -116,11 +158,16 @@ class StatsTests(unittest.TestCase):
         self.assertNotIn("{'",rendered)
         self.assertEqual(stats.size_label(0),'0.0 Б')
         self.assertEqual(stats.age_label(None),'нет данных')
-        data['gauges']={'range_active_files':4,'range_task_discovery_pending_archives':2,'range_task_discovery_reads':32}
+        data['gauges']={'range_active_files':4,'range_eligible_files':1,'range_recheck_eligible_files':2,
+                        'range_task_discovery_pending_archives':2,'range_task_discovery_reads':32}
+        data['metrics_age']=5
         with patch.object(stats,'collect',return_value=data),patch('sys.stdout',io.StringIO()) as output:
             stats.show({},['queue'])
         self.assertIn('Всего активных файлов: 4.',output.getvalue())
         self.assertIn('Очередь показана частично.',output.getvalue())
+        line=next(line for line in output.getvalue().splitlines() if 'Yandex Range' in line)
+        self.assertEqual(line.split()[-2:],['4','3'])
+        self.assertNotIn('*',line)
 
 
 if __name__=='__main__':unittest.main()

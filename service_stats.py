@@ -12,7 +12,7 @@ import time
 
 import storage
 
-SOURCES=('yandex','nextcloud','opencloud','s3')
+SOURCES=('yandex','nextcloud','opencloud','s3','yandex_range')
 STAMP=re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[,.]\d+) (.*)$')
 PROGRESS=re.compile(r'^(NEXTCLOUD|OPENCLOUD|S3) (UPLOAD|DOWNLOAD) PROGRESS: (.+); (\d+)/(\d+) bytes$')
 
@@ -84,7 +84,9 @@ def log_summary(rows,name,cutoff):
         if uploaded:result['files'][uploaded[1].lower()]+=1
         if name in ('queue','range') and message.startswith('VALID: ') and 'SHA-256 verified' in message:
             attempt=re.search(r'\(attempt (\d+)\) (.*)$',message)
-            if attempt and int(attempt[1])>0:
+            if attempt and attempt[2].startswith('Recovered all ranges and SHA-256 verified'):
+                result['files']['yandex_range']+=1
+            elif attempt and int(attempt[1])>0:
                 reason=attempt[2].lower()
                 source=next((s for s in ('nextcloud','opencloud','s3') if reason.startswith(s+' ')),'yandex')
                 result['files'][source]+=1
@@ -97,9 +99,10 @@ def log_summary(rows,name,cutoff):
 
 
 def traffic(rows,cutoff,now):
-    groups=defaultdict(dict);result={}
+    groups=defaultdict(dict);result={};rates={};latest={}
     for row in rows:groups[row['budget'],row['epoch']][row['time']]=row
-    for group in groups.values():
+    for (budget,_),group in groups.items():latest[budget]=max(latest.get(budget,0),max(group))
+    for (budget,_),group in groups.items():
         samples=[group[k] for k in sorted(group)]
         names=set().union(*(r['sources'] for r in samples))
         for name in names:
@@ -108,12 +111,17 @@ def traffic(rows,cutoff,now):
                 if cutoff is None or a['time']>=cutoff:
                     item['bytes']+=max(0,b['sources'].get(name,0)-a['sources'].get(name,0))
                     item['measured']=True
-            if samples and now-samples[-1]['time']<=120:
+            if samples and samples[-1]['time']==latest[budget] and now-samples[-1]['time']<=120:
                 end=samples[-1]
                 base=next((r for r in reversed(samples[:-1]) if end['time']-r['time']>=30),None)
-                if base and end['time']>=item['rate_time']:
-                    item['mbit_s']=max(0,end['sources'].get(name,0)-base['sources'].get(name,0))*8/(end['time']-base['time'])/1e6
-                    item['rate_time']=end['time']
+                if end.get('closed'):
+                    rates[name,budget]=(end['time'],0)
+                elif base:
+                    rates[name,budget]=(end['time'],max(0,end['sources'].get(name,0)-base['sources'].get(name,0))*8/(end['time']-base['time'])/1e6)
+    for (name,_),(stamp,rate) in rates.items():
+        item=result[name]
+        item['mbit_s']=(item['mbit_s'] or 0)+rate
+        item['rate_time']=max(item['rate_time'],stamp)
     return result
 
 
@@ -209,6 +217,10 @@ def collect(config,names,seconds=None):
                                    controller=data.get('controller',{}),members=list(data.get('members',{}).values()),
                                    age=age,stale=age>120)
         if age>120:warnings.append(direction+': budget slots are stale; no recent updates')
+    range_packets=[row for row in packets if 'yandex_range' in row['sources']]
+    if range_packets:
+        group=directions.setdefault('download',dict(traffic={}))
+        group['traffic'].update(traffic(range_packets,cutoff,now))
     archives=Counter();tasks=Counter();gauges={};latest_time=0;host={};queue_states={}
     for queue in queues if attached else ():
         data=read_json(queue,warnings)
@@ -266,7 +278,7 @@ def age_label(value):
 
 def show(config,names,seconds=None):
     data=collect(config,names,seconds)
-    labels=dict(queue='Загрузчик',range='Range',yandex='Yandex',nextcloud='Nextcloud',opencloud='OpenCloud',s3='S3')
+    labels=dict(queue='Загрузчик',range='Range',yandex='Yandex',nextcloud='Nextcloud',opencloud='OpenCloud',s3='S3',yandex_range='Yandex Range')
     states=dict(finished='Готово',done='Готово',recovering='Range',running='В работе',pending='Ожидают',
                 active='работает',inactive='остановлен',failed='сбой',activating='запускается',deactivating='останавливается')
     def date(stamp):return datetime.fromtimestamp(stamp).astimezone().strftime('%d.%m.%Y %H:%M:%S %Z')
@@ -291,14 +303,20 @@ def show(config,names,seconds=None):
             amount=row.get('bytes',0) if row.get('measured') else legacy
             volume='≥'+size_label(amount) if row.get('measured') or legacy else 'нет данных'
             rate=f'{row["mbit_s"]:.2f}' if row.get('mbit_s') is not None else 'нет данных'
-            active,waiting=(str(members[source][k]) if group else 'нет данных' for k in ('active','waiting'))
-            if group.get('stale'):active+='*';waiting+='*'
+            active,waiting=(str(members[source][k]) if 'members' in group else 'нет данных' for k in ('active','waiting'))
+            if source=='yandex_range':
+                gauges=data['gauges']
+                fresh=data.get('metrics_age') is not None and data['metrics_age']<=180
+                active=str(gauges['range_active_files']) if fresh and 'range_active_files' in gauges else 'нет данных'
+                waiting=str(gauges.get('range_eligible_files',0)+gauges.get('range_recheck_eligible_files',0)) if fresh and 'range_eligible_files' in gauges else 'нет данных'
+            elif group.get('stale'):active+='*';waiting+='*'
             rows.append((label,labels[source],files,volume,rate,active,waiting))
-        if group:
+        if 'controller' in group:
             status='УСТАРЕЛ' if group['stale'] else 'снимок'
             budgets.append(f'{label}: лимит файлов — {group["controller"].get("limit","?")}; {status} {age_label(group["age"])}.')
     print_table(('Направление','Источник','Файлы*','Объём','Мбит/с','Активно','Ждут'),rows,right=(2,3,4,5,6))
     for line in budgets:print(line)
+    print('Yandex Range — сохранённые блоки Range/Recheck; файловый автоподбор не изменяется.')
     if any(g.get('stale') for g in data['directions'].values()):print('* Слоты со звёздочкой — устаревшие данные.')
 
     print('\nСЕРВИСЫ И ПАМЯТЬ (МиБ)')
@@ -363,4 +381,4 @@ def show(config,names,seconds=None):
     else:print('Нет сохранившихся записей.')
     print('\n≥ — подтверждённый минимум; нет данных — неизвестно, а не ноль. КБ/МБ/ГБ — десятичные.')
     print('Файлы* — события завершения, включая повторную проверку SHA. Скорость — подтверждённые байты;')
-    print('служебный трафик, Range и непринятые повторы не входят. Мбит/с: нужен свежий замер от 30 с.')
+    print('служебный трафик и непринятые повторы не входят. Мбит/с: нужен свежий замер от 30 с.')

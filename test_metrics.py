@@ -10,6 +10,32 @@ from metrics import Metrics, AriaMetrics
 
 
 class MetricsChecks(unittest.TestCase):
+    def test_range_traffic_snapshots_include_baseline_and_do_not_repeat_bytes(self):
+        import io
+        import service_stats
+        with tempfile.TemporaryDirectory() as directory, patch('sys.stdout', new_callable=io.StringIO) as output:
+            m=Metrics(Path(directory)/'metrics.jsonl','range-worker',start=False)
+            m.add(range_requests=1,range_received_bytes=1024)
+            m.snapshot();m.snapshot();m.close();m.snapshot('handoff')
+            rows=[json.loads(s.split('TRANSFER STATS: ',1)[1]) for s in output.getvalue().splitlines()
+                  if s.startswith('TRANSFER STATS: ')]
+            self.assertGreaterEqual(len(rows),3)
+            self.assertEqual(rows[0]['sources'],{'yandex_range':0})
+            self.assertEqual(rows[-1]['sources'],{'yandex_range':1024})
+            self.assertTrue(rows[-1]['closed'])
+            self.assertEqual(len({r['epoch'] for r in rows}),1)
+            for row in rows:row['time']=service_stats.timestamp(row['time'])
+            measured=service_stats.traffic(rows,None,rows[-1]['time'])
+            self.assertEqual(measured['yandex_range']['bytes'],1024)
+
+    def test_range_traffic_log_failure_does_not_break_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            m=Metrics(Path(directory)/'metrics.jsonl','range-worker',start=False)
+            m.add(range_requests=1,range_received_bytes=1024)
+            with patch('builtins.print',side_effect=BrokenPipeError('closed')):
+                m.snapshot();m.close()
+            self.assertEqual(json.loads(m.path.read_text().splitlines()[-1])['counters']['range_received_bytes'],1024)
+
     def test_aria_times_interleaved_connections_and_late_headers_without_tokens(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);log=root/'aria2.log';log.touch()
