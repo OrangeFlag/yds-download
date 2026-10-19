@@ -6,10 +6,12 @@ import re
 from threading import Lock
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
 import xml.etree.ElementTree as ET
 
 import download as d
+import network
 from nextcloud import VIDEO, normalized, remote_path
 from nextcloud_fallback import Fallback
 import opencloud as oc
@@ -40,18 +42,31 @@ class OpenCloudIndex:
     def candidates(self, data, item):
         catalog=self.catalog
         with catalog['lock']:
-            if catalog['error'] is not None and time.monotonic()<catalog['retry_at']:
+            cooling=catalog['error'] is not None and time.monotonic()<catalog['retry_at']
+            if cooling and catalog['rows'] is None:
                 raise catalog['error'].with_traceback(None)
-            if catalog['rows'] is None or catalog['error'] is not None or time.monotonic()>=catalog['expires']:
+            if not cooling and (catalog['rows'] is None or catalog['error'] is not None or time.monotonic()>=catalog['expires']):
                 try:
-                    self.share.discover()
+                    if catalog['base'] is None:
+                        self.share.discover()
+                        catalog['base']=self.share.base
+                    self.share.base=catalog['base']
                     # scan traverses the selected project Space with PROPFIND only.
                     rows=oc.Uploader(self.share,self.stopping).scan()
-                    catalog.update(rows=rows,error=None,expires=time.monotonic()+300,base=getattr(self.share,'base',None))
+                    catalog.update(rows=rows,error=None,retry_at=0,expires=time.monotonic()+300)
                 except (OSError,ValueError,RuntimeError,http.client.HTTPException,ET.ParseError) as error:
                     if isinstance(error,InterruptedError) or storage.disk_error(error):raise
-                    catalog.update(rows=None,error=error,retry_at=time.monotonic()+60)
-                    raise
+                    code=getattr(error,'code',None)
+                    transient=(code in (408,429,500,502,503,504)
+                               or network.failure(error)['category'] in ('routing','ambiguous')
+                               or isinstance(error,ET.ParseError))
+                    cooldown=max(60,network.retry_after(getattr(error,'headers',None)))
+                    if isinstance(error,urllib.error.HTTPError):error.close()
+                    if not transient:catalog.update(rows=None,base=None)
+                    catalog.update(error=error.with_traceback(None),retry_at=time.monotonic()+cooldown)
+                    print(f'OPENCLOUD CATALOG DEFERRED: cached={catalog["rows"] is not None}; '
+                          f'retry_after_seconds={cooldown:g}; HTTP={code}; error={type(error).__name__}',flush=True)
+                    if catalog['rows'] is None:raise
             if catalog['base'] is not None:self.share.base=catalog['base']
             try:relative=remote_path(data,item)
             except ValueError:relative=None

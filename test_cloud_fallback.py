@@ -8,6 +8,7 @@ from pathlib import Path
 import tempfile
 from threading import Event
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 import download as d
@@ -27,8 +28,11 @@ class Server:
     nickname="Reader"
     def __init__(self, rows, bodies):
         self.rows,self.bodies=rows,bodies
+        self.base=None
         self.discoveries=0;self.listings=[];self.gets=[]
-    def discover(self):self.discoveries+=1
+    def discover(self):
+        self.discoveries+=1
+        self.base='https://cloud.example/dav/spaces/project/'
     def listing(self, folder):
         self.listings.append(folder)
         return [row for row in self.rows if str(Path(row['path']).parent).replace('.', '')==folder]
@@ -146,6 +150,86 @@ class CloudChecks(unittest.TestCase):
                 with self.assertRaises(TimeoutError):index.candidates(self.data,self.item)
             self.assertEqual(listing.call_count,3)
         self.assertEqual(self.server.gets,[])
+
+    def test_refresh_reuses_validated_space_across_index_instances(self):
+        first=self.cloud().sources[0].index
+        self.assertEqual(first.candidates(self.data,self.item),[self.rows[-1]])
+        original_server=self.server
+        self.server=Server(self.rows,{self.path:self.body})
+        second=self.cloud().sources[0].index
+        self.assertEqual(second.candidates(self.data,self.item),[self.rows[-1]])
+        self.assertEqual(self.server.base,original_server.base)
+        first.catalog['expires']=0
+        self.rows[-1]=dict(self.rows[-1],etag='new')
+        self.assertEqual(second.candidates(self.data,self.item),[self.rows[-1]])
+        self.assertEqual(second.catalog['rows'][-1]['etag'],'new')
+        self.assertEqual(original_server.discoveries,1)
+        self.assertEqual(self.server.discoveries,0)
+
+    def test_transient_refresh_preserves_snapshot_and_respects_retry_after(self):
+        import cloud_fallback
+        index=self.cloud().sources[0].index
+        index.candidates(self.data,self.item)
+        snapshot=index.catalog['rows'];index.catalog['expires']=0
+        error=urllib.error.HTTPError('https://cloud.example/catalog',503,'busy',{'Retry-After':'120'},io.BytesIO())
+        with patch.object(cloud_fallback.time,'monotonic',return_value=1000),patch.object(cloud_fallback.oc.Uploader,'scan',side_effect=error) as scan:
+            self.assertEqual(index.candidates(self.data,self.item),[self.rows[-1]])
+            self.assertEqual(index.candidates(self.data,self.item),[self.rows[-1]])
+            self.assertEqual(scan.call_count,1)
+        self.assertIs(index.catalog['rows'],snapshot)
+        self.assertEqual(index.catalog['retry_at'],1120)
+        with patch.object(cloud_fallback.time,'monotonic',return_value=1120),patch.object(cloud_fallback.oc.Uploader,'scan',return_value=[]):
+            self.assertEqual(index.candidates(self.data,self.item),[])
+        self.assertIsNone(index.catalog['error'])
+        self.assertEqual(self.server.discoveries,1)
+
+    def test_first_scan_failure_keeps_validated_root_but_no_partial_catalog(self):
+        import cloud_fallback
+        index=self.cloud().sources[0].index
+        with patch.object(cloud_fallback.time,'monotonic',return_value=1000),patch.object(cloud_fallback.oc.Uploader,'scan',side_effect=TimeoutError('offline')) as scan:
+            for _ in range(2):
+                with self.assertRaises(TimeoutError):index.candidates(self.data,self.item)
+            self.assertEqual(scan.call_count,1)
+        self.assertIsNone(index.catalog['rows'])
+        with patch.object(cloud_fallback.time,'monotonic',return_value=1060):
+            self.assertEqual(index.candidates(self.data,self.item),[self.rows[-1]])
+        self.assertEqual(self.server.discoveries,1)
+
+    def test_permanent_refresh_errors_do_not_use_stale_catalog(self):
+        import cloud_fallback
+        index=self.cloud().sources[0].index
+        errors=[urllib.error.HTTPError('https://cloud.example/catalog',code,'denied',{},io.BytesIO()) for code in (401,403,404)]
+        errors.extend([ValueError('Invalid Space WebDAV root'),RuntimeError('Invalid listing')])
+        for error in errors:
+            with self.subTest(error=error):
+                index.catalog.update(error=None,expires=0)
+                index.candidates(self.data,self.item)
+                index.catalog['expires']=0
+                with patch.object(cloud_fallback.oc.Uploader,'scan',side_effect=error) as scan:
+                    for _ in range(2):
+                        with self.assertRaises(type(error)):index.candidates(self.data,self.item)
+                    self.assertEqual(scan.call_count,1)
+                self.assertIsNone(index.catalog['rows'])
+                self.assertIsNone(index.catalog['base'])
+
+    def test_stale_catalog_never_hides_interruption_or_disk_failure(self):
+        import cloud_fallback
+        index=self.cloud().sources[0].index
+        index.candidates(self.data,self.item)
+        for error in (InterruptedError('stop'),cloud_fallback.storage.StorageUnavailable('disk')):
+            with self.subTest(error=error):
+                index.catalog['expires']=0
+                with patch.object(cloud_fallback.oc.Uploader,'scan',side_effect=error):
+                    with self.assertRaises(type(error)):index.candidates(self.data,self.item)
+
+    def test_stale_catalog_recovery_still_checks_payload_sha(self):
+        import cloud_fallback
+        cloud=self.cloud();index=cloud.sources[0].index
+        index.candidates(self.data,self.item);index.catalog['expires']=0
+        self.server.bodies[self.path]=b'x'*len(self.body)
+        with patch.object(cloud_fallback.oc.Uploader,'scan',side_effect=TimeoutError('offline')):
+            self.assertEqual(cloud.recover_all(self.item,self.event)['status'],'mismatch')
+        self.assertFalse(d.target(self.root,self.item,'Course').exists())
 
     def test_existing_valid_original_skips_both_remote_sources(self):
         target=d.target(self.root,self.item,'Course');target.parent.mkdir();target.write_bytes(self.body)

@@ -1307,6 +1307,19 @@ tail -F '/data/YandexDisk/ШАД весна 2026/.download/opencloud-uploads.jso
 
 Upload polling and cloud fallback keep compact incremental SHA/stat proof indexes. Concurrent readers never repair `events.jsonl`: an unfinished final line stays untouched and is retried after the writer appends its newline. Archive owners retain crash-tail repair under the archive lock. Cloud fallback indexes each `(path, local)` copy separately and omits Range attempt histories. OpenCloud uses exact DAV paths for traversal; course matching preserves trailing spaces while normalizing Unicode.
 
+Для скачивания из OpenCloud проверенный адрес project Space и полный каталог
+переиспользуются в памяти процесса между архивами. Каталог обновляется каждые
+300 секунд без повторного Graph discovery. При временной сетевой ошибке,
+HTTP 408/429/500/502/503/504 или повреждённом XML последний успешный каталог
+остаётся доступным; новый обход повторяется не раньше чем через 60 секунд
+или `Retry-After`, если он больше. Незавершённый обход не заменяет каталог.
+Без ранее полученного каталога ошибка возвращается вызывающей задаче.
+Ошибки авторизации и проверки Space сбрасывают каталог и адрес, остановка
+и ошибки локального диска передаются вызывающему коду. При следующем обходе
+после сброса адрес заново проверяется через Graph. После рестарта кэш
+заполняется заново. `OPENCLOUD CATALOG DEFERRED` показывает наличие старого
+каталога и паузу; найденные копии по-прежнему проверяются по SHA-256.
+
 ### Slow local aria2 RPC
 
 `--rpc-timeout` defaults to 30 seconds; `--rpc-status-retries` defaults to 2 extra reads. A transient `tellStatus` transport error retries the same GID while retaining its download slot. `addUri` is never replayed after an ambiguous reply. An exited engine, permanent RPC rejection or exhausted retry allowance stops safely with native resume state retained; supervision can resume it. User interruption and disk-full handling retain priority. Startup RPC calls stay within the 15-second readiness deadline. These settings do not change Yandex HTTP timeouts.
