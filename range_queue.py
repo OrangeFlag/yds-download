@@ -460,16 +460,20 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                     return bool(recheck_interval and background.jobs[path].get('yandex_recheck'))
 
                 active = sum(not is_recheck(bg,path) for bg,_,_ in roots.values() for path in bg.futures)
-                def dispatch_regular(cap):
+                def dispatch_regular(cap, reserve_secondary=True):
                     nonlocal active
                     while eligible and active < cap:
                         # Reserve capacity for later queues without delaying ready work.
                         chosen = 0
-                        if len(queues) > 1 and any(row[0] > 0 for row in eligible):
+                        if len(queues) > 1:
                             first_active = sum(not is_recheck(bg,path) for bg,_,_ in roots.values()
                                                if priorities[bg.root] == 0 for path in bg.futures)
                             if first_active >= max(1, files - secondary_slots):
-                                chosen = next(i for i, row in enumerate(eligible) if row[0] > 0)
+                                later = next((i for i, row in enumerate(eligible) if row[0] > 0), None)
+                                if later is not None:
+                                    chosen = later
+                                elif reserve_secondary:
+                                    break
                         _, background, path = eligible.pop(chosen)
                         with profile.stage('submit', path):
                             job = json.loads(path.read_text())
@@ -599,7 +603,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 if checking:recheck_times[path]=(job['state']=='applied',yandex_checked_time(job))
                         # Ready tasks need not wait for unrelated archives to finish discovery.
                         dispatch_regular(max(1, files-secondary_slots) if priority==0 and len(queues)>1 else files)
-                dispatch_regular(files)
+                dispatch_regular(files, reserve_secondary=False)
                 checking_active=Counter(min(priorities[bg.root],1) for bg,_,_ in roots.values()
                                         for path in bg.futures if is_recheck(bg,path))
                 rechecks.sort(key=lambda row:recheck_times[row[2]])

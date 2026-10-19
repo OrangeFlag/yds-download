@@ -842,6 +842,53 @@ class SharedRangeChecks(unittest.TestCase):
                 q.run(queues, files=8, secondary_slots=4, stopping=stopping)
             self.assertEqual(Counter(started), {'personal': 4, 'courses': 4})
 
+    def test_course_reserve_reaches_later_archives_before_personal_borrows_slots(self):
+        from collections import Counter
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            queues = []
+            for group, counts in (('personal', [16]), ('courses', [2, 8])):
+                archives = []
+                for index, count in enumerate(counts):
+                    root = base / f'{group}-{index}'
+                    state = root / '.download'
+                    (state / 'tasks').mkdir(parents=True)
+                    source = 'https://disk.yandex.ru/d/' + root.name
+                    items = [dict(path=f'/Course/{i}.mp4', size=7,
+                                  sha256=hashlib.sha256(b'lecture').hexdigest(),
+                                  file='https://example.invalid/video') for i in range(count)]
+                    for filename, value in {
+                        'source.json': dict(source=source), 'catalog.json': dict(source=source),
+                        'settings.json': dict(retries=2, tuning=resolve()), 'courses.json': ['Course'],
+                        'summary.json': dict(downloads_complete=True, pending_courses=['Course']),
+                        'course-history.json': {'Course': dict(state='recovering')},
+                        '01-manifest.json': [{k:v for k,v in item.items() if k != 'file'} for item in items]
+                    }.items():
+                        d.write_json(state / filename, value)
+                    for item in items:
+                        key = hashlib.sha256(json.dumps([source, item['path'], item['size'], item['sha256'], 'range']).encode()).hexdigest()
+                        event = dict(item, course='Course', status='missing', corrupted_path='corrupted/old' + item['path'])
+                        d.write_json(state / 'tasks' / (key + '.json'), dict(kind='range', source=source,
+                                     item=item, event=event, course='Course', attempt=3, state='pending'))
+                    archives.append(dict(destination=str(root), catalog=str(state / 'catalog.json')))
+                queue = base / (group + '.json')
+                d.write_json(queue, dict(archives=archives))
+                queues.append(queue)
+            stopping = Event()
+            gate = Event()
+            mutex = Lock()
+            started = []
+            def recover(root, event, item, *args, **kwargs):
+                with mutex:
+                    started.append(root.name)
+                    if len(started) == 16:
+                        stopping.set()
+                        gate.set()
+                self.assertTrue(gate.wait(3), 'Sixteen files did not start together')
+            with patch('recovery.finish_recovery', side_effect=recover):
+                q.run(queues, files=16, secondary_slots=8, stopping=stopping)
+            self.assertEqual(Counter(started), {'personal-0': 8, 'courses-0': 2, 'courses-1': 6})
+
     def test_worker_recovers_four_files_before_full_task_discovery(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

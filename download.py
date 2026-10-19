@@ -266,8 +266,7 @@ class EventIndex:
         return hashlib.sha256(encoded).hexdigest()
 
     def _anchor(self, offset):
-        # Verify both boundaries. JSONL is append-only; a rewritten/rotated
-        # journal must be replayed instead of trusting a stale proof.
+        # shortcut: boundary anchors require an append-only prefix; discard the index before manual edits.
         with self.path.open('rb') as stream:
             stat = os.fstat(stream.fileno())
             if offset > stat.st_size:
