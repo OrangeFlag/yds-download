@@ -306,6 +306,44 @@ class CloudChecks(unittest.TestCase):
         self.assertTrue(all('range_attempts' not in row and 'file' not in row for row in cached.values()))
         self.assertLess(len(json.dumps(list(cached.values()))),3000)
 
+    def test_fallback_reuses_proofs_by_path_and_cached_source_identity(self):
+        import cloud_fallback
+        unrelated = [dict(path=f'/Course/unrelated-{i}.mp4', source=self.data['source'],
+                          status='invalid',size=1,sha256='a'*64)
+                     for i in range(200)]
+        d.append_events(self.state/'events.jsonl',unrelated)
+        cloud=self.cloud()
+        self.assertIsNone(cloud._local(self.item))
+
+        class CountedEvents(dict):
+            scans=0
+            def values(self):
+                self.scans+=1
+                return super().values()
+
+        cache=CountedEvents(cloud.event_index.events)
+        cloud.event_index.events=cache
+        source_path=self.state/'source.json'
+        original_read=Path.read_text
+        def read(path,*args,**kwargs):
+            if path==source_path:
+                raise AssertionError('Source identity needlessly reloaded per file')
+            return original_read(path,*args,**kwargs)
+        with patch.object(Path,'read_text',new=read):
+            for _ in range(10):
+                self.assertIsNone(cloud._local(self.item))
+        self.assertEqual(cache.scans,0,'Unchanged event history was re-scanned per task')
+
+        target=d.target(self.root,self.item,'Course')
+        target.parent.mkdir(exist_ok=True)
+        target.write_bytes(self.body)
+        proof=dict(self.item,source=self.data['source'],status='valid',
+                   local=str(target),local_stat=Fallback.stamp(target))
+        d.append_events(self.state/'events.jsonl',[proof])
+        with patch.object(d,'sha256_file',side_effect=AssertionError('Fresh proof missed')):
+            self.assertEqual(cloud._local(self.item)[0],target)
+        self.assertEqual(cache.scans,1,'Append must rebuild the compact path lookup once')
+
     def test_event_proof_refresh_reads_only_new_rows_and_invalidates_changed_proof(self):
         target=d.target(self.root,self.item,'Course');target.parent.mkdir();target.write_bytes(self.body)
         proof=dict(self.item,source=self.data['source'],status='valid',local=str(target),local_stat=Fallback.stamp(target))
