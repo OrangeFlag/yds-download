@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, perf/range-event-index-checkpoint-20261019]
   workflow_dispatch:
 
 jobs:
