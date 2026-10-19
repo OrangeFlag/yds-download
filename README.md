@@ -1307,6 +1307,51 @@ tail -F '/data/YandexDisk/ШАД весна 2026/.download/opencloud-uploads.jso
 
 Upload polling and cloud fallback keep compact incremental SHA/stat proof indexes. Concurrent readers never repair `events.jsonl`: an unfinished final line stays untouched and is retried after the writer appends its newline. Archive owners retain crash-tail repair under the archive lock. Cloud fallback indexes each `(path, local)` copy separately and omits Range attempt histories. OpenCloud uses exact DAV paths for traversal; course matching preserves trailing spaces while normalizing Unicode.
 
+### Профилирование запуска Range
+
+Range измеряет существующие операции без повторного обхода диска или чтения
+видеофайлов. В `.range.metrics.jsonl` первой очереди и соответствующем
+`-latest.json` сохраняются текущий `range_discovery_stage`, его
+`range_discovery_path` и накопительные `range_discovery_<этап>_*`:
+
+| Этап | Что измеряется |
+|---|---|
+| `events` | Время `EventIndex.refresh()`, число разобранных событий `records`, обработанные байты `bytes`, размер журнала перед чтением `journal_bytes` |
+| `task_enumeration` | Перечисление и сортировка имён `tasks/*.json`, число имён `entries` |
+| `tasks` | Весь вызов обнаружения задач: время, число прочитанных JSON `json_reads` и возвращённых задач `returned_tasks` |
+| `archive_setup` | Создание фонового обработчика архива, включая загрузку его состояния |
+| `manifests` | Загрузка курсов и манифестов: время, число новых успешно разобранных JSON `json_reads`, число записей `items` |
+| `submit` / `recheck_submit` | Чтение полной выбранной задачи и её передача фоновому обработчику |
+
+Для каждого этапа есть `calls`, `seconds`, `failures`; `journal_bytes` —
+последний размер, а не накопительный объём I/O. `events.bytes` считает
+потреблённые строки журнала, включая повторный разбор после его замены;
+неполная последняя строка read-only журнала не считается обработанной.
+Это не физические байты чтения HDD. Время `tasks` включает вложенное
+`task_enumeration`: их нельзя складывать. `returned_tasks` и `items`
+могут повторно учитывать те же записи при следующих вызовах.
+
+`RANGE PROFILE: {...}` выводится для операций первого прохода, затем только
+для операций дольше секунды или завершившихся ошибкой. Текущий этап виден
+в периодических метриках ещё до окончания операции. Профиль хранит только
+счётчики и текущий этап, без истории событий в памяти.
+
+`RANGE STARTUP: {...}` и gauges `range_startup_first_range_submit_seconds`,
+`range_startup_first_recheck_submit_seconds`, `range_startup_first_pass_seconds`
+фиксируют первые вехи один раз за запуск. Время отсчитывается с начала
+загрузки `range_queue.py`, включая импорты модулей. Веха первой задачи —
+начало попытки её постановки, даже если `Background.submit()` затем
+завершится ошибкой. Она совпадает по смыслу с `RANGE START`, но не доказывает начало HTTP-запроса:
+фоновой задаче ещё могут понадобиться метаданные или ожидание сетевого слота.
+При отсутствии подходящих задач соответствующей вехи нет — это не ноль секунд.
+Проверки файлов, восстановление JSONL и порядок задач не меняются.
+
+```bash
+tail -F ~/.local/state/yds-download/range.log | rg --line-buffered 'RANGE PROFILE|RANGE STARTUP|RANGE START:|YANDEX RECHECK START:'
+```
+
+### Каталог OpenCloud при временных ошибках
+
 Для скачивания из OpenCloud проверенный адрес project Space и полный каталог
 переиспользуются в памяти процесса между архивами. Каталог обновляется каждые
 300 секунд без повторного Graph discovery. При временной сетевой ошибке,

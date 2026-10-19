@@ -253,6 +253,7 @@ class EventIndex:
         self.events = {}
         self.inode = None
         self.offset = 0
+        self.scanned_events = self.scanned_bytes = self.journal_bytes = 0
 
     def refresh(self):
         # The writer and reader share STATE_LOCK; a crash-torn final row is repaired.
@@ -263,14 +264,18 @@ class EventIndex:
                 self.events.clear()
                 self.inode = None
                 self.offset = 0
+                self.journal_bytes = 0
                 return self.events
+            self.journal_bytes = stat.st_size
             if self.inode != stat.st_ino or stat.st_size < self.offset:
                 self.events.clear()
                 self.offset = 0
             self.inode = stat.st_ino
             for offset, row in scan_events(self.path, repair=self.repair, start=self.offset, complete_lines=not self.repair):
+                self.scanned_bytes += offset - self.offset
                 self.offset = offset
                 if row is not None:
+                    self.scanned_events += 1
                     identity = (row['path'], row.get('local')) if self.by_copy else row['path']
                     fields = self.FIELDS + ('state', 'actual_sha256', 'local_stat', 'recovered_stat') if self.by_copy else self.FIELDS
                     self.events[identity] = {key: row[key] for key in fields if key in row}

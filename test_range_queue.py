@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from file_state import FileState
 import fcntl
 import hashlib
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -15,6 +16,103 @@ import download as d
 import range_queue as q
 import semester_queue
 from settings import resolve
+
+
+class DiscoveryProfileChecks(unittest.TestCase):
+    def setUp(self):
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
+        self.root=Path(tmp.name)
+        self.metrics=q.Metrics(self.root/'metrics.jsonl','test',start=False)
+        self.addCleanup(self.metrics.close)
+        self.profile=q.DiscoveryProfile(self.metrics)
+
+    def test_event_profile_counts_only_consumed_tail_without_an_extra_scan(self):
+        path=self.root/'events.jsonl'
+        row=dict(path='/video.mp4',status='invalid')
+        d.append_events(path,[row,dict(row,status='valid')])
+        index=d.EventIndex(path)
+        with patch.object(d,'scan_events',wraps=d.scan_events) as scan:
+            self.assertEqual(self.profile.events(index)['/video.mp4']['status'],'valid')
+            original_size=path.stat().st_size
+            self.profile.events(index)
+            d.append_events(path,[row]);self.profile.events(index)
+            self.assertEqual(scan.call_count,3)
+        counters=self.metrics.counters
+        self.assertEqual(counters['range_discovery_events_records'],3)
+        self.assertEqual(counters['range_discovery_events_bytes'],path.stat().st_size)
+        self.assertGreater(path.stat().st_size,original_size)
+        self.assertEqual(self.metrics.gauges['range_discovery_events_journal_bytes'],path.stat().st_size)
+        old=path.with_suffix('.old');path.rename(old)
+        d.append_events(path,[dict(row,status='missing')])
+        self.assertEqual(self.profile.events(index)['/video.mp4']['status'],'missing')
+        self.assertEqual(counters['range_discovery_events_records'],4)
+        self.assertEqual(counters['range_discovery_events_bytes'],old.stat().st_size+path.stat().st_size)
+
+    def test_observing_unfinished_event_does_not_repair_a_read_only_journal(self):
+        path=self.root/'events.jsonl';body=b'{"path":"/video.mp4","status":"valid"}'
+        path.write_bytes(body);index=d.EventIndex(path,repair=False)
+        self.assertEqual(self.profile.events(index),{})
+        self.assertEqual(path.read_bytes(),body)
+        self.assertEqual(self.metrics.counters['range_discovery_events_records'],0)
+        with path.open('ab') as f:f.write(b'\n')
+        self.assertEqual(self.profile.events(index)['/video.mp4']['status'],'valid')
+        self.assertEqual(self.metrics.counters['range_discovery_events_records'],1)
+
+    def test_task_profile_reuses_the_existing_batched_scan(self):
+        directory=self.root/'tasks';directory.mkdir()
+        for i in range(5):
+            d.write_json(directory/f'{i}.json',dict(kind='range',state='pending',course='Course',source='test',attempt=0,
+                item=dict(path=f'/Course/{i}.mp4',size=4,sha256='a'*64)))
+        cache=q.JsonCache(self.profile)
+        self.assertEqual(len(cache.tasks(directory,limit=2)),2)
+        self.assertEqual(len(cache.tasks(directory,limit=2)),4)
+        self.assertEqual(len(cache.tasks(directory,limit=2)),5)
+        self.assertTrue(cache.tasks_complete(directory))
+        cache.tasks(directory,limit=2)
+        self.assertEqual(self.metrics.counters['range_discovery_task_enumeration_calls'],1)
+        self.assertEqual(self.metrics.counters['range_discovery_task_enumeration_entries'],5)
+        self.assertEqual(self.metrics.counters['range_discovery_tasks_json_reads'],5)
+
+    def test_manifest_profile_does_not_reload_unchanged_json(self):
+        d.write_json(self.root/'courses.json',['Course'])
+        item=dict(path='/Course/video.mp4',size=4,sha256='a'*64)
+        d.write_json(self.root/'01-manifest.json',[item])
+        cache=q.JsonCache(self.profile)
+        with patch.object(Path,'read_text',autospec=True,side_effect=Path.read_text) as read:
+            self.assertEqual(self.profile.manifests(cache,self.root),{('Course',item['path']):(4,'a'*64)})
+            self.profile.manifests(cache,self.root)
+            self.assertEqual(read.call_count,2)
+        self.assertEqual(self.metrics.counters['range_discovery_manifests_json_reads'],2)
+
+    def test_observation_failure_preserves_errors_and_nested_phase(self):
+        with patch('builtins.print',side_effect=OSError('log unavailable')):
+            with self.assertRaisesRegex(InterruptedError,'original stop'):
+                with self.profile.stage('tasks',self.root):
+                    with self.profile.stage('task_enumeration',self.root):
+                        self.assertEqual(self.metrics.gauges['range_discovery_stage'],'task_enumeration')
+                    self.assertEqual(self.metrics.gauges['range_discovery_stage'],'tasks')
+                    raise InterruptedError('original stop')
+        self.assertEqual(self.metrics.gauges['range_discovery_stage'],'idle')
+        self.assertEqual(self.metrics.counters['range_discovery_tasks_failures'],1)
+
+    def test_manifest_profile_keeps_completed_reads_when_a_later_file_is_invalid(self):
+        d.write_json(self.root/'courses.json',['Course','Other'])
+        d.write_json(self.root/'01-manifest.json',[dict(path='/Course/video.mp4',size=4,sha256='a'*64)])
+        (self.root/'02-manifest.json').write_text('not JSON')
+        with self.assertRaises(json.JSONDecodeError):
+            self.profile.manifests(q.JsonCache(self.profile),self.root)
+        self.assertEqual(self.metrics.counters['range_discovery_manifests_json_reads'],2)
+        self.assertEqual(self.metrics.counters['range_discovery_manifests_failures'],1)
+
+    def test_startup_milestones_are_reported_once(self):
+        with patch('sys.stdout',new_callable=io.StringIO) as output:
+            self.profile.milestone('first_range_submit')
+            first=self.metrics.gauges['range_startup_first_range_submit_seconds']
+            self.profile.milestone('first_range_submit')
+            self.profile.milestone('first_pass')
+        self.assertEqual(self.metrics.gauges['range_startup_first_range_submit_seconds'],first)
+        self.assertEqual(output.getvalue().count('RANGE STARTUP:'),2)
+        self.assertFalse(self.profile.first_pass)
 
 
 class SharedRangeChecks(unittest.TestCase):

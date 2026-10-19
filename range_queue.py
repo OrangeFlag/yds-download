@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 """Recover durable Range tasks across archives without blocking ordinary downloads."""
+import time
+
+PROCESS_STARTED = time.monotonic()
+
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -14,7 +18,6 @@ import math
 import hashlib
 from datetime import datetime
 from threading import Event, Lock, Semaphore
-import time
 
 import download as d
 import storage
@@ -50,12 +53,85 @@ class RangeBudget:
             self.slots.release()
 
 
+class DiscoveryProfile:
+    def __init__(self, metrics):
+        self.metrics = metrics
+        self.first_pass = True
+        self.milestones = set()
+        self.active = ('idle', '')
+
+    def log(self, prefix, row):
+        try:
+            print(prefix + json.dumps(row, ensure_ascii=False), flush=True)
+        except OSError as error:
+            self.metrics.warning(error)
+
+    @contextmanager
+    def stage(self, name, path):
+        previous = self.active
+        self.active = (name, str(path))
+        self.metrics.gauge('range_discovery_stage', name)
+        self.metrics.gauge('range_discovery_path', str(path))
+        started = time.monotonic()
+        counts = {}
+        complete = False
+        try:
+            yield counts
+            complete = True
+        finally:
+            seconds = max(0, time.monotonic() - started)
+            prefix = 'range_discovery_' + name + '_'
+            self.metrics.add(**{prefix + 'calls': 1, prefix + 'seconds': seconds,
+                               prefix + 'failures': int(not complete),
+                               **{prefix + k: v for k, v in counts.items() if k != 'journal_bytes'}})
+            if 'journal_bytes' in counts:
+                self.metrics.gauge(prefix + 'journal_bytes', counts['journal_bytes'])
+            if self.first_pass or seconds >= 1 or not complete:
+                self.log('RANGE PROFILE: ', dict(stage=name, path=str(path), seconds=seconds,
+                                                complete=complete, **counts))
+            self.active = previous
+            self.metrics.gauge('range_discovery_stage', previous[0])
+            self.metrics.gauge('range_discovery_path', previous[1])
+
+    def events(self, index):
+        records, size = index.scanned_events, index.scanned_bytes
+        with self.stage('events', index.path) as counts:
+            try:
+                return index.refresh()
+            finally:
+                counts.update(records=index.scanned_events - records, bytes=index.scanned_bytes - size,
+                              journal_bytes=index.journal_bytes)
+
+    def manifests(self, cache, state):
+        reads = cache.json_reads
+        with self.stage('manifests', state) as counts:
+            try:
+                result = {(course, item['path']): (item['size'], item['sha256'])
+                          for index, course in enumerate(cache.read(state / 'courses.json'), 1)
+                          for item in cache.read(state / f'{index:02d}-manifest.json')}
+                counts['items'] = len(result)
+                return result
+            finally:
+                counts['json_reads'] = cache.json_reads - reads
+
+    def milestone(self, name):
+        if name in self.milestones:
+            return
+        self.milestones.add(name)
+        seconds = max(0, time.monotonic() - PROCESS_STARTED)
+        self.metrics.gauge('range_startup_' + name + '_seconds', seconds)
+        if name == 'first_pass':
+            self.first_pass = False
+        self.log('RANGE STARTUP: ', dict(milestone=name, seconds=seconds))
+
+
 class JsonCache:
-    def __init__(self):
+    def __init__(self, profile=None):
+        self.profile = profile
         self.entries = {}
         self.directories = {}
         self.scans = {}
-        self.task_reads = 0
+        self.task_reads = self.json_reads = 0
 
     def read(self, path, default=None):
         if not path.exists():
@@ -65,6 +141,7 @@ class JsonCache:
         saved = self.entries.get(path)
         if saved is None or saved[0] != stamp:
             saved = stamp, json.loads(path.read_text())
+            self.json_reads += 1
             self.entries[path] = saved
         return saved[1]
 
@@ -75,6 +152,26 @@ class JsonCache:
         return directory not in self.scans and saved is not None and saved[0] == Background.stat(directory)
 
     def tasks(self, directory, limit=None):
+        if self.profile is None:
+            return self._tasks(directory, limit)
+        reads = self.task_reads
+        with self.profile.stage('tasks', directory) as counts:
+            try:
+                result = self._tasks(directory, limit)
+                counts['returned_tasks'] = len(result)
+                return result
+            finally:
+                counts['json_reads'] = self.task_reads - reads
+
+    def _paths(self, directory):
+        if self.profile is None:
+            return iter(sorted(directory.glob('*.json')))
+        with self.profile.stage('task_enumeration', directory) as counts:
+            paths = sorted(directory.glob('*.json'))
+            counts['entries'] = len(paths)
+            return iter(paths)
+
+    def _tasks(self, directory, limit=None):
         if not directory.exists():
             self.directories.pop(directory, None)
             self.scans.pop(directory, None)
@@ -86,7 +183,7 @@ class JsonCache:
         scan = self.scans.get(directory)
         if scan is None:
             previous = dict(saved[1]) if saved else {}
-            scan = stamp, iter(sorted(directory.glob('*.json'))), {}, previous
+            scan = stamp, self._paths(directory), {}, previous
             self.scans[directory] = scan
         _, paths, current, previous = scan
         reads = 0
@@ -138,7 +235,7 @@ class JsonCache:
         if complete:
             if latest != scan[0]:
                 previous.update(current)
-                self.scans[directory] = latest, iter(sorted(directory.glob('*.json'))), {}, previous
+                self.scans[directory] = latest, self._paths(directory), {}, previous
             else:
                 self.directories[directory] = latest, current, tasks
                 del self.scans[directory]
@@ -341,6 +438,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
     with Metrics(queues[0].with_suffix('.range.metrics.jsonl'),'range-queue',interval=metrics_interval,
                  settings=dict(files=files,per_file=per_file,requests=requests,rps=rps,secondary_slots=secondary_slots,recheck_interval=recheck_interval,recheck_files=recheck_files,recheck_probes=recheck_probes,recheck_full_interval=recheck_full_interval)) as metrics, \
             ThreadPoolExecutor(max_workers=files+(recheck_files if recheck_interval else 0), thread_name_prefix='range-file') as pool:
+        profile = DiscoveryProfile(metrics)
+        cache.profile = profile
         try:
             while not stopping.is_set():
                 for queue in queues:
@@ -414,10 +513,11 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                     raise ValueError('Range archive source does not match catalog')
                                 settings = cache.read(state / 'settings.json')
                                 tuning = resolve({**settings['tuning'], 'range_workers': per_file, 'range_rps': rps})
-                                background = Background(root, identity['source'], settings['retries'], tuning,
-                                                        range_pool=pool, budget=budget, range_files=files, nextcloud_fallback=link if fallback else None,retry_check=settings.get('retry_check',False),
-                                                        recheck_probes=recheck_probes,recheck_full_interval=recheck_full_interval,
-                                                        opencloud_fallback=cloud if fallback else None,download_budget=download_config)
+                                with profile.stage('archive_setup', root):
+                                    background = Background(root, identity['source'], settings['retries'], tuning,
+                                                            range_pool=pool, budget=budget, range_files=files, nextcloud_fallback=link if fallback else None,retry_check=settings.get('retry_check',False),
+                                                            recheck_probes=recheck_probes,recheck_full_interval=recheck_full_interval,
+                                                            opencloud_fallback=cloud if fallback else None,download_budget=download_config)
                             except BaseException:
                                 lock.close()
                                 raise
@@ -426,16 +526,14 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 changed_courses_by_root[root] = set(dirty_courses)
                             priorities[root] = priority
                             background.event_index = EventIndex(state / 'events.jsonl')
-                            background.cached_events = background.event_index.refresh()
+                            background.cached_events = profile.events(background.event_index)
                             background.task_cache = cache
                             if legacy:
                                 seed_legacy_tasks(background)
                                 tasks=cache.tasks(state/'tasks', limit=32)
-                            background.manifest_items = {(course, item['path']): (item['size'], item['sha256'])
-                                for index, course in enumerate(cache.read(state / 'courses.json'), 1)
-                                for item in cache.read(state / f'{index:02d}-manifest.json')}
+                            background.manifest_items = profile.manifests(cache, state)
                         background = roots[root][0]
-                        background.cached_events = background.event_index.refresh()
+                        background.cached_events = profile.events(background.event_index)
                         from nextcloud import saved_remote_files
                         remote_link = None if fallback else settings.get('nextcloud_existing')
                         remote_files = saved_remote_files(state, remote_link, source=background.source,
@@ -487,9 +585,11 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         if first_active >= max(1, files - secondary_slots):
                             chosen = next(i for i, row in enumerate(eligible) if row[0] > 0)
                     _, background, path = eligible.pop(chosen)
-                    job = json.loads(path.read_text())
-                    print('RANGE START: ' + str(background.root) + job['item']['path'], flush=True)
-                    background.submit('range', job['item'], job['course'], job['attempt'], job['event'],force=job['state']=='applied',fallback_only=job['state']=='applied')
+                    with profile.stage('submit', path):
+                        job = json.loads(path.read_text())
+                        profile.milestone('first_range_submit')
+                        print('RANGE START: ' + str(background.root) + job['item']['path'], flush=True)
+                        background.submit('range', job['item'], job['course'], job['attempt'], job['event'],force=job['state']=='applied',fallback_only=job['state']=='applied')
                     active += 1
                 checking_active=Counter(min(priorities[bg.root],1) for bg,_,_ in roots.values()
                                         for path in bg.futures if is_recheck(bg,path))
@@ -502,11 +602,14 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         previous=recheck_roots.get(group)
                         root=candidates[(candidates.index(previous)+1)%len(candidates)] if previous in candidates else candidates[0]
                         row=next(row for row in options if row[1].root==root);rechecks.remove(row)
-                        _,background,path=row;job=json.loads(path.read_text())
-                        event=job.get('result',{}).get('event') or job['event']
-                        print('YANDEX RECHECK START: '+str(background.root)+job['item']['path'],flush=True)
-                        background.submit('range',job['item'],job['course'],job['attempt'],event,
-                                          force=job['state']=='applied',yandex_recheck=True)
+                        _,background,path=row
+                        with profile.stage('recheck_submit', path):
+                            job=json.loads(path.read_text())
+                            event=job.get('result',{}).get('event') or job['event']
+                            profile.milestone('first_recheck_submit')
+                            print('YANDEX RECHECK START: '+str(background.root)+job['item']['path'],flush=True)
+                            background.submit('range',job['item'],job['course'],job['attempt'],event,
+                                              force=job['state']=='applied',yandex_recheck=True)
                         recheck_roots[group]=root;checking_active[group]+=1
                 for root, (background, lock, config) in list(roots.items()):
                     if root not in selected_roots and not background.futures:
@@ -541,6 +644,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                 metrics.gauge('archives_owned',len(roots))
                 metrics.gauge('range_task_discovery_pending_archives',len(cache.scans))
                 metrics.gauge('range_task_discovery_reads',cache.task_reads)
+                profile.milestone('first_pass')
                 stopping.wait(2)
         finally:
             for background, _, _ in roots.values():
