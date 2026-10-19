@@ -618,7 +618,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             saved=json.loads(saved_path.read_text()) if saved_path.exists() else {}
             if saved.get('source')==source and saved.get('share')==remote_index.link:
                 remote_files=saved.get('files',{})
-        event_index = d.EventIndex(state / 'events.jsonl')
+        event_index = d.EventIndex(state / 'events.jsonl', checkpoint=True)
         events = dict(event_index.refresh())
         history_path = state / 'course-history.json'
         history = json.loads(history_path.read_text()) if history_path.exists() else {}

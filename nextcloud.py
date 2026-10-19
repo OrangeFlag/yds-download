@@ -385,7 +385,7 @@ class Sync:
                        and row.get('nickname')==self.share.nickname}
             proof_index=self.event_indexes.get(root)
             if proof_index is None:
-                proof_index=d.EventIndex(state/'events.jsonl',repair=False)
+                proof_index=d.EventIndex(state/'events.jsonl',repair=False,checkpoint=True)
                 self.event_indexes[root]=proof_index
             events=dict(proof_index.refresh())
             for e in self.read(state/'local-copies.json',[]):
