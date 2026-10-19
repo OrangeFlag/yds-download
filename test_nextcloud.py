@@ -492,6 +492,36 @@ class NextcloudChecks(unittest.TestCase):
         with journal.open('ab') as stream:stream.write(b'\n')
         self.assertEqual(sync.jobs([self.root]),[])
 
+    def test_uploader_restores_range_checkpoint_and_only_reads_new_events(self):
+        journal=self.state/'events.jsonl'
+        download.append_events(journal, [dict(self.proof,path='/Other.mp4',
+            range_attempts=['history'*1000]*50)])
+        writer=download.EventIndex(journal,checkpoint=True)
+        writer.refresh()
+        checkpoint=journal.with_name('events.jsonl.index.json')
+        self.assertTrue(checkpoint.exists())
+        offset=writer.offset
+        download.append_events(journal,[dict(self.proof,status='invalid')])
+        sync=nextcloud.Sync(None,self.upload,Event())
+        with patch.object(download,'scan_events',wraps=download.scan_events) as scanner:
+            self.assertEqual(sync.jobs([self.root]),[])
+        calls=[c for c in scanner.call_args_list if c.args[0]==journal]
+        self.assertTrue(calls)
+        self.assertEqual([c.kwargs['start'] for c in calls],[offset])
+        self.assertTrue(all(c.kwargs['repair'] is False for c in calls))
+        self.assertTrue(sync.event_indexes[self.root].checkpoint_loaded)
+
+    def test_uploader_creates_checkpoint_without_repairing_partial_writer_row(self):
+        journal=self.state/'events.jsonl'
+        with journal.open('ab') as stream:
+            stream.write(b'{"path":')
+        original=journal.read_bytes()
+        sync=nextcloud.Sync(None,self.upload,Event())
+        self.assertEqual(len(sync.jobs([self.root])),1)
+        self.assertEqual(journal.read_bytes(),original)
+        self.assertTrue(journal.with_name('events.jsonl.index.json').exists())
+        self.assertFalse(sync.event_indexes[self.root].repair)
+
     def test_uploader_reuses_compact_proof_index_across_polls(self):
         download.append_events(self.state/'events.jsonl',
             [dict(self.proof,range_attempts=['history'*1000]*50)])
