@@ -553,7 +553,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
         summary_path = state / 'summary.json'
         handoff = json.loads(summary_path.read_text()) if deep and not retry_check and summary_path.exists() else {}
         handoff = {key: handoff[key] for key in ('downloads_complete', 'pending_courses') if key in handoff}
-        event_index = EventIndex(state / 'events.jsonl')
+        event_index = EventIndex(state / 'events.jsonl', checkpoint=True)
         event_index.refresh()
         recovered = {}
         if retry_check:
