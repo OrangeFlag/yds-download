@@ -706,7 +706,20 @@ class SharedRangeChecks(unittest.TestCase):
                         stopping.set()
                         gate.set()
                 self.assertTrue(gate.wait(3), 'Eight files did not start together')
-            with patch('recovery.finish_recovery', side_effect=recover):
+            submitted = []
+            original_submit = q.Background.submit
+            original_read = q.JsonCache.read
+            def capture_submit(background, *args, **kwargs):
+                submitted.append(background.root.name)
+                return original_submit(background, *args, **kwargs)
+            def capture_read(cache, path, default=None):
+                if path == queues[1].parent / 'source.json':
+                    self.assertEqual(submitted[:4], ['personal'] * 4,
+                                     'Ready personal tasks waited for the next archive scan')
+                return original_read(cache, path, default)
+            with patch('recovery.finish_recovery', side_effect=recover), \
+                    patch.object(q.Background, 'submit', capture_submit), \
+                    patch.object(q.JsonCache, 'read', capture_read):
                 q.run(queues, files=8, secondary_slots=4, stopping=stopping)
             self.assertEqual(Counter(started), {'personal': 4, 'courses': 4})
 

@@ -455,6 +455,29 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                 rechecks = []
                 recheck_times = {}
                 selected_roots = set()
+                def is_recheck(background,path):
+                    return bool(recheck_interval and background.jobs[path].get('yandex_recheck'))
+
+                active = sum(not is_recheck(bg,path) for bg,_,_ in roots.values() for path in bg.futures)
+                def dispatch_regular(cap):
+                    nonlocal active
+                    while eligible and active < cap:
+                        # Reserve capacity for later queues without delaying ready work.
+                        chosen = 0
+                        if len(queues) > 1 and any(row[0] > 0 for row in eligible):
+                            first_active = sum(not is_recheck(bg,path) for bg,_,_ in roots.values()
+                                               if priorities[bg.root] == 0 for path in bg.futures)
+                            if first_active >= max(1, files - secondary_slots):
+                                chosen = next(i for i, row in enumerate(eligible) if row[0] > 0)
+                        _, background, path = eligible.pop(chosen)
+                        with profile.stage('submit', path):
+                            job = json.loads(path.read_text())
+                            profile.milestone('first_range_submit')
+                            print('RANGE START: ' + str(background.root) + job['item']['path'], flush=True)
+                            background.submit('range', job['item'], job['course'], job['attempt'], job['event'],
+                                              force=job['state']=='applied',fallback_only=job['state']=='applied')
+                        active += 1
+
                 for priority, queue in enumerate(queues):
                     config = storage.read_queue(queue, cache.read(queue))
                     archives=list(config['archives'])
@@ -573,24 +596,9 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                         continue
                                 (rechecks if checking else eligible).append((priority, background, path))
                                 if checking:recheck_times[path]=(job['state']=='applied',yandex_checked_time(job))
-                def is_recheck(background,path):
-                    return bool(recheck_interval and background.jobs[path].get('yandex_recheck'))
-                active = sum(not is_recheck(bg,path) for bg,_,_ in roots.values() for path in bg.futures)
-                while eligible and active < files:
-                    # Reserve slots for courses while retaining priority for personal files.
-                    chosen = 0
-                    if len(queues) > 1 and any(row[0] > 0 for row in eligible):
-                        first_active = sum(not is_recheck(bg,path) for bg,_,_ in roots.values()
-                                           if priorities[bg.root] == 0 for path in bg.futures)
-                        if first_active >= max(1, files - secondary_slots):
-                            chosen = next(i for i, row in enumerate(eligible) if row[0] > 0)
-                    _, background, path = eligible.pop(chosen)
-                    with profile.stage('submit', path):
-                        job = json.loads(path.read_text())
-                        profile.milestone('first_range_submit')
-                        print('RANGE START: ' + str(background.root) + job['item']['path'], flush=True)
-                        background.submit('range', job['item'], job['course'], job['attempt'], job['event'],force=job['state']=='applied',fallback_only=job['state']=='applied')
-                    active += 1
+                        # Ready tasks need not wait for unrelated archives to finish discovery.
+                        dispatch_regular(max(1, files-secondary_slots) if priority==0 and len(queues)>1 else files)
+                dispatch_regular(files)
                 checking_active=Counter(min(priorities[bg.root],1) for bg,_,_ in roots.values()
                                         for path in bg.futures if is_recheck(bg,path))
                 rechecks.sort(key=lambda row:recheck_times[row[2]])
