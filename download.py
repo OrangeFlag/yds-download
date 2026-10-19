@@ -296,6 +296,7 @@ class EventIndex:
         except (FileNotFoundError, ValueError, KeyError, TypeError, UnicodeDecodeError):
             return
         self.events = payload['events']
+        self.inode = journal.st_ino
         self.offset = self.checkpoint_offset = offset
         self.checkpoint_loaded = True
 
