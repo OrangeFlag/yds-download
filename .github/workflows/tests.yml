@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main, perf/nextcloud-remove-redundant-hash-20261019]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
