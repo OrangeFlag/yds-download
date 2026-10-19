@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, perf/fallback-proof-lookup-20261019]
   workflow_dispatch:
 
 jobs:
