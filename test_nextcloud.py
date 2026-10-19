@@ -22,6 +22,15 @@ class Response(io.BytesIO):
 
 
 class NextcloudChecks(unittest.TestCase):
+    def test_put_body_does_not_duplicate_sha256_work(self):
+        # Sync.upload already computes the complete SHA-256 and each chunk's checksum.
+        payload=b'known video bytes'
+        with patch.object(nextcloud.hashlib,'sha256',
+                          side_effect=AssertionError('Unused third SHA-256 pass')), \
+                patch.object(nextcloud.storage,'check'):
+            body=nextcloud.Body(io.BytesIO(payload),len(payload),Event(),Path('/tmp/source.mp4'))
+            self.assertEqual(body.read(7)+body.read(),payload)
+            self.assertEqual(body.sent,len(payload))
     def test_upload_skips_name_size_match_without_claiming_verified_download(self):
         row=dict(path='2023-fall/Course/001 - 2023-09-15 Лекция.mp4',size=7,directory=False,checksums=[])
         with patch.object(nextcloud.Share,'listing',return_value=[row]), \
