@@ -115,6 +115,21 @@ class PipelineChecks(unittest.TestCase):
         self.assertTrue(events)
         self.assertTrue(all(event['status'] == 'valid' for event in events))
 
+    def test_downloader_reuses_range_checkpoint_instead_of_replaying_journal(self):
+        state=self.root/'.download';state.mkdir()
+        journal=state/'events.jsonl'
+        row=dict(self.items['First'],status='invalid',course='First',time='2026-10-01')
+        download.append_events(journal,[row])
+        snapshot=download.EventIndex(journal,checkpoint=True)
+        snapshot.refresh()
+        offset=snapshot.offset
+        with patch.object(download,'scan_events',wraps=download.scan_events) as scanner:
+            self.assertEqual(self.run_download(),0)
+        calls=[c for c in scanner.call_args_list if c.args[0]==journal]
+        self.assertTrue(calls)
+        self.assertTrue(all(c.kwargs['start']>=offset for c in calls),
+                        'Downloader replayed old history instead of using Range checkpoint')
+
     def test_pipeline_uses_compact_index_for_range_history_and_avoids_full_rescans(self):
         (self.root / '.download').mkdir()
         event=dict(self.items['First'],status='invalid',course='First',time='2026-10-01',
