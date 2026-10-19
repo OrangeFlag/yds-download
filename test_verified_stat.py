@@ -13,6 +13,29 @@ import file_hashes
 
 
 class VerifiedStatTests(unittest.TestCase):
+    def test_full_recovery_rejects_mutation_inside_publication(self):
+        self.local.unlink()
+        archive = self.root / 'corrupted/test/Course/video.mp4'
+        archive.parent.mkdir(parents=True)
+        archive.write_bytes(b'good')
+        download.write_json(Path(str(archive) + '.ranges.json'),
+                            dict(size=4, sha256=self.item['sha256'], ranges=[[0, 4]]))
+        event = dict(self.item, course='Course', attempt=1, status='partial',
+                     corrupted_path=str(archive.relative_to(self.root)))
+        link = os.link
+        def change(source, destination):
+            link(source, destination)
+            before = destination.stat()
+            destination.write_bytes(b'evil')
+            os.utime(destination, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with patch.object(recovery.os, 'link', side_effect=change):
+            with self.assertRaisesRegex(OSError, 'changed'):
+                recovery.finish_recovery(self.root, event, self.item, retries=0, background=True)
+        self.assertFalse(event.get('range_recovered_complete'))
+        self.assertFalse(any(row['status'] == 'valid' for row in download.read_events(self.state / 'events.jsonl')))
+        self.assertEqual(archive.read_bytes(), b'good')
+        self.assertIsNone(file_hashes.load(self.local))
+
     def test_new_copy_requires_its_own_verification_before_hash_reuse(self):
         download.sha256_file(self.local)
         hashes=file_hashes.load(self.local)
@@ -38,7 +61,8 @@ class VerifiedStatTests(unittest.TestCase):
                     else:destination.write_bytes(b'evil')
                     os.utime(destination,ns=(before.st_atime_ns,before.st_mtime_ns))
                 with patch.object(recovery.storage,'sync_directory',side_effect=changed):
-                    recovery.copy_saved(self.local,destination,overwrite=False)
+                    with self.assertRaisesRegex(OSError,'changed'):
+                        recovery.copy_saved(self.local,destination,overwrite=False)
                 self.assertIsNone(file_hashes.load(destination))
                 self.assertNotEqual(download.sha256_file(destination),self.item['sha256'])
 

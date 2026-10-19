@@ -25,6 +25,7 @@ import xml.etree.ElementTree as ET
 import download as d
 from download import local_path
 from file_hashes import VIDEO
+import file_hashes
 import network
 import storage
 from upload_concurrency import UploadConcurrency, SharedUploadBudget
@@ -342,6 +343,7 @@ class Sync:
         self.indexes={}
         self.event_indexes={}
         self.cache = {}
+        self.job_stamps = {}
 
     def read(self, path, default=None):
         if not path.exists():
@@ -354,6 +356,7 @@ class Sync:
 
     def jobs(self, roots):
         jobs = []
+        self.job_stamps = {}
         for root in roots:
             if self.stopping.is_set():
                 return
@@ -407,9 +410,10 @@ class Sync:
                     local=storage.saved_local(root, event['local']) if event.get('local') else local_path(root,item['path'])
                     variant='original'
                     expected_size=item['size']
+                    selected=file_hashes.proof_stat(local.stat()) if local.is_file() else None
                     same=(event.get('size'),event.get('sha256'))==(item['size'],item['sha256'])
-                    valid=(same and event.get('status')=='valid' and local.is_file()
-                           and (local.stat().st_size,local.stat().st_mtime_ns)==(expected_size,event.get('mtime_ns'))
+                    valid=(same and event.get('status')=='valid' and selected is not None
+                           and file_hashes.proof_current(local,event,root=root,legacy=True)
                            and not Path(str(local)+'.aria2').exists())
                     percent=None
                     if not valid:
@@ -421,11 +425,15 @@ class Sync:
                         if not local.is_relative_to(root.resolve()):
                             raise ValueError('Unsafe partial video path')
                         expected_size=event['local_size']
-                        if (not local.is_file() or (local.stat().st_size,local.stat().st_mtime_ns)!=(expected_size,event['mtime_ns'])):
+                        selected=file_hashes.proof_stat(local.stat()) if local.is_file() else None
+                        if selected is None or not file_hashes.proof_current(local,event,root=root,legacy=True):
                             continue
                         variant='partial'
                         percent=100*event['downloaded_bytes']/item['size']
-                    jobs.append((item['path'] in started,root,data,item,local,variant,expected_size,percent,index,ordinal,event['mtime_ns']))
+                    if file_hashes.proof_stat(local.stat())!=selected:
+                        continue
+                    jobs.append((item['path'] in started,root,data,item,local,variant,expected_size,percent,index,ordinal,selected[2]))
+                    self.job_stamps[root,local,selected[2]]=selected
         jobs.sort(key=lambda job:not job[0])
         return jobs
 
@@ -476,6 +484,10 @@ class Sync:
             storage.check(local)
             if not local.is_file() or (local.stat().st_size,local.stat().st_mtime_ns)!=(expected_size,expected_mtime):
                 return
+            current=file_hashes.proof_stat(local.stat())
+            selected=self.job_stamps.get((root,local,expected_mtime),current)
+            if current!=selected:
+                return
             relative=PurePosixPath(remote_path(data,item))
             stem=relative.stem+(f' (partially available {percent:.2f}%)' if percent is not None else '')
             name=local_path(Path('/'),f'/{ordinal:03} - {stem}{relative.suffix}').name
@@ -486,7 +498,7 @@ class Sync:
                 if exists:
                     print('NEXTCLOUD EXISTS: '+item['path'],flush=True)
                     return
-            self.upload(root,data,item,local,variant,target,expected_size,percent)
+            self.upload(root,data,item,local,variant,target,expected_size,percent,expected_stat=selected)
         except (OSError,http.client.HTTPException,RuntimeError,ValueError,ET.ParseError) as error:
             if storage.disk_error(error):
                 self.stopping.set()
@@ -539,13 +551,15 @@ class Sync:
                       f'{type(error).__name__}; HTTP={details["http_status"]}; '
                       f'reason={details["error_reason"]!r}; errno={details["error_errno"]}',flush=True)
 
-    def upload(self, root, data, item, local, variant, target, size, percent, allow_session_restart=True):
+    def upload(self, root, data, item, local, variant, target, size, percent, allow_session_restart=True, expected_stat=None):
         state=root/'.download/nextcloud-uploads.json'
         with d.STATE_LOCK:
             ledger=json.loads(state.read_text()) if state.exists() else {}
-            stamp=local.stat();fingerprint=[stamp.st_ino,stamp.st_size,stamp.st_mtime_ns]
+            stamp=local.stat();fingerprint=file_hashes.proof_stat(stamp)
+            if expected_stat is not None and fingerprint!=expected_stat:
+                raise RuntimeError('Video changed after upload selection')
             key=hashlib.sha256(json.dumps([share_identity(self.share.url()),self.share.nickname,data['source'],item['path'],item['sha256'],variant,
-                                        fingerprint if variant=='partial' else None]).encode()).hexdigest()
+                                        fingerprint[:3] if variant=='partial' else None]).encode()).hexdigest()
             old=ledger.get(key,{})
             journal=state.with_suffix('.jsonl')
             if old and old.get('state')!='uploaded' and journal.exists():
@@ -558,6 +572,9 @@ class Sync:
                     return
             if old.get('state')=='uploaded':
                 return
+            if old.get('next_chunk',0) and old.get('local_stat')!=fingerprint:
+                print('NEXTCLOUD UPLOAD RESET: '+item['path']+'; checkpoint does not prove the current file version',flush=True)
+                old={}
             row=dict(key=key,source=data['source'],path=item['path'],size=item['size'],sha256=item['sha256'],variant=variant,
                      target=target,upload_share=share_identity(self.share.url()),read_share=share_identity(Share(self.existing).url()) if self.existing else None,
                      local=str(local),local_stat=fingerprint,payload_size=size,bytes_percent=percent,state='uploading',
@@ -631,7 +648,7 @@ class Sync:
                         if response.status not in (200,201,204) or body.sent!=len(chunk):
                             raise RuntimeError('Nextcloud did not confirm the complete chunk')
                     after=local.stat()
-                    if [after.st_ino,after.st_size,after.st_mtime_ns]!=fingerprint:
+                    if file_hashes.proof_stat(after)!=fingerprint:
                         raise RuntimeError('Video changed during upload')
                     row.update(next_chunk=number+1,sent_bytes=min(size,(number+1)*row['chunk_size']))
                     self.save(state,row,record=True)
@@ -640,7 +657,7 @@ class Sync:
                     if self.upload_budget:self.upload_budget.confirmed(len(chunk))
                     print(f'NEXTCLOUD UPLOAD PROGRESS: {target}; {row["sent_bytes"]}/{size} bytes',flush=True)
             after=local.stat()
-            if ([after.st_ino,after.st_size,after.st_mtime_ns]!=fingerprint
+            if (file_hashes.proof_stat(after)!=fingerprint
                     or variant=='original' and digest.hexdigest()!=item['sha256']):
                 raise RuntimeError('Video changed during upload or was not sent completely')
             row.update(state='assembling',payload_sha256=digest.hexdigest())
@@ -676,7 +693,7 @@ class Sync:
             row['time']=datetime.now().astimezone().isoformat()
             self.save(state,row,record=True)
         if restart:
-            self.upload(root,data,item,local,variant,target,size,percent,allow_session_restart=False)
+            self.upload(root,data,item,local,variant,target,size,percent,allow_session_restart=False,expected_stat=fingerprint)
 
 
 def main():

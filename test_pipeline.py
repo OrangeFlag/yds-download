@@ -588,7 +588,7 @@ class PipelineChecks(unittest.TestCase):
                 next(iter(bg.futures.values())).result();bg.close()
                 task=next((state/'tasks').glob('*.json'));job=json.loads(task.read_text())
                 job.update(state=state_name);job.pop('result',None);download.write_json(task,job)
-                started=Event();real_inspect=download.inspect
+                started=Event();real_inspect=download.inspect_available_copies
                 def inspect(root,item,*args,**kwargs):
                     if item['path']==self.items['Second']['path']:started.set()
                     return real_inspect(root,item,*args,**kwargs)
@@ -596,7 +596,7 @@ class PipelineChecks(unittest.TestCase):
                     self.assertTrue(started.wait(2),'Unfinished SHA waited behind earlier course')
                     return self.transfer(command,**kwargs)
                 with patch.object(download,'list_course',side_effect=lambda source,course,*args:[self.items[course]]), \
-                        patch.object(download,'inspect',side_effect=inspect), \
+                        patch.object(download,'inspect_available_copies',side_effect=inspect), \
                         patch('pipeline.transfer_process',side_effect=transfer):
                     self.assertEqual(download.download(self.data,['First','Second'],self.root,retries=0),0)
 
@@ -747,6 +747,46 @@ class PipelineChecks(unittest.TestCase):
         download.record(state, item, 'First', 0, 'missing', 'Root absent')
         self.assertEqual(self.run_download(), 0)
         self.assertEqual(self.calls, ['Second'])
+
+    def legacy_external_copies(self):
+        state = self.root / '.download'
+        state.mkdir()
+        item = self.items['First']
+        copies = []
+        for name, content in [('damaged.mp4', b'garbage'), ('external.mp4', self.content)]:
+            local = self.root / name
+            local.write_bytes(content)
+            copies.append(dict(item, source=self.data['source'], status='valid', local=str(local),
+                               mtime_ns=local.stat().st_mtime_ns))
+        download.write_json(state / 'local-copies.json', copies)
+        download.record(state, item, 'First', 0, 'missing', 'Root absent')
+        return [self.root / 'damaged.mp4', self.root / 'external.mp4']
+
+    def test_foreground_verifies_legacy_external_copies_before_transfer(self):
+        candidates = self.legacy_external_copies()
+        with patch.object(download, 'list_course', return_value=[self.items['First']]), \
+                patch.object(pipeline, 'transfer_process', side_effect=AssertionError('Existing copy downloaded again')), \
+                patch.object(download, 'sha256_file', wraps=download.sha256_file) as sha:
+            self.assertEqual(download.download(self.data, ['First'], self.root, retries=0), 0)
+        self.assertEqual([call.args[0] for call in sha.call_args_list], candidates)
+        proof = download.EventIndex(self.root / '.download/events.jsonl').refresh()[self.items['First']['path']]
+        self.assertEqual(download.saved_local(self.root, proof['local']), candidates[-1])
+        self.assertIn('ctime_ns', proof)
+        self.assertFalse((self.root / 'First/video.mp4').exists())
+        self.assertEqual(candidates[0].read_bytes(), b'garbage')
+
+    def test_nondeep_downloader_verifies_legacy_external_copies_before_transfer(self):
+        candidates = self.legacy_external_copies()
+        with patch.object(download, 'list_course', return_value=[self.items['First']]), \
+                patch.object(pipeline, 'transfer_process', side_effect=AssertionError('Existing copy downloaded again')), \
+                patch.object(download, 'sha256_file', wraps=download.sha256_file) as sha:
+            self.assertEqual(download.download_deep(self.data, ['First'], self.root, retries=0, deep=False), 0)
+        self.assertEqual([call.args[0] for call in sha.call_args_list], candidates)
+        proof = download.EventIndex(self.root / '.download/events.jsonl').refresh()[self.items['First']['path']]
+        self.assertEqual(download.saved_local(self.root, proof['local']), candidates[-1])
+        self.assertIn('ctime_ns', proof)
+        self.assertFalse((self.root / 'First/video.mp4').exists())
+        self.assertEqual(candidates[0].read_bytes(), b'garbage')
 
     def test_bad_downloads_exhaust_exactly_the_configured_retries(self):
         original = self.transfer

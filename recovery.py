@@ -20,6 +20,7 @@ from threading import Event, Lock
 import urllib.request
 import urllib.error
 import network
+import file_hashes
 import storage
 from file_state import FileState
 from progress import merge_ranges, saved_ranges, progress
@@ -36,7 +37,7 @@ def body_path(root, event):
     return path
 
 
-def copy_saved(source, destination, overwrite=True, before_publish=None):
+def copy_saved(source, destination, overwrite=True, before_publish=None, expected_sha256=None, stopping=None):
     destination.parent.mkdir(parents=True, exist_ok=True)
     # Preserve sparse holes and the archive used for future retries.
     with tempfile.NamedTemporaryFile(dir=destination.parent, prefix='.partial-', delete=False) as temporary:
@@ -62,8 +63,18 @@ def copy_saved(source, destination, overwrite=True, before_publish=None):
             name.replace(destination)
         else:
             os.link(name, destination)
+        name.unlink(missing_ok=True)
+        published = file_hashes.proof_stat(destination.stat())
+        if published[:3] != file_hashes.proof_stat(stat)[:3]:
+            raise OSError('Copy changed during publication')
         storage.sync_directory(destination.parent)
-        return [stat.st_ino, stat.st_size, stat.st_mtime_ns]
+        if file_hashes.proof_stat(destination.stat()) != published:
+            raise OSError('Copy changed during publication')
+        if expected_sha256 is not None:
+            file_hashes.calculate(destination, stopping, expected_sha256=expected_sha256)
+            if file_hashes.proof_stat(destination.stat()) != published:
+                raise OSError('Copy changed during publication')
+        return published
     finally:
         name.unlink(missing_ok=True)
 
@@ -113,6 +124,8 @@ def _promote_partial(root, event):
         stat = destination.stat()
         if (stat.st_size, stat.st_mtime_ns) != (old['local_size'], old['mtime_ns']):
             raise FileExistsError('Partial copy changed locally: ' + str(destination))
+        if old.get('ctime_ns') is not None and old['ctime_ns']!=stat.st_ctime_ns:
+            raise FileExistsError('Partial copy changed locally: ' + str(destination))
         if (not old.get('sha256_mismatch') and (old['size'], old['sha256']) == (event['size'], event['sha256'])
                 and (old.get('downloaded_bytes') or 0) >= (event.get('downloaded_bytes') or 0)):
             return True
@@ -126,7 +139,8 @@ def _promote_partial(root, event):
                     local_size=stamp[1], mtime_ns=stamp[2], pending_stat=stamp, previous=old,
                     recovery_time=datetime.now().astimezone().isoformat())
         write_json(registry, others + [copy])
-    copy_saved(path, destination, overwrite=bool(old and destination.exists()), before_publish=prepare)
+    published=copy_saved(path, destination, overwrite=bool(old and destination.exists()), before_publish=prepare)
+    copy['ctime_ns']=published[3]
     copy.pop('pending_stat'); copy.pop('previous')
     write_json(registry, others + [copy])
     print(f'PARTIALLY AVAILABLE: {event["path"]}; bytes={event["downloaded_percent"]:.2f}%', flush=True)
@@ -650,7 +664,7 @@ def reconcile_course(root, course):
         for row in json.loads(registry.read_text()):
             if row['source'].rstrip('/') == source and row['status'] == 'valid':
                 local = storage.saved_local(root, row['local'])
-                if local.exists() and (local.stat().st_size, local.stat().st_mtime_ns) == (row['size'], row['mtime_ns']):
+                if file_hashes.proof_current(local,row,root=root,legacy=True):
                     proofs[row['path']] = row
     prefix = '/' if course == '.' else '/' + course + '/'
     expected = [row for path, row in proofs.items() if path.startswith(prefix)]
@@ -667,8 +681,7 @@ def reconcile_course(root, course):
         local = storage.saved_local(root, proof['local']) if proof.get('local') else local_path(root, row['path'])
         if (proof.get('status') == 'valid' and proof.get('sha256') == row['sha256']
                 and proof.get('size') == row['size'] and local.exists()
-                and local.stat().st_size == row['size']
-                and ('mtime_ns' not in proof or local.stat().st_mtime_ns == proof['mtime_ns'])
+                and file_hashes.proof_current(local,proof,root=root,legacy=True)
                 and not Path(str(local) + '.aria2').exists()):
             verified += 1
     status.update(verified=verified, failed=status['total'] - verified,
@@ -705,7 +718,7 @@ def range_result_current(root, item, event):
     if not local.exists() or Path(str(local) + '.aria2').exists():
         return False
     stat = local.stat()
-    return stat.st_size == item['size'] and event.get('recovered_stat') == [stat.st_ino, stat.st_size, stat.st_mtime_ns]
+    return stat.st_size == item['size'] and event.get('recovered_stat') == file_hashes.proof_stat(stat)
 
 
 def finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning=None, stopping=None, download_active=None, background=False, request_budget=None, metrics=None, probe_requests=0):
@@ -744,11 +757,11 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
     ranges = saved_ranges(path, event['size'], event['sha256'])
     if ranges == [[0, event['size']]] and path.exists():
         before = path.stat()
-        archive_stat = [before.st_ino, before.st_size, before.st_mtime_ns]
+        archive_stat = file_hashes.proof_stat(before)
 
         def check_archive(copied=None):
             stat = path.stat() if path.exists() else None
-            if stat is not None and archive_stat == [stat.st_ino, stat.st_size, stat.st_mtime_ns]:
+            if stat is not None and archive_stat == file_hashes.proof_stat(stat):
                 return
             event.update(sha256_mismatch=True, recovery_error='Archive changed after SHA verification')
             # Discard byte proofs for the changed version; keep its body and control.
@@ -801,13 +814,18 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
             control = Path(str(destination) + '.aria2')
             if destination.exists() or control.exists():
                 stat = destination.stat() if destination.exists() else None
-                verified_stat = [stat.st_ino, stat.st_size, stat.st_mtime_ns] if stat is not None else None
+                verified_stat = file_hashes.proof_stat(stat) if stat is not None else None
                 status, _ = inspect(root, item, event['course'], path=destination, stopping=stopping)
                 if status != 'valid':
                     raise FileExistsError('Refusing to replace an unverified original: ' + str(destination))
                 check_archive()
             else:
-                verified_stat = copy_saved(path, destination, overwrite=False)
+                try:
+                    verified_stat = copy_saved(path, destination, overwrite=False,
+                                               expected_sha256=event['sha256'], stopping=stopping)
+                except OSError:
+                    check_archive(destination)
+                    raise
                 check_archive(destination)
             proof = record(root / '.download', item, event['course'], 0, 'valid',
                            'Recovered all ranges and SHA-256 verified', verified_stat=verified_stat)
@@ -844,7 +862,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
         for row in json.loads(registry.read_text()):
             if row['source'].rstrip('/') == source.rstrip('/') and row['status'] == 'valid':
                 local = storage.saved_local(root, row['local'])
-                if local.exists() and (local.stat().st_size, local.stat().st_mtime_ns) == (row['size'], row['mtime_ns']):
+                if file_hashes.proof_current(local,row,root=root):
                     valid[row['path']] = row
     ledger = FileState(root/'.download', 'recovery-state')
     metadata = {}
@@ -862,8 +880,7 @@ def recover_corrupted(root, source, retries=2, retry=False, report_repo=None, ma
         local = storage.saved_local(root, known['local']) if known.get('local') else local_path(root, event['path'])
         complete = (known.get('status') == 'valid' and known.get('sha256') == event['sha256']
                     and known.get('size') == event['size'] and local.exists()
-                    and local.stat().st_size == known['size']
-                    and ('mtime_ns' not in known or local.stat().st_mtime_ns == known['mtime_ns'])
+                    and file_hashes.proof_current(local,known,root=root)
                     and not Path(str(local) + '.aria2').exists())
         if retry and complete:
             reconcile_course(root, event['course'])

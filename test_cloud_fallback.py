@@ -287,7 +287,7 @@ class CloudChecks(unittest.TestCase):
 
     def test_valid_registry_proof_skips_body_hash(self):
         target=self.root/'existing.mp4';target.write_bytes(self.body)
-        proof=dict(self.item,source=self.data['source'],status='valid',local=str(target),mtime_ns=target.stat().st_mtime_ns)
+        proof=dict(self.item,source=self.data['source'],status='valid',local=str(target),mtime_ns=target.stat().st_mtime_ns,ctime_ns=target.stat().st_ctime_ns)
         d.write_json(self.state/'local-copies.json',[proof])
         with patch.object(d,'sha256_file',side_effect=AssertionError('verified body rehashed')):
             self.assertFalse(self.cloud().ready(self.item))
@@ -356,7 +356,7 @@ class CloudChecks(unittest.TestCase):
             with patch.object(d,'scan_events',wraps=d.scan_events) as scan,patch.object(d,'sha256_file',return_value='0'*64) as sha:
                 self.assertTrue(cloud.ready(self.item))
             self.assertEqual(scan.call_args.kwargs['start'],offset)
-            sha.assert_called_once()
+            sha.assert_not_called()
 
     def test_valid_cloud_receipt_skips_body_hash(self):
         target=d.target(self.root,self.item,'Course');target.parent.mkdir();target.write_bytes(self.body)

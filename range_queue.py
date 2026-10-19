@@ -261,8 +261,11 @@ def retire_cached_copy(background, path, job, proofs):
             stat = local.stat()
         except FileNotFoundError:
             continue
-        if ((stat.st_size, stat.st_mtime_ns) != (item['size'], proof['mtime_ns'])
-                or not local.is_file() or Path(str(local) + '.aria2').exists()):
+        if not local.is_file() or Path(str(local)+'.aria2').exists():
+            continue
+        if not d.file_hashes.proof_current(local,proof,root=background.root):
+            if stat.st_size==item['size']:
+                background.local_candidates.setdefault(item['path'],set()).add(local)
             continue
         saved = FileState(background.state, 'recovery-state').get(item['path'], {}).get('event', {})
         previous = saved if (saved.get('size'), saved.get('sha256')) == (item['size'], item['sha256']) else job.get('event', {})
@@ -271,7 +274,7 @@ def retire_cached_copy(background, path, job, proofs):
             r.body_path(background.root, dict(corrupted_path=archived))
         event = d.record(background.state, item, job['course'], job['attempt'], 'valid',
                          'Cached SHA-256 verified local copy; obsolete Range task retired', local=local,
-                         verified_stat=[stat.st_ino, stat.st_size, stat.st_mtime_ns])
+                         verified_stat=d.file_hashes.proof_stat(stat))
         if event['status'] != 'valid':
             continue
         event = dict(previous, **event, range_recovered_complete=True)
@@ -323,8 +326,7 @@ def finish_courses(background, config, changed_courses=()):
                 # Manifests deliberately omit expiring URLs; only the destination is needed here.
                 local = storage.saved_local(root, proof['local']) if proof.get('local') else d.target(root, dict(item, file='https://disk.yandex.ru'), course)
                 if (proof.get('status') == 'valid' and (proof.get('size'), proof.get('sha256')) == (item['size'], item['sha256'])
-                        and local.exists() and local.stat().st_size == item['size']
-                        and ('mtime_ns' not in proof or local.stat().st_mtime_ns == proof['mtime_ns'])
+                        and d.file_hashes.proof_current(local,proof,root=root,legacy=True)
                         and not Path(str(local) + '.aria2').exists()):
                     valid += 1
                     verified_paths.add(item['path'])

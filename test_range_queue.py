@@ -396,7 +396,7 @@ class SharedRangeChecks(unittest.TestCase):
                  'summary.json': dict(downloads_complete=True, pending_courses=[], complete=False, failed=1),
                  'course-history.json': {'Course': dict(state='finished', verified=0, failed=1)},
                  '01-manifest.json': [{key: value for key, value in item.items() if key != 'file'}],
-                 'local-copies.json': [dict(item, source=source, status='valid', local=str(local), mtime_ns=local.stat().st_mtime_ns)],
+                 'local-copies.json': [dict(item, source=source, status='valid', local=str(local), mtime_ns=local.stat().st_mtime_ns, ctime_ns=local.stat().st_ctime_ns)],
                  'queue.json': dict(report_repo=str(root / 'reports'), mark='Test',
                                     archives=[dict(state='finished', destination=str(root), catalog=str(catalog))])}
         for name, value in files.items():
@@ -679,8 +679,8 @@ class SharedRangeChecks(unittest.TestCase):
             latest = dict(job['event'], corrupted_path='corrupted/new/Course/video.mp4', range_attempts=[{'pass': 1}])
             d.write_json(root / 'corrupted/new/failed.json', [latest])
             d.write_json(state / 'recovery-state.json', {item['path']: dict(state='running', event=latest)})
-            bg = SimpleNamespace(root=root, state=state, source=source, checkpoint=Mock())
-            proof = dict(item, source=source, status='valid', local=str(local), mtime_ns=local.stat().st_mtime_ns)
+            bg = SimpleNamespace(root=root, state=state, source=source, checkpoint=Mock(),local_candidates={})
+            proof = dict(item, source=source, status='valid', local=str(local), mtime_ns=local.stat().st_mtime_ns,ctime_ns=local.stat().st_ctime_ns)
             with patch.object(d, 'sha256_file', side_effect=AssertionError('Redundant SHA')):
                 for change in ({'mtime_ns': 0}, {'status': 'partial'}, {'source': 'other'}, {'sha256': '0'*64}, {'mtime_ns': None}):
                     self.assertFalse(q.retire_cached_copy(bg, path, job, [dict(proof, **change)]))
@@ -715,7 +715,7 @@ class SharedRangeChecks(unittest.TestCase):
             d.write_json(state / 'summary.json', dict(pending_courses=[], complete=True))
             d.write_json(state / 'course-history.json', {'Course': dict(state='finished', verified=1, failed=0)})
             d.write_json(state / '01-manifest.json', [{k:v for k,v in item.items() if k != 'file'}])
-            d.write_json(state / 'local-copies.json', [dict(item, source=source, status='valid', local=str(local), mtime_ns=local.stat().st_mtime_ns)])
+            d.write_json(state / 'local-copies.json', [dict(item, source=source, status='valid', local=str(local), mtime_ns=local.stat().st_mtime_ns,ctime_ns=local.stat().st_ctime_ns)])
             task = state / 'tasks' / 'old.json'
             d.write_json(task, dict(kind='range', source=source, item=item, event={}, course='Course', attempt=3, state='pending'))
             stale = state / 'tasks' / 'stale.json'

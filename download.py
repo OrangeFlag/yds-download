@@ -51,7 +51,7 @@ def sha256_file(path, stopping=None):
                 digest.update(chunk)
             os.fsync(stream.fileno())
         after = path.stat()
-        if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+        if file_hashes.proof_stat(before) != file_hashes.proof_stat(after):
             raise OSError('File changed during SHA verification')
         return digest.hexdigest()
     finally:
@@ -245,7 +245,7 @@ def scan_events(path, repair=False, start=0, complete_lines=False):
 class EventIndex:
     """Hold current compact proofs, not the complete append-only JSONL history."""
 
-    FIELDS = ('path', 'source', 'status', 'local', 'size', 'sha256', 'mtime_ns')
+    FIELDS = ('path', 'source', 'status', 'local', 'size', 'sha256', 'mtime_ns', 'ctime_ns')
     CHECKPOINT_INTERVAL = 64 * 1024 * 1024
 
     def __init__(self, path, by_copy=False, repair=True, checkpoint=False):
@@ -366,12 +366,47 @@ def inspect(root, item, course, path=None, stopping=None):
         return 'invalid', 'Size mismatch'
     actual = sha256_file(path, stopping)
     after = path.stat() if path.exists() else None
-    if (after is None or (before.st_ino, before.st_size, before.st_mtime_ns) !=
-            (after.st_ino, after.st_size, after.st_mtime_ns)):
+    if after is None or file_hashes.proof_stat(before) != file_hashes.proof_stat(after):
         return 'invalid', 'File changed during SHA verification'
     if actual != item['sha256']:
         return 'invalid', 'SHA-256 mismatch: ' + actual
     return 'valid', 'SHA-256 verified'
+
+
+def copy_paths(root, item, course, cached, source):
+    locations = [target(root, item, course)]
+    registry = root / '.download/local-copies.json'
+    copies = json.loads(registry.read_text()) if registry.exists() else []
+    for proof in [cached, *copies]:
+        if (proof.get('status') == 'valid' and proof.get('path') == item['path']
+                and proof.get('source', source).rstrip('/') == source.rstrip('/')
+                and (proof.get('size'), proof.get('sha256')) == (item['size'], item['sha256'])
+                and proof.get('local')):
+            locations.append(saved_local(root, proof['local']))
+    return list(dict.fromkeys(locations))
+
+
+def inspect_available_copies(root, item, course, cached, source, stopping=None):
+    result = None
+    for local in copy_paths(root, item, course, cached, source):
+        before = file_hashes.proof_stat(local.stat()) if local.exists() else None
+        hashes = (file_hashes.load(local, root=root) if before is not None and before[1] == item['size']
+                  and not Path(str(local) + '.aria2').exists() else None)
+        if hashes:
+            status = 'valid' if hashes['sha256'] == item['sha256'] else 'invalid'
+            detail = 'SHA-256 verified' if status == 'valid' else 'SHA-256 mismatch: ' + hashes['sha256']
+        else:
+            status, detail = inspect(root, item, course, path=local, stopping=stopping)
+        after = file_hashes.proof_stat(local.stat()) if local.exists() else None
+        if status == 'valid' and before != after:
+            status, detail = 'invalid', 'File changed during SHA verification'
+        if result is None or status == 'valid':
+            result = dict(status=status, detail=detail, stat=before)
+            if local != target(root, item, course):
+                result['local'] = str(local)
+        if status == 'valid':
+            break
+    return result
 
 
 def record(state, item, course, attempt, status, detail, local=None, verified_stat=None, source_current=False):
@@ -380,7 +415,7 @@ def record(state, item, course, attempt, status, detail, local=None, verified_st
     stamp = None
     if status == 'valid':
         stat = path.stat() if path.exists() else None
-        stamp = [stat.st_ino, stat.st_size, stat.st_mtime_ns] if stat is not None else None
+        stamp = file_hashes.proof_stat(stat) if stat is not None else None
         if (stamp is None or stamp[1] != item['size'] or Path(str(path) + '.aria2').exists()
                 or verified_stat is not None and stamp != list(verified_stat)):
             status, detail = 'invalid', 'File changed after SHA verification'
@@ -396,6 +431,7 @@ def record(state, item, course, attempt, status, detail, local=None, verified_st
     if status == 'valid':
         storage.sync_directory(path.parent)
         event['mtime_ns'] = stamp[2]
+        event['ctime_ns'] = stamp[3]
     append_events(state / 'events.jsonl', [event])
     print(f"{status.upper()}: {item['path']} (attempt {attempt}) {detail}", flush=True)
     return event
@@ -414,7 +450,7 @@ def inspect_copies(root, item, course, cached, source, source_current=False):
     result = None
     for local in dict.fromkeys(locations):
         stat = local.stat() if local.exists() else None
-        verified_stat = [stat.st_ino, stat.st_size, stat.st_mtime_ns] if stat is not None else None
+        verified_stat = file_hashes.proof_stat(stat) if stat is not None else None
         status, detail = inspect(root, item, course, local)
         event = record(state, item, course, 0, status, detail, local=local, verified_stat=verified_stat,
                        source_current=source_current)
@@ -547,8 +583,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
         for event in local_copies:
             if event['source'].rstrip('/') == source.rstrip('/') and (deep or event['status'] == 'valid'):
                 local = saved_local(root, event['local'])
-                if deep or (local.exists() and local.stat().st_size == event['size']
-                        and local.stat().st_mtime_ns == event['mtime_ns']
+                if deep or (file_hashes.proof_current(local,event,root=root)
                         and not Path(str(local) + '.aria2').exists()):
                     events[event['path']] = event
         if not preserve_queue:
@@ -622,8 +657,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                     continue
                 if ((not deep or archived) and cached.get('status') == 'valid'
                         and cached.get('sha256') == item['sha256'] and cached.get('size') == item['size']
-                        and local.exists() and local.stat().st_size == item['size']
-                        and ('mtime_ns' not in cached or local.stat().st_mtime_ns == cached['mtime_ns'])
+                        and file_hashes.proof_current(local,cached,root=root)
                         and not Path(str(local) + '.aria2').exists()):
                     verified += 1
                     print('FILE SKIPPED: ' + item['path'] + '; previously SHA-256 verified', flush=True)
@@ -633,6 +667,15 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                         if event['status'] == 'valid':
                             verified += 1
                             continue
+                    else:
+                        checked = inspect_available_copies(root, item, course, cached, source)
+                        if checked['status'] == 'valid':
+                            event = record(state, item, course, 0, 'valid', checked['detail'],
+                                           local=saved_local(root, checked['local']) if checked.get('local') else None,
+                                           verified_stat=checked['stat'])
+                            if event['status'] == 'valid':
+                                verified += 1
+                                continue
                     pending.append(item)
             needed = sum(max(0, item['size'] - (target(root, item, course).stat().st_size
                          if target(root, item, course).exists() else 0)) for item in pending)
@@ -690,7 +733,7 @@ def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, g
                 for item in pending:
                     local = target(root, item, course)
                     stat = local.stat() if local.exists() else None
-                    verified_stat = [stat.st_ino, stat.st_size, stat.st_mtime_ns] if stat is not None else None
+                    verified_stat = file_hashes.proof_stat(stat) if stat is not None else None
                     status, detail = inspect(root, item, course)
                     event = record(state, item, course, attempt, status, detail, verified_stat=verified_stat)
                     status = event['status']

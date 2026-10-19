@@ -2,10 +2,12 @@
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import ssl
 from threading import Barrier, Event, Lock
+from types import SimpleNamespace
 from types import SimpleNamespace
 import unittest
 import urllib.error
@@ -22,6 +24,117 @@ class Response(io.BytesIO):
 
 
 class NextcloudChecks(unittest.TestCase):
+    def test_upload_uses_current_mtime_when_hash_cache_proves_touched_file(self):
+        before=self.local.stat()
+        os.utime(self.local,ns=(before.st_atime_ns,before.st_mtime_ns+1000000))
+        nextcloud.file_hashes.calculate(self.local,root=self.root)
+        sync=nextcloud.Sync(None,self.upload,Event())
+        jobs=sync.jobs([self.root])
+        self.assertEqual(len(jobs),1)
+        with patch.object(sync,'upload') as upload:
+            sync.transfer(jobs[0])
+        upload.assert_called_once()
+        self.assertEqual(jobs[0][-1],self.local.stat().st_mtime_ns)
+
+    def test_partial_changed_during_remote_lookup_is_not_uploaded(self):
+        sync=nextcloud.Sync(None,self.upload,Event())
+        job=list(sync.jobs([self.root])[0])
+        def changed(*args):
+            before=self.local.stat()
+            self.local.write_bytes(b'evilure')
+            os.utime(self.local,ns=(before.st_atime_ns,before.st_mtime_ns))
+            return False
+        job[5]='partial'
+        job[8]=SimpleNamespace(upload_contains=changed)
+        methods=[]
+        def request(method,path='',data=None,**kwargs):
+            methods.append(method)
+            if method=='PUT':data.read()
+            return Response()
+        with patch.object(sync,'request',request):
+            sync.transfer(job)
+        self.assertNotIn('PUT',methods)
+        self.assertNotIn('MOVE',methods)
+        self.assertFalse((self.state/'nextcloud-uploads.json').exists())
+
+    def check_resume_identity(self,variant,initial,content,legacy=False):
+        self.local.write_bytes(initial)
+        sync=nextcloud.Sync(None,self.upload,Event(),chunk_size=4)
+        stopping=sync.stopping
+        calls=[]
+        def request(method,path='',data=None,headers=None,uploads=False):
+            if method=='PROPFIND':
+                response=Response(b'<d:multistatus xmlns:d="DAV:"><d:response><d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>')
+                response.status=207
+                return response
+            if method=='PUT':
+                calls.append((path,data.read()))
+                if len(calls)==1:stopping.set()
+            return Response()
+        with patch.object(sync,'request',request):
+            with self.assertRaises(InterruptedError):
+                sync.upload(self.root,self.data,self.item,self.local,variant,'video.mp4',7,71.43)
+        state=self.state/'nextcloud-uploads.json'
+        old=next(iter(json.loads(state.read_text()).values()))
+        self.assertEqual(old['next_chunk'],1)
+        if content!=initial:
+            before=self.local.stat()
+            self.local.write_bytes(content)
+            os.utime(self.local,ns=(before.st_atime_ns,before.st_mtime_ns))
+        if legacy:
+            old['local_stat']=old['local_stat'][:3]
+            download.write_json(state,{old['key']:old})
+        sync=nextcloud.Sync(None,self.upload,Event(),chunk_size=4)
+        with patch.object(sync,'request',request):
+            sync.upload(self.root,self.data,self.item,self.local,variant,'video.mp4',7,71.43)
+        current=next(iter(json.loads(state.read_text()).values()))
+        self.assertEqual(current['state'],'uploaded')
+        if content!=initial or legacy:
+            self.assertNotEqual(current['upload_id'],old['upload_id'])
+            self.assertEqual([body for _,body in calls],[initial[:4],content[:4],content[4:]])
+        else:
+            self.assertEqual(current['upload_id'],old['upload_id'])
+            self.assertEqual([body for _,body in calls],[initial[:4],content[4:]])
+
+    def test_partial_resume_never_mixes_an_old_prefix_with_changed_bytes(self):
+        self.check_resume_identity('partial',b'lecture',b'evilure')
+
+    def test_original_resume_never_reuses_a_changed_prefix(self):
+        self.check_resume_identity('original',b'evilure',b'lecture')
+
+    def test_legacy_resume_restarts_a_prefix_without_ctime_proof(self):
+        self.check_resume_identity('partial',b'lecture',b'lecture',legacy=True)
+
+    def test_unchanged_partial_resumes_its_confirmed_chunks(self):
+        self.check_resume_identity('partial',b'lecture',b'lecture')
+
+    def test_selected_video_changed_with_restored_mtime_is_not_sent(self):
+        sync=nextcloud.Sync(None,self.upload,Event())
+        jobs=sync.jobs([self.root])
+        self.assertEqual(len(jobs),1)
+        before=self.local.stat()
+        self.local.write_bytes(b'x'*before.st_size)
+        os.utime(self.local,ns=(before.st_atime_ns,before.st_mtime_ns))
+        with patch.object(sync,'upload',side_effect=AssertionError('Changed video sent')):
+            sync.transfer(jobs[0])
+
+    def test_original_changed_during_put_with_restored_mtime_is_not_published(self):
+        methods=[]
+        def request(share,method,path='',data=None,headers=None,uploads=False):
+            methods.append(method)
+            if method=='PUT':
+                data.read()
+                before=self.local.stat()
+                self.local.write_bytes(b'x'*before.st_size)
+                os.utime(self.local,ns=(before.st_atime_ns,before.st_mtime_ns))
+            return Response()
+        with patch.object(nextcloud.Share,'request',request):
+            nextcloud.Sync(None,self.upload,Event()).run_once([self.root])
+        self.assertIn('PUT',methods)
+        self.assertNotIn('MOVE',methods)
+        self.assertFalse(any(row['state']=='uploaded' for row in
+                             json.loads((self.state/'nextcloud-uploads.json').read_text()).values()))
+
     def test_put_body_does_not_duplicate_sha256_work(self):
         # Sync.upload already computes the complete SHA-256 and each chunk's checksum.
         payload=b'known video bytes'
@@ -925,7 +1038,8 @@ class ParallelUploadChecks(unittest.TestCase):
             upload_share=sync.share.url(), nickname=None) for n,item in enumerate(started)})
         gate, lock = Barrier(4), Lock()
         seen = []
-        def upload(root, data, item, local, variant, target, size, percent):
+        def upload(root, data, item, local, variant, target, size, percent, expected_stat=None):
+            self.assertEqual(expected_stat,nextcloud.file_hashes.proof_stat(local.stat()))
             with lock:
                 seen.append((item['path'],target)); first_wave=len(seen)<=4
             if first_wave:gate.wait(3)

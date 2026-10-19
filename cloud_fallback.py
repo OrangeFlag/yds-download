@@ -11,6 +11,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 import download as d
+import file_hashes
 import network
 from nextcloud import VIDEO, normalized, remote_path
 from nextcloud_fallback import Fallback
@@ -132,7 +133,7 @@ class CloudFallback:
                 if original.get(kind):item[kind]=original[kind]
         return matches
 
-    def _local(self,item,event=None):
+    def _local(self,item,event=None,verify=True):
         target=d.local_path(self.root,item['path'])
         paths={target:[]}
         source=self.sources[0].source['source']
@@ -170,26 +171,34 @@ class CloudFallback:
                         or proof.get('status')!='valid' and proof.get('state')!='verified'
                         or proof.get('actual_sha256',item['sha256'])!=item['sha256']):continue
                 saved_stat=proof.get('local_stat',proof.get('recovered_stat'))
-                if saved_stat is not None:
+                if proof.get('ctime_ns') is not None:
+                    trusted=file_hashes.proof_current(path,proof,root=self.root)
+                elif saved_stat is not None:
                     trusted=list(saved_stat)==stamp
-                else:trusted=proof.get('mtime_ns')==stamp[2]
+                else:trusted=file_hashes.proof_current(path,proof,root=self.root)
                 if trusted:break
             key=(str(path),item['sha256'])
             if self.local_proofs.get(key)!=stamp:
-                if not trusted and (d.sha256_file(path,self.stopping)!=item['sha256'].lower() or Fallback.stamp(path)!=stamp):continue
+                if not trusted:
+                    cached=file_hashes.load(path,root=self.root)
+                    if cached and cached['sha256']==item['sha256'].lower():
+                        trusted=True
+                    elif not verify or d.sha256_file(path,self.stopping)!=item['sha256'].lower():
+                        continue
+                    if Fallback.stamp(path)!=stamp:continue
                 self.local_proofs[key]=stamp
             return path,stamp
         return None
 
     def ready(self,item):
-        return self._listed(item) and self._local(item) is None and any(source.ready(item) for source in self.sources)
+        return self._listed(item) and self._local(item,verify=False) is None and any(source.ready(item) for source in self.sources)
 
     def recover_all(self,item,event):
         if not self._listed(item):return None
         local=self._local(item,event)
         if local is not None:
-            if any(source.read(item).get('state')=='verified' for source in self.sources):return None
             path,stamp=local
+            if any(source.read(item).get('state')=='verified' and source.read(item).get('local_stat')==stamp for source in self.sources):return None
             proof=d.record(self.root/'.download',item,event['course'],event['attempt'],'valid',
                            'Existing local original; SHA-256 verified',local=path,verified_stat=stamp)
             if proof['status']!='valid':return None

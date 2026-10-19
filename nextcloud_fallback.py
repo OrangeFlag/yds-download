@@ -69,7 +69,7 @@ class Fallback:
     @staticmethod
     def stamp(path):
         s=path.stat()
-        return [s.st_ino,s.st_size,s.st_mtime_ns]
+        return file_hashes.proof_stat(s)
 
     @staticmethod
     def body_key(path,size):
@@ -137,6 +137,19 @@ class Fallback:
         if row.get('state') in ('verified','mismatch','not_found','unmapped') and not self.ready(item):
             return None
         row.update(source=self.source['source'],path=item['path'],size=item['size'],sha256=item['sha256'],share=self.index.link)
+        if row.get('state')=='pending' and row.get('local') and row.get('actual_sha256')==item['sha256']:
+            local=storage.saved_local(self.root,row['local'])
+            if local.is_file() and not Path(str(local)+'.aria2').exists() and local.stat().st_size==item['size']:
+                stamp=self.stamp(local)
+                hashes=file_hashes.load(local,root=self.root) or self.hash_file(local)
+                if hashes['sha256']==item['sha256'] and self.stamp(local)==stamp:
+                    proof=d.record(self.root/'.download',item,event['course'],event['attempt'],'valid',
+                        self.label.title()+' resumed publication; SHA-256 verified',local=local,verified_stat=stamp)
+                    if proof['status']!='valid':raise RuntimeError('Resumed publication changed')
+                    row.update(state='verified',local_stat=stamp,received_bytes=item['size']);self.save(item,row)
+                    result=dict(event,**proof,range_recovered_complete=True,recovered_stat=stamp)
+                    r.recovery_state(self.root,result,'finished')
+                    return result
         own_hashes=[]
         for copy in row.get('retained_copies',{}).values():
             local=storage.saved_local(self.root, copy['local'])
@@ -253,7 +266,10 @@ class Fallback:
             verified_stat=before
             collision=0
             while True:
-                try:os.link(part,target)
+                try:
+                    os.link(part,target)
+                    verified_stat=self.stamp(target)
+                    if verified_stat[:3]!=before[:3]:raise RuntimeError('Fallback file changed during publication')
                 except FileExistsError:
                     stamp=self.stamp(target)
                     if Path(str(target)+'.aria2').exists() or d.sha256_file(target,self.stopping)!=actual or self.stamp(target)!=stamp:
@@ -265,6 +281,17 @@ class Fallback:
             storage.sync_directory(target.parent)
             stat=self.stamp(target)
             if stat!=verified_stat:raise RuntimeError('Fallback file changed before publication')
+            row.update(state='pending',actual_sha256=actual,local=str(target))
+            self.save(item,row)
+            part.unlink()
+            stat=self.stamp(target)
+            if stat[:3]!=verified_stat[:3]:raise RuntimeError('Fallback file changed during cleanup')
+            storage.sync_directory(part.parent)
+            if self.stamp(target)!=stat:raise RuntimeError('Fallback file changed during cleanup')
+            # Link removal changes ctime; prove the final inode version before caching it.
+            if stat[0]==before[0] and stat[3]!=before[3]:
+                actual_hashes=file_hashes.calculate(target,self.stopping,root=self.root,expected_sha256=actual)
+                if self.stamp(target)!=stat:raise RuntimeError('Fallback file changed during final verification')
             row.update(state='verified' if matched else 'mismatch',actual_sha256=actual,local=str(target),local_stat=stat,received_bytes=size)
             if matched:
                 proof=d.record(self.root/'.download',item,event['course'],event['attempt'],'valid',
@@ -279,7 +306,6 @@ class Fallback:
                 result=dict(status='mismatch',local=str(target),actual_sha256=actual,expected_sha256=item['sha256'],source=host)
                 print(self.label+' SHA MISMATCH: '+str(target),flush=True)
             self.save(item,row)
-            part.unlink();storage.sync_directory(part.parent)
             return result
         except InterruptedError:
             row.update(state='pending',retry_after=0);self.save(item,row);raise

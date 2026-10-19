@@ -97,7 +97,7 @@ class OutageIntegrationChecks(unittest.TestCase):
 
     def test_event_proof_is_synced_before_record_returns(self):
         local = self.root / 'Course/video.mp4';local.parent.mkdir();local.write_bytes(b'lecture')
-        stamp = [local.stat().st_ino, local.stat().st_size, local.stat().st_mtime_ns]
+        stamp = download.file_hashes.proof_stat(local.stat())
         with patch('download.os.fsync') as sync:
             result = download.record(self.state, self.item, 'Course', 1, 'valid', 'Verified', verified_stat=stamp)
         self.assertEqual(result['status'], 'valid')
@@ -105,7 +105,7 @@ class OutageIntegrationChecks(unittest.TestCase):
 
     def test_valid_original_directory_sync_failure_does_not_record_proof(self):
         local = self.root / 'Course/video.mp4'; local.parent.mkdir(); local.write_bytes(b'lecture')
-        stamp = [local.stat().st_ino, local.stat().st_size, local.stat().st_mtime_ns]
+        stamp = download.file_hashes.proof_stat(local.stat())
         with patch.object(storage, 'sync_directory', side_effect=OSError(errno.EIO, 'Directory unavailable')) as sync:
             with self.assertRaises(OSError):
                 download.record(self.state, self.item, 'Course', 1, 'valid', 'Verified', verified_stat=stamp)

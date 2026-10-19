@@ -23,6 +23,28 @@ def fingerprint(path):
     return _stamp(Path(path).stat())
 
 
+def proof_stat(stat):
+    return _stamp(stat)[1:]
+
+
+def proof_current(path, proof, root=None, *, legacy=False):
+    """Legacy display marks survive; actual reuse needs ctime or a current SHA cache."""
+    storage.check(path)
+    try:
+        stat = Path(path).stat()
+    except FileNotFoundError:
+        return False
+    if stat.st_size != proof.get('local_size', proof.get('size')):
+        return False
+    if proof.get('mtime_ns') is None or stat.st_mtime_ns == proof['mtime_ns']:
+        if proof.get('ctime_ns') == stat.st_ctime_ns:
+            return True
+        if legacy and proof.get('ctime_ns') is None:
+            return True
+    cached = load(path, root=root)
+    return bool(cached and cached['sha256'] == proof.get('actual_sha256', proof.get('sha256')))
+
+
 def _location(path, root):
     path = Path(os.path.abspath(path))
     storage.check(path)
@@ -115,7 +137,7 @@ def save(path, hashes, expected_stat, root=None):
             temporary.unlink(missing_ok=True)
 
 
-def calculate(path, stopping=None, root=None, progress=None):
+def calculate(path, stopping=None, root=None, progress=None, expected_sha256=None):
     """Always read once; only explicit load() calls may reuse saved hashes."""
     path = Path(path)
     storage.check(path)
@@ -152,6 +174,8 @@ def calculate(path, stopping=None, root=None, progress=None):
         if amount != before[2] or fingerprint(path) != before:
             raise OSError('File changed during SHA verification')
         hashes = {name: digest.hexdigest() for name, digest in digests.items()}
+        if expected_sha256 is not None and hashes['sha256'] != expected_sha256:
+            raise OSError('File changed during publication: SHA-256 mismatch')
         if not save(path, hashes, before, root=root) and fingerprint(path) != before:
             raise OSError('File changed during SHA verification')
         return hashes

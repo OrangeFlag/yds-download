@@ -423,6 +423,8 @@ class Uploader(nextcloud.Sync):
         storage.check(local)
         stat=local.stat();fingerprint=(stat.st_dev,stat.st_ino,stat.st_size,stat.st_mtime_ns,stat.st_ctime_ns)
         if (stat.st_size,stat.st_mtime_ns)!=(size,mtime):raise RuntimeError('Local video changed')
+        selected=self.job_stamps.get((root,local,mtime))
+        if selected is not None and file_hashes.proof_stat(stat)!=selected:raise RuntimeError('Local video changed after selection')
         row=self.record(job)
         if row.get('state') in ('uploaded','existing'):return False
         relative=PurePosixPath(nextcloud.remote_path(data,item))

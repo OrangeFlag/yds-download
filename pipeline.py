@@ -16,6 +16,7 @@ from threading import Event
 import time
 
 import download as d
+import file_hashes
 import network
 from network import aria_resource
 import storage
@@ -155,6 +156,7 @@ class Background:
         self.futures = {}
         self.jobs = {}
         self.bindings = {}
+        self.local_candidates = {}
         self.deferred = {}
         self.defer_range = defer_range
         self.budget = budget
@@ -236,8 +238,8 @@ class Background:
             job['queued_at'] = old.get('queued_at') or old.get('time',job['time'])
             if old['state'] == 'done':
                 # Reapply a result saved just before interruption, but never trust changed bytes.
-                local = d.target(self.root, item, course)
                 result = old.get('result', {})
+                local = storage.saved_local(self.root, result['local']) if result.get('local') else d.target(self.root, item, course)
                 if (kind == 'range' and r.prefer_saved_event(self.root, event, result.get('event', {}))
                         and self.range_result_current(item, result.get('event', {}))
                         or kind != 'range' and local.exists() and result.get('stat') == self.stat(local)
@@ -286,7 +288,7 @@ class Background:
     @staticmethod
     def stat(local):
         stat = local.stat()
-        return [stat.st_ino, stat.st_size, stat.st_mtime_ns]
+        return file_hashes.proof_stat(stat)
 
     def range_result_current(self, item, event):
         return r.range_result_current(self.root, item, event)
@@ -308,13 +310,8 @@ class Background:
         try:
             d.write_json(path, job)
             if job['kind'] == 'sha':
-                local = d.target(self.root, job['item'], job['course'])
-                before = self.stat(local) if local.exists() else None
-                status, detail = d.inspect(self.root, job['item'], job['course'], stopping=self.stopping)
-                after = self.stat(local) if local.exists() else None
-                if status == 'valid' and before != after:
-                    status, detail = 'invalid', 'File changed during SHA verification'
-                result = dict(status=status, detail=detail, stat=before)
+                result = d.inspect_available_copies(self.root, job['item'], job['course'],
+                                                   job.get('event', {}), self.source, self.stopping)
             else:
                 event = job['event']
                 if self.fallback or job.get('yandex_recheck'):
@@ -329,7 +326,23 @@ class Background:
                 checked_yandex = False
                 completed_yandex = False
                 try:
-                    fallback=self.fallback.recover_all(job['item'],event) if self.fallback and not job.get('yandex_recheck') else None
+                    fallback=None
+                    if not job.get('yandex_recheck'):
+                        originals=(*self.local_candidates.pop(job['item']['path'],()),d.target(self.root,job['item'],job['course']))
+                        for local in dict.fromkeys(originals):
+                            if not local.is_file() or local.stat().st_size!=job['item']['size'] or Path(str(local)+'.aria2').exists():continue
+                            stamp=self.stat(local)
+                            hashes=file_hashes.load(local,root=self.root)
+                            actual=hashes['sha256'] if hashes else d.sha256_file(local,self.stopping)
+                            if actual!=job['item']['sha256'] or self.stat(local)!=stamp:continue
+                            proof=d.record(self.state,job['item'],job['course'],job['attempt'],'valid',
+                                'Existing local original; SHA-256 verified',local=local,verified_stat=stamp)
+                            if proof['status']!='valid':continue
+                            fallback=dict(event,**proof,range_recovered_complete=True,recovered_stat=stamp)
+                            r.recovery_state(self.root,fallback,'finished')
+                            break
+                    if fallback is None and self.fallback and not job.get('yandex_recheck'):
+                        fallback=self.fallback.recover_all(job['item'],event)
                     if fallback and fallback['status']=='valid':
                         event=fallback
                     else:
@@ -464,11 +477,12 @@ class Background:
             item, course, attempt = job['item'], job['course'], job['attempt']
             result = job['result']
             if job['kind'] == 'sha':
-                local = d.target(self.root, item, course)
+                local = storage.saved_local(self.root, result['local']) if result.get('local') else d.target(self.root, item, course)
                 if result['status'] == 'valid' and (not local.exists() or result['stat'] != self.stat(local)
                                                    or Path(str(local) + '.aria2').exists()):
                     result.update(status='invalid', detail='File changed after SHA verification')
                 event = d.record(self.state, item, course, attempt, result['status'], result['detail'],
+                                 local=local if result.get('local') else None,
                                  verified_stat=result['stat'])
                 if event['status'] != 'valid':
                     self.failed(item, course, attempt, event)
@@ -620,7 +634,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
         for row in json.loads(registry.read_text()) if registry.exists() else []:
             local = storage.saved_local(root, row['local'])
             if (row['source'].rstrip('/') == source.rstrip('/') and row['status'] == 'valid' and local.exists()
-                    and (local.stat().st_size, local.stat().st_mtime_ns) == (row['size'], row['mtime_ns'])
+                    and file_hashes.proof_current(local,row,root=root)
                     and not Path(str(local) + '.aria2').exists()):
                 events[row['path']] = row
         candidates = {}
@@ -664,7 +678,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                     and job['kind'] == 'sha' and job['state'] in ('pending', 'running', 'done')
                     and (current.get('size'), current.get('sha256')) == (job['item']['size'], job['item']['sha256'])
                     and background.continuation(job['item']).get('phase') == 'verifying'):
-                background.submit('sha', job['item'], job['course'], job['attempt'])
+                background.submit('sha', job['item'], job['course'], job['attempt'], job.get('event'))
         if report_repo:
             from report import retry_reports
             retry_reports(root)
@@ -684,8 +698,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                     for proof in (proofs.get(item['path'], {}), events.get(item['path'], {})):
                         local = storage.saved_local(root, proof['local']) if proof.get('local') else d.target(root, item, course)
                         if (proof.get('status') == 'valid' and (proof.get('size'), proof.get('sha256')) == (item['size'], item['sha256'])
-                                and local.exists() and local.stat().st_size == item['size']
-                                and ('mtime_ns' not in proof or local.stat().st_mtime_ns == proof['mtime_ns'])
+                                and file_hashes.proof_current(local,proof,root=root,legacy=True)
                                 and not Path(str(local) + '.aria2').exists()):
                             valid += 1
                             break
@@ -746,8 +759,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                     cached = events.get(item['path'], {})
                     local = storage.saved_local(root, cached['local']) if cached.get('local') and cached.get('status') == 'valid' else d.target(root, item, course)
                     if (cached.get('status') == 'valid' and (cached.get('size'), cached.get('sha256')) == (item['size'], item['sha256'])
-                            and local.exists() and local.stat().st_size == item['size']
-                            and ('mtime_ns' not in cached or local.stat().st_mtime_ns == cached['mtime_ns'])
+                            and file_hashes.proof_current(local,cached,root=root)
                             and not Path(str(local) + '.aria2').exists()):
                         continue
                     if remote_index and remote_index.contains(data,item):
@@ -795,8 +807,9 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                         else:
                             background.repair_archive(item, course, archived)
                             background.submit('range', item, course, archived['attempt'], archived, force=retry_check)
-                    elif local.exists() and local.stat().st_size == item['size'] and not Path(str(local) + '.aria2').exists():
-                        background.submit('sha', item, course, 0)
+                    elif any(local.is_file() and local.stat().st_size == item['size'] and not Path(str(local) + '.aria2').exists()
+                             for local in d.copy_paths(root, item, course, cached, source)):
+                        background.submit('sha', item, course, 0, cached)
                     else:
                         pending.append(item)
                 if pending:

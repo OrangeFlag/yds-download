@@ -15,6 +15,7 @@ import unicodedata
 import uuid
 
 import network
+import file_hashes
 import storage
 
 BEGIN = '<!-- yds-download:begin -->'
@@ -26,7 +27,7 @@ PUBLISH_LOCK = Lock()
 
 class ReportEvents:
     # shortcut: journals are append-only; replace the file atomically to edit committed history.
-    FIELDS = ('path', 'source', 'status', 'local', 'size', 'sha256', 'mtime_ns',
+    FIELDS = ('path', 'source', 'status', 'local', 'size', 'sha256', 'mtime_ns', 'ctime_ns',
               'time', 'detail', 'attempt', 'source_current', 'downloaded_percent', 'downloaded_bytes')
 
     def __init__(self, path):
@@ -257,8 +258,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
                 or (events[key]['size'], events[key]['sha256']) == (event['size'], event['sha256'])):
             continue
         local = storage.saved_local(destination, event['local']) if event.get('local') else local_path(destination, event['path'])
-        if (local.exists() and local.stat().st_size == event['size']
-                and local.stat().st_mtime_ns == event['mtime_ns'] and not Path(str(local) + '.aria2').exists()):
+        if (file_hashes.proof_current(local,event,root=destination,legacy=True) and not Path(str(local) + '.aria2').exists()):
             events[key] = event
     def same_identity(row):
         identity = expected.get(normalized(row['path']))
@@ -276,7 +276,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
             local = storage.saved_local(destination, copy['local'])
             if local.exists():
                 stat = local.stat()
-                if stat.st_size == copy['size'] and stat.st_mtime_ns == copy['mtime_ns'] and not Path(str(local) + '.aria2').exists():
+                if file_hashes.proof_current(local,copy,root=destination,legacy=True) and not Path(str(local) + '.aria2').exists():
                     external[normalized(copy['path'])] = copy
     partial = {}
     known_partial = {}
@@ -292,7 +292,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
                 raise ValueError('Unsafe partial copy path')
             if local.exists():
                 stat = local.stat()
-                if (stat.st_size == copy['local_size'] and stat.st_mtime_ns == copy['mtime_ns']
+                if (file_hashes.proof_current(local,copy,root=destination,legacy=True)
                         and (copy.get('downloaded_bytes') or 0) * 2 > copy['size']
                         and not copy.get('sha256_mismatch') and same_identity(copy)):
                     partial[key] = copy
@@ -338,8 +338,7 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
             if event:
                 status = event['status']
                 local = storage.saved_local(destination, local_copy['local']) if local_copy else local_path(destination, event['path'])
-                if status == 'valid' and (not same_identity(event) or not local.exists() or local.stat().st_size != event['size']
-                                         or ('mtime_ns' in event and local.stat().st_mtime_ns != event['mtime_ns'])
+                if status == 'valid' and (not same_identity(event) or not file_hashes.proof_current(local,event,root=destination,legacy=True)
                                          or Path(str(local) + '.aria2').exists()):
                     status = 'missing'
                 final = terminal.get(normalized(event['path']))

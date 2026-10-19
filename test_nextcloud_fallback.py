@@ -117,8 +117,6 @@ class FallbackChecks(unittest.TestCase):
         self.assertFalse(Fallback(self.root,self.link,Event()).ready(self.item))
         import file_hashes
         target=d.target(self.root,self.item,'Course')
-        self.assertIsNone(file_hashes.load(target,root=self.root))
-        d.sha256_file(target)
         hashes=file_hashes.load(target,root=self.root)
         self.assertEqual(hashes,{name:hashlib.new(name,self.content).hexdigest() for name in file_hashes.ALGORITHMS})
 
