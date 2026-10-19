@@ -112,7 +112,11 @@ class CloudChecks(unittest.TestCase):
         expected=dict(self.rows[-1],path='ingest/Other/2017/Course/001 - Lecture.mp4')
         wrong=[dict(expected,path=f'ingest/Other/{year}/Course/001 - Lecture.mp4')
                for year in ('2017-fall','2017-spring','2018')]
-        self.server.rows=wrong+[expected]
+        prefixes=('2017','2017-fall','2017-spring','2018')
+        folders=[dict(path=path,directory=True)
+                 for path in ('ingest','ingest/Other',*(f'ingest/Other/{year}' for year in prefixes),
+                              *(f'ingest/Other/{year}/Course' for year in prefixes))]
+        self.server.rows=folders+wrong+[expected]
         index=self.cloud().sources[0].index
         self.assertEqual(index.candidates(self.data,self.item),[expected])
 
