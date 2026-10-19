@@ -710,7 +710,7 @@ class NextcloudChecks(unittest.TestCase):
         with patch.object(sync,'upload') as upload:
             sync.transfer(jobs[0])
         upload.assert_called_once()
-        self.assertEqual(upload.call_args.args[6],
+        self.assertEqual(upload.call_args.args[5],
                          '2017/Course/001 - 2023-09-15 Лекция.mp4')
 
     def test_annual_archive_nextcloud_lookup_does_not_match_other_seasons(self):
