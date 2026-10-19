@@ -532,6 +532,7 @@ def download(data, courses, root, retries=2, report_repo=None, mark=None, git_pu
 
 
 def download_deep(data, courses, root, retries=2, report_repo=None, mark=None, git_push=False, deep=False, retry_check=False, tuning=None, download_budget=None):
+    storage.check(root)
     tuning = resolve(tuning)
     if not all(shutil.which(name) for name in ('aria2c', 'cp')):
         raise RuntimeError('Install aria2c and coreutils first')

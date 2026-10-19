@@ -57,7 +57,10 @@ class Fallback:
             return False
         row=self.read(item)
         if row.get('state')=='unmapped':
-            return False
+            try:
+                remote_path(self.source,item)
+            except ValueError:
+                return False
         if row.get('state')=='mismatch' and self.changed_copies(row):return True
         if row.get('state') in ('verified','mismatch'):
             local=storage.saved_local(self.root, row['local'])

@@ -24,6 +24,27 @@ class Response(io.BytesIO):
 
 
 class FallbackChecks(unittest.TestCase):
+    def test_annual_archive_retries_a_previously_unmapped_copy(self):
+        d.write_json(self.state/'source.json',dict(self.data,title='ШАД 2017'))
+        fallback=Fallback(self.root,self.link,Event())
+        fallback.directory.mkdir()
+        fallback.save(self.item,dict(state='unmapped'))
+        remote=dict(self.row,path='2017/Course/001 - 2023-09-15 Лекция.mp4')
+        with patch.object(nextcloud.Share,'listing',return_value=[remote]), \
+                patch.object(nextcloud.Share,'request',return_value=Response(self.content)):
+            self.assertTrue(fallback.ready(self.item))
+            self.assertEqual(fallback.recover(self.item,self.event)['status'],'valid')
+        self.assertEqual(d.target(self.root,self.item,'Course').read_bytes(),self.content)
+
+    def test_unmapped_copy_without_a_year_still_does_not_request_network(self):
+        d.write_json(self.state/'source.json',dict(self.data,title='ШАД'))
+        fallback=Fallback(self.root,self.link,Event())
+        fallback.directory.mkdir()
+        fallback.save(self.item,dict(state='unmapped'))
+        with patch.object(nextcloud.Share,'request',side_effect=AssertionError('Unmapped request')):
+            self.assertFalse(fallback.ready(self.item))
+            self.assertIsNone(fallback.recover(self.item,self.event))
+
     def test_ru_endpoint_resumes_the_old_download_body(self):
         class Interrupted(Response):
             def read(response,amount=-1):

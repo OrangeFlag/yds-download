@@ -154,6 +154,14 @@ class StorageChecks(unittest.TestCase):
             with self.assertRaises(storage.StorageUnavailable):
                 download.inspect(self.root, item, 'Course')
 
+    def test_deep_download_checks_disk_before_creating_archive(self):
+        archive=self.root/'archive'
+        with patch.dict(os.environ,dict(self.env,YDS_DISK_DEVICE='-1')), \
+                patch.object(download.shutil,'which',return_value='/usr/bin/tool'):
+            with self.assertRaises(storage.StorageUnavailable):
+                download.download(dict(source='test',title='ШАД 2017'),[],archive,deep=True)
+        self.assertFalse(archive.exists())
+
     def test_manual_recovery_refuses_a_missing_mount(self):
         (self.root / '.download').mkdir()
         download.write_json(self.root / '.download/source.json', {'source': 'test'})
