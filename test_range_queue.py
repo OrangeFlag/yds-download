@@ -513,7 +513,7 @@ class SharedRangeChecks(unittest.TestCase):
             d.append_events(path,[original])
             d.EventIndex(path,checkpoint=True).refresh()
             # Same-size in-place rewrite must not inherit previous verified results.
-            path.write_text(json.dumps(dict(original,status='other'))+'\\n')
+            path.write_text(json.dumps(dict(original,status='other'))+chr(10))
             self.assertEqual(d.EventIndex(path,checkpoint=True).refresh()['/one']['status'],'other')
             replacement=path.with_name('replacement.jsonl')
             d.append_events(replacement,[dict(original,status='lost')])
@@ -527,10 +527,10 @@ class SharedRangeChecks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'events.jsonl'
             row=dict(path='/one',status='valid')
-            path.write_text(json.dumps(row)+'\\n'+'{"path":')
+            path.write_text(json.dumps(row)+chr(10)+'{"path":')
             initial=d.EventIndex(path,checkpoint=True)
             self.assertEqual(initial.refresh()['/one']['status'],'valid')
-            self.assertEqual(path.read_text(),json.dumps(row)+'\\n')
+            self.assertEqual(path.read_text(),json.dumps(row)+chr(10))
             d.append_events(path,[dict(row,status='other')])
             self.assertEqual(d.EventIndex(path,checkpoint=True).refresh()['/one']['status'],'other')
 
