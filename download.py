@@ -178,7 +178,11 @@ def write_json(path, data):
                 json.dump(data, stream, ensure_ascii=False, indent=2)
                 stream.flush(); os.fsync(stream.fileno())
             temporary.replace(path)
-            storage.sync_directory(path.parent)
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
         finally:
             temporary.unlink(missing_ok=True)
 
