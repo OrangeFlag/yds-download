@@ -246,30 +246,89 @@ class EventIndex:
     """Hold current compact proofs, not the complete append-only JSONL history."""
 
     FIELDS = ('path', 'source', 'status', 'local', 'size', 'sha256', 'mtime_ns')
+    CHECKPOINT_INTERVAL = 64 * 1024 * 1024
 
-    def __init__(self, path, by_copy=False, repair=True):
+    def __init__(self, path, by_copy=False, repair=True, checkpoint=False):
+        if checkpoint and by_copy:
+            raise ValueError('Persistent event checkpoints require path keys')
         self.by_copy, self.repair = by_copy, repair
         self.path = path
+        self.checkpoint = path.with_name(path.name + '.index.json') if checkpoint else None
         self.events = {}
         self.inode = None
-        self.offset = 0
+        self.offset = self.checkpoint_offset = 0
+        self.checkpoint_loaded = False
         self.scanned_events = self.scanned_bytes = self.journal_bytes = 0
 
+    @staticmethod
+    def _checksum(data):
+        encoded = json.dumps(data, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _anchor(self, offset):
+        # Verify both boundaries. JSONL is append-only; a rewritten/rotated
+        # journal must be replayed instead of trusting a stale proof.
+        with self.path.open('rb') as stream:
+            stat = os.fstat(stream.fileno())
+            if offset > stat.st_size:
+                return None, stat
+            head = stream.read(min(4096, offset))
+            stream.seek(max(0, offset - 4096))
+            tail = stream.read(min(4096, offset))
+            return hashlib.sha256(head + tail).hexdigest(), stat
+
+    def _load_checkpoint(self, journal):
+        try:
+            saved = json.loads(self.checkpoint.read_text())
+            payload = saved['payload']
+            offset = payload['offset']
+            if (payload['schema'] != 1 or type(offset) is not int or offset <= 0
+                    or not isinstance(payload['events'], dict)
+                    or saved['sha256'] != self._checksum(payload)
+                    or (payload['dev'], payload['ino']) != (journal.st_dev, journal.st_ino)
+                    or offset > journal.st_size
+                    or (offset == journal.st_size and payload['mtime_ns'] != journal.st_mtime_ns)):
+                return
+            anchor, current = self._anchor(offset)
+            if (anchor != payload['anchor']
+                    or (current.st_dev, current.st_ino) != (journal.st_dev, journal.st_ino)):
+                return
+        except (FileNotFoundError, ValueError, KeyError, TypeError, UnicodeDecodeError):
+            return
+        self.events = payload['events']
+        self.offset = self.checkpoint_offset = offset
+        self.checkpoint_loaded = True
+
+    def _save_checkpoint(self):
+        anchor, stat = self._anchor(self.offset)
+        if (anchor is None or stat.st_ino != self.inode):
+            return  # A concurrent journal replacement will trigger a replay.
+        payload = storage.portable_state(self.checkpoint, dict(
+            schema=1, dev=stat.st_dev, ino=stat.st_ino, offset=self.offset,
+            mtime_ns=stat.st_mtime_ns, anchor=anchor, events=self.events))
+        write_json(self.checkpoint, dict(payload=payload, sha256=self._checksum(payload)))
+        self.checkpoint_offset = self.offset
+
     def refresh(self):
-        # The writer and reader share STATE_LOCK; a crash-torn final row is repaired.
+        # The writer and reader share STATE_LOCK in-process. A separate
+        # process may append concurrently; the checkpoint is bound to a
+        # completed JSONL offset and checked against the journal on restart.
         with STATE_LOCK:
             try:
                 stat = self.path.stat()
             except FileNotFoundError:
                 self.events.clear()
                 self.inode = None
-                self.offset = 0
+                self.offset = self.checkpoint_offset = 0
                 self.journal_bytes = 0
                 return self.events
             self.journal_bytes = stat.st_size
+            if self.inode is None and self.checkpoint:
+                self._load_checkpoint(stat)
             if self.inode != stat.st_ino or stat.st_size < self.offset:
                 self.events.clear()
-                self.offset = 0
+                self.offset = self.checkpoint_offset = 0
+                self.checkpoint_loaded = False
             self.inode = stat.st_ino
             for offset, row in scan_events(self.path, repair=self.repair, start=self.offset, complete_lines=not self.repair):
                 self.scanned_bytes += offset - self.offset
@@ -279,8 +338,11 @@ class EventIndex:
                     identity = (row['path'], row.get('local')) if self.by_copy else row['path']
                     fields = self.FIELDS + ('state', 'actual_sha256', 'local_stat', 'recovered_stat') if self.by_copy else self.FIELDS
                     self.events[identity] = {key: row[key] for key in fields if key in row}
+            if (self.checkpoint and self.offset
+                    and (not self.checkpoint_offset
+                         or self.offset - self.checkpoint_offset >= self.CHECKPOINT_INTERVAL)):
+                self._save_checkpoint()
         return self.events
-
 
 def iter_events(path, repair=False):
     for _, row in scan_events(path, repair):
