@@ -1421,3 +1421,42 @@ HTTP 408/429/500/502/503/504 или повреждённом XML последн�
 `--rpc-timeout` defaults to 30 seconds; `--rpc-status-retries` defaults to 2 extra reads. A transient `tellStatus` transport error retries the same GID while retaining its download slot. `addUri` is never replayed after an ambiguous reply. An exited engine, permanent RPC rejection or exhausted retry allowance stops safely with native resume state retained; supervision can resume it. User interruption and disk-full handling retain priority. Startup RPC calls stay within the 15-second readiness deadline. These settings do not change Yandex HTTP timeouts.
 
 Existing foreground metrics collect `aria_rpc_calls`, `aria_rpc_seconds`, `aria_rpc_failures`, `aria_rpc_timeouts` and `aria_rpc_status_retries`; collection observes the actual authenticated control calls and sends no extra probes. Metrics are batched by the existing interval. Calls and failures include readiness polling while the RPC server starts; status retries count only repeated observations of an existing GID.
+
+
+### S3: получение недостающих видео через Range-worker
+
+S3 — отдельный каталог, отметки OpenCloud в него не переносятся. Для S3 нужен
+дополнительный пакет `boto3` (например, `python3 -m pip install boto3`). Остальные
+источники не требуют его. Добавьте в команду **Range**, в `services.json`:
+
+```text
+--s3-fallback http://ysda-recover-rfs.jumpingcrab.com
+--s3-bucket vids
+--s3-key-file $home/.jumpingcrub.s3.key
+```
+
+Файл ключей — JSON с `accessKey` и `secretKey`, права `0600`. Значения не попадают
+в аргументы, журналы или состояние. Соединения прямые, без системных прокси.
+HTTP выбран явно: видео и метаданные передаются без шифрования.
+
+Весь бакет просматривается для поиска копий у других участников. Подходят только
+видео из локальных манифестов ШАД, не имеющие подтверждённого полного оригинала.
+Личный диск исключён. Совпадение общего SHA-256/SHA-1/MD5 имеет приоритет;
+MD5 из `s3cmd-attrs` поддерживается, multipart ETag хэшем файла не считается.
+При отсутствии общего хэша кандидат выбирается по размеру и похожему названию.
+Полученные байты всегда проверяются по SHA-256 Яндекса: несовпадающие копии
+сохраняются с суффиксом `SHA mismatch, <источник>`, оригинал не подменяется.
+
+Используется существующая очередь Range, отдельного сервиса нет. Уже начатая
+резервная загрузка сохраняет приоритет; среди новых источников первым проверяется
+S3. Одновременное скачивание из разных источников подчиняется общему download-budget.
+Обрывы сохраняют `.part`; возобновление использует `Range` и проверку ETag через
+`If-Match`. При изменении объекта скачивается новая полная версия этой копии.
+Каталог и востребованные HEAD-метаданные кешируются в `~/.cache/yds-download/s3/`
+на 5 минут, в том числе между перезапусками. Сбой чтения каталога откладывает
+повтор на 60 секунд и позволяет пробовать остальные источники.
+
+Наблюдение: `yds-services stats --since 15m` и `tail -F
+~/.local/state/yds-download/range.log`. Состояние каждого файла и журнал:
+`.download/s3-downloads/*.json` и `.download/s3-downloads.jsonl` в архиве семестра.
+S3 используется только для чтения, отправка в него не реализована.

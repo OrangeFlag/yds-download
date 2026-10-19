@@ -12,9 +12,9 @@ import time
 
 import storage
 
-SOURCES=('yandex','nextcloud','opencloud')
+SOURCES=('yandex','nextcloud','opencloud','s3')
 STAMP=re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[,.]\d+) (.*)$')
-PROGRESS=re.compile(r'^(NEXTCLOUD|OPENCLOUD) (UPLOAD|DOWNLOAD) PROGRESS: (.+); (\d+)/(\d+) bytes$')
+PROGRESS=re.compile(r'^(NEXTCLOUD|OPENCLOUD|S3) (UPLOAD|DOWNLOAD) PROGRESS: (.+); (\d+)/(\d+) bytes$')
 
 
 def duration(value):
@@ -65,7 +65,7 @@ def log_summary(rows,name,cutoff):
                         and all(type(n) is int and n>=0 for n in row['sources'].values())):
                     result['packets'].append(row)
             except (KeyError,TypeError,ValueError):pass
-        start=re.match(r'^(NEXTCLOUD|OPENCLOUD) (UPLOAD|DOWNLOAD) START: (.+)$',message)
+        start=re.match(r'^(NEXTCLOUD|OPENCLOUD|S3) (UPLOAD|DOWNLOAD) START: (.+)$',message)
         if start:
             for key in list(previous):
                 if key[:3]==(start[1].lower(),start[2],start[3]):previous.pop(key)
@@ -86,7 +86,7 @@ def log_summary(rows,name,cutoff):
             attempt=re.search(r'\(attempt (\d+)\) (.*)$',message)
             if attempt and int(attempt[1])>0:
                 reason=attempt[2].lower()
-                source=next((s for s in ('nextcloud','opencloud') if reason.startswith(s+' ')),'yandex')
+                source=next((s for s in ('nextcloud','opencloud','s3') if reason.startswith(s+' ')),'yandex')
                 result['files'][source]+=1
         problem=next((key for key in ('Unsafe Nextcloud path','METRICS WARNING','Traceback','DISK OFFLINE',
                      'NEXTCLOUD ERROR:','OPENCLOUD ERROR:','DOWNLOAD RETRY:','[ERROR]','SHA MISMATCH') if key in message),None)
@@ -266,7 +266,7 @@ def age_label(value):
 
 def show(config,names,seconds=None):
     data=collect(config,names,seconds)
-    labels=dict(queue='Загрузчик',range='Range',yandex='Yandex',nextcloud='Nextcloud',opencloud='OpenCloud')
+    labels=dict(queue='Загрузчик',range='Range',yandex='Yandex',nextcloud='Nextcloud',opencloud='OpenCloud',s3='S3')
     states=dict(finished='Готово',done='Готово',recovering='Range',running='В работе',pending='Ожидают',
                 active='работает',inactive='остановлен',failed='сбой',activating='запускается',deactivating='останавливается')
     def date(stamp):return datetime.fromtimestamp(stamp).astimezone().strftime('%d.%m.%Y %H:%M:%S %Z')
@@ -283,7 +283,7 @@ def show(config,names,seconds=None):
         members=defaultdict(Counter)
         for member in group.get('members',[]):
             members[member['name']].update({k:member.get(k,0) for k in ('active','waiting')})
-        for source in SOURCES if direction=='download' else SOURCES[1:]:
+        for source in SOURCES if direction=='download' else ('nextcloud','opencloud'):
             logs=('queue','range') if direction=='download' else (source,)
             files=sum(data['summaries'][n]['files'][source] for n in logs)
             row=group.get('traffic',{}).get(source,{})

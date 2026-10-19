@@ -28,7 +28,7 @@ def get_budgets(config):
         if key not in _groups:
             group={}
             try:
-                for source in ('yandex','nextcloud','opencloud'):
+                for source in ('yandex','nextcloud','opencloud','s3'):
                     group[source]=SharedUploadBudget(key[0],source,key[1],key[2],probe_zero=True)
             except BaseException:
                 for budget in group.values():budget.close()

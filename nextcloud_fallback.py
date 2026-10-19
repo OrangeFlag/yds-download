@@ -178,7 +178,7 @@ class Fallback:
                      not in row.get('failed_candidates',[])]
             if not untried:
                 row['failed_candidates']=[];untried=candidates
-            candidate=min(untried,key=lambda c:(c.get('size')!=item['size'],c['path']))
+            candidate=min(untried,key=lambda c:(c.get('match_rank',1),c.get('size')!=item['size'],c['path']))
             size=candidate['size']
             if not isinstance(size,int) or size<0:
                 raise RuntimeError('Nextcloud did not provide a valid file size')

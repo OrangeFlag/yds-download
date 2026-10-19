@@ -403,7 +403,7 @@ def seed_legacy_tasks(background):
     if count:print('YANDEX RECHECK LEGACY QUEUED: '+str(root)+'; files='+str(count),flush=True)
 
 
-def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60, nextcloud_fallback=None, recheck_interval=0, recheck_files=8, recheck_probes=16, recheck_full_interval=604800, opencloud_fallback=None, download_budget=None):
+def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, secondary_slots=1, budget_directory=None, metrics_interval=60, nextcloud_fallback=None, recheck_interval=0, recheck_files=8, recheck_probes=16, recheck_full_interval=604800, opencloud_fallback=None, download_budget=None, s3_fallback=None):
     opencloud_fallback, download_budget = validate_source_settings(opencloud_fallback, download_budget)
     if files < 1 or per_file < 1:
         raise ValueError('Range file limits must be positive')
@@ -506,19 +506,20 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         settings=cache.read(state/'settings.json',{})
                         link = nextcloud_fallback or archive.get('nextcloud_fallback', config.get('nextcloud_fallback', settings.get('nextcloud_fallback')))
                         cloud = opencloud_fallback or archive.get('opencloud_fallback', config.get('opencloud_fallback', settings.get('opencloud_fallback')))
+                        s3 = s3_fallback or archive.get('s3_fallback', config.get('s3_fallback'))
                         download_config = download_budget or archive.get('download_budget', config.get('download_budget', settings.get('download_budget')))
                         cloud, download_config = validate_source_settings(cloud, download_config)
                         fallback = None
-                        if (link or cloud) and state.joinpath('source.json').exists() and not cache.read(state/'catalog.json',{}).get('root'):
-                            fallback_key = json.dumps([link, cloud, download_config], sort_keys=True)
+                        if (link or cloud or s3) and state.joinpath('source.json').exists() and not cache.read(state/'catalog.json',{}).get('root'):
+                            fallback_key = json.dumps([link, cloud, download_config, s3], sort_keys=True)
                             if root not in fallbacks or fallbacks[root][0] != fallback_key:
                                 budgets = None
                                 if download_config:
                                     from adaptive_downloads import get_budgets
                                     budgets = get_budgets(download_config)
-                                if cloud:
+                                if cloud or s3:
                                     from cloud_fallback import CloudFallback
-                                    source_fallback = CloudFallback(root, link, stopping, opencloud=cloud, budget=budgets)
+                                    source_fallback = CloudFallback(root, link, stopping, opencloud=cloud, budget=budgets, **({'s3':s3} if s3 else {}))
                                 else:
                                     from nextcloud_fallback import Fallback
                                     source_fallback = Fallback(root, link, stopping, **({'budget': budgets['nextcloud']} if budgets else {}))
@@ -561,6 +562,9 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 tasks=cache.tasks(state/'tasks', limit=32)
                             background.manifest_items = profile.manifests(cache, state)
                         background = roots[root][0]
+                        if s3 and fallback is not None:
+                            fallback.set_stopping(background.stopping)
+                            background.fallback = fallback
                         background.cached_events = profile.events(background.event_index)
                         from nextcloud import saved_remote_files
                         remote_link = None if fallback else settings.get('nextcloud_existing')
@@ -682,6 +686,9 @@ def main():
     parser.add_argument('--metrics-interval',type=int,default=60,help='Service metrics interval, seconds')
     parser.add_argument('--budget', type=Path, help='Share the HTTP budget with overlapping ordinary downloaders')
     parser.add_argument('--nextcloud-fallback',help='Also backfill completed failed course tasks from this public share')
+    parser.add_argument('--s3-fallback', help='HTTP(S) S3 origin for missing course videos; read-only')
+    parser.add_argument('--s3-bucket', help='S3 bucket to search across all participant folders')
+    parser.add_argument('--s3-key-file', type=Path, help='JSON with accessKey and secretKey; never copied to state')
     parser.add_argument('--recheck-interval',type=float,default=0,help='Seconds between completed Yandex rechecks; 0 disables')
     parser.add_argument('--recheck-files',type=int,default=8,help='Extra recheck file slots, split between first and later queues')
     parser.add_argument('--recheck-probes',type=int,default=16,help='Maximum cheap availability requests before full recovery; 0 always runs full recovery')
@@ -690,6 +697,8 @@ def main():
     args = parser.parse_args()
     try:
         opencloud_fallback, download_budget = source_settings(args)
+        from s3_fallback import configuration
+        s3_fallback = configuration(args.s3_fallback, args.s3_bucket, args.s3_key_file)
     except ValueError as error:
         parser.error(str(error))
     stopping = Event()
@@ -698,7 +707,7 @@ def main():
     # Prevent two workers from multiplying the global limits.
     with args.queue[0].with_suffix('.range.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget, args.metrics_interval, args.nextcloud_fallback,args.recheck_interval,args.recheck_files,args.recheck_probes,args.recheck_full_interval,opencloud_fallback=opencloud_fallback,download_budget=download_budget)
+        run(args.queue, args.files, args.requests_per_file, args.requests, args.rps, stopping, args.secondary_slots, args.budget, args.metrics_interval, args.nextcloud_fallback,args.recheck_interval,args.recheck_files,args.recheck_probes,args.recheck_full_interval,opencloud_fallback=opencloud_fallback,download_budget=download_budget,s3_fallback=s3_fallback)
 
 
 if __name__ == '__main__':

@@ -90,10 +90,14 @@ class OpenCloudIndex:
 
 
 class CloudFallback:
-    def __init__(self, root, nextcloud_link, stopping, opencloud=None, budget=None):
+    def __init__(self, root, nextcloud_link, stopping, opencloud=None, budget=None, s3=None):
         self.root,self.stopping=Path(root),stopping
         self.sources=[]
         def source_budget(name):return budget.get(name) if isinstance(budget,dict) else budget
+        if s3:
+            from s3_fallback import S3Index
+            index=S3Index(s3,stopping)
+            self.sources.append(Fallback(root,index.link,stopping,index=index,budget=source_budget('s3'),label='S3'))
         if nextcloud_link:
             self.sources.append(Fallback(root,nextcloud_link,stopping,budget=source_budget('nextcloud')))
         if opencloud:
@@ -104,6 +108,12 @@ class CloudFallback:
         self.manifest={}
         self.local_proofs={}
         self.event_index=d.EventIndex(self.root/'.download/events.jsonl',by_copy=True,repair=False)
+
+    def set_stopping(self, stopping):
+        self.stopping=stopping
+        for source in self.sources:
+            source.stopping=stopping
+            source.index.stopping=stopping
 
     def _listed(self,item):
         paths=sorted((self.root/'.download').glob('*-manifest.json'))
