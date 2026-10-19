@@ -108,6 +108,8 @@ class CloudFallback:
         self.manifest={}
         self.local_proofs={}
         self.event_index=d.EventIndex(self.root/'.download/events.jsonl',by_copy=True,repair=False)
+        self.event_proofs={}
+        self.event_proofs_stamp=None
 
     def set_stopping(self, stopping):
         self.stopping=stopping
@@ -133,9 +135,16 @@ class CloudFallback:
     def _local(self,item,event=None):
         target=d.local_path(self.root,item['path'])
         paths={target:[]}
-        source=json.loads((self.root/'.download/source.json').read_text())['source']
+        source=self.sources[0].source['source']
         with d.STATE_LOCK:
-            rows=[row for row in self.event_index.refresh().values() if row.get('path')==item['path']]
+            proofs=self.event_index.refresh()
+            stamp=(self.event_index.device,self.event_index.inode,self.event_index.offset)
+            if stamp!=self.event_proofs_stamp:
+                by_path={}
+                for row in proofs.values():
+                    by_path.setdefault(row['path'],[]).append(row)
+                self.event_proofs,self.event_proofs_stamp=by_path,stamp
+            rows=list(self.event_proofs.get(item['path'],()))
         if event:rows.append(event)
         for row in rows:
             path=storage.saved_local(self.root, row['local']) if row.get('local') else target
