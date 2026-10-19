@@ -28,6 +28,27 @@ class StorageChecks(unittest.TestCase):
         self.env = dict(YDS_DISK_ROOT=str(self.root), YDS_DISK_DEVICE=str(self.root.stat().st_dev))
         self.filesystem_sync = self.enterContext(patch('storage.sync_filesystem'))
 
+    def test_independent_writers_publish_json_with_distinct_temporary_files(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from contextlib import nullcontext
+        from threading import Barrier
+        target=self.root/'shared-checkpoint.json'
+        barrier=Barrier(2)
+        original_fsync=os.fsync
+        def synchronize(fd):
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                barrier.wait(timeout=5)
+            return original_fsync(fd)
+        # Separate processes do not share the in-process STATE_LOCK.
+        with patch.object(download,'STATE_LOCK',nullcontext()), \
+                patch.object(download.os,'fsync',side_effect=synchronize), \
+                ThreadPoolExecutor(max_workers=2) as pool:
+            jobs=[pool.submit(download.write_json,target,dict(writer=i)) for i in range(2)]
+            for job in jobs:
+                job.result(timeout=10)
+        self.assertIn(json.loads(target.read_text())['writer'],(0,1))
+        self.assertEqual(list(self.root.glob('shared-checkpoint.json*.tmp')),[])
+
     def test_overlapping_archive_uploaders_share_the_same_nonblocking_lock(self):
         for name in ('opencloud.lock', 'nextcloud.lock'):
             root = self.root / name
