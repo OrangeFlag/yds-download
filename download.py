@@ -255,7 +255,7 @@ class EventIndex:
         self.path = path
         self.checkpoint = path.with_name(path.name + '.index.json') if checkpoint else None
         self.events = {}
-        self.inode = None
+        self.inode = self.device = None
         self.offset = self.checkpoint_offset = 0
         self.checkpoint_loaded = False
         self.scanned_events = self.scanned_bytes = self.journal_bytes = 0
@@ -296,13 +296,13 @@ class EventIndex:
         except (FileNotFoundError, ValueError, KeyError, TypeError, UnicodeDecodeError):
             return
         self.events = payload['events']
-        self.inode = journal.st_ino
+        self.inode, self.device = journal.st_ino, journal.st_dev
         self.offset = self.checkpoint_offset = offset
         self.checkpoint_loaded = True
 
     def _save_checkpoint(self):
         anchor, stat = self._anchor(self.offset)
-        if (anchor is None or stat.st_ino != self.inode):
+        if (anchor is None or (stat.st_dev, stat.st_ino) != (self.device, self.inode)):
             return  # A concurrent journal replacement will trigger a replay.
         payload = storage.portable_state(self.checkpoint, dict(
             schema=1, dev=stat.st_dev, ino=stat.st_ino, offset=self.offset,
@@ -319,18 +319,18 @@ class EventIndex:
                 stat = self.path.stat()
             except FileNotFoundError:
                 self.events.clear()
-                self.inode = None
+                self.inode = self.device = None
                 self.offset = self.checkpoint_offset = 0
                 self.journal_bytes = 0
                 return self.events
             self.journal_bytes = stat.st_size
             if self.inode is None and self.checkpoint:
                 self._load_checkpoint(stat)
-            if self.inode != stat.st_ino or stat.st_size < self.offset:
+            if (self.inode, self.device) != (stat.st_ino, stat.st_dev) or stat.st_size < self.offset:
                 self.events.clear()
                 self.offset = self.checkpoint_offset = 0
                 self.checkpoint_loaded = False
-            self.inode = stat.st_ino
+            self.inode, self.device = stat.st_ino, stat.st_dev
             for offset, row in scan_events(self.path, repair=self.repair, start=self.offset, complete_lines=not self.repair):
                 self.scanned_bytes += offset - self.offset
                 self.offset = offset
