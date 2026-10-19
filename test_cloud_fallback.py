@@ -106,6 +106,34 @@ class CloudChecks(unittest.TestCase):
         state=''.join(path.read_text() for path in self.state.rglob('*.json'))
         self.assertNotIn('app token',state+cloud.link)
 
+    def test_annual_archive_opencloud_fallback_matches_only_year_folder(self):
+        self.data['title']='ШАД 2017'
+        d.write_json(self.state/'source.json',self.data)
+        expected=dict(self.rows[-1],path='ingest/Other/2017/Course/001 - Lecture.mp4')
+        wrong=[dict(expected,path=f'ingest/Other/{year}/Course/001 - Lecture.mp4')
+               for year in ('2017-fall','2017-spring','2018')]
+        prefixes=('2017','2017-fall','2017-spring','2018')
+        folders=[dict(path=path,directory=True)
+                 for path in ('ingest','ingest/Other',*(f'ingest/Other/{year}' for year in prefixes),
+                              *(f'ingest/Other/{year}/Course' for year in prefixes))]
+        self.server.rows=folders+wrong+[expected]
+        index=self.cloud().sources[0].index
+        self.assertEqual(index.candidates(self.data,self.item),[expected])
+
+    def test_annual_archive_nextcloud_fallback_recovers_verified_video(self):
+        self.data['title']='ШАД 2017'
+        d.write_json(self.state/'source.json',self.data)
+        index=nextcloud.Index(self.root,'https://drive.example/s/test',stopping=Event())
+        fallback=Fallback(self.root,index.link,Event(),index=index)
+        remote=dict(path='2017/Course/001 - Lecture.mp4',directory=False,
+                    size=len(self.body),checksums=[])
+        with patch.object(index.share,'listing',return_value=[remote]) as listing, \
+                patch.object(index.share,'request',return_value=Response(self.body)):
+            result=fallback.recover_all(self.item,self.event)
+        self.assertEqual(result['status'],'valid')
+        self.assertEqual(d.target(self.root,self.item,'Course').read_bytes(),self.body)
+        listing.assert_called_with('2017/Course')
+
     def test_hash_matches_renamed_file_but_conflict_cannot_fall_back_to_name(self):
         cloud=self.cloud();index=cloud.sources[0].index
         self.rows[-1]['checksums']=['SHA256:'+'0'*64,'MD5:'+'a'*32]

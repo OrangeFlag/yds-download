@@ -676,6 +676,61 @@ class NextcloudChecks(unittest.TestCase):
         self.assertEqual(destinations['PUT'],destinations['MOVE'])
         self.assertIn('/2023-fall/Course/',destinations['MOVE'])
 
+    def test_annual_archive_uses_year_folder_without_inventing_a_semester(self):
+        courses = ('Обучение языку C++, часть 2',
+                   'Методы и системы обработки больших данных',
+                   'Алгоритмы и структуры данных, часть 2',
+                   'Алгоритмы и структуры данных, часть 1',
+                   'Язык Python')
+        for course in courses:
+            for filename in ('2017-02-15 Лекция.mp4', '2017-04-12 Лекция.mp4',
+                             '2017-11-20 Лекция.mp4'):
+                item=dict(self.item,path=f'/{course}/{filename}')
+                self.assertEqual(nextcloud.remote_path(dict(title='ШАД 2017'),item),
+                                 f'2017/{course}/{filename}')
+        # An explicitly nested semester is still authoritative.
+        self.assertEqual(nextcloud.remote_path(dict(title='ШАД 2017'),
+                         dict(self.item,path='/Осень/Курс/Видео.mp4')),
+                         '2017-fall/Курс/Видео.mp4')
+        self.assertEqual(nextcloud.remote_path(dict(title='ШАД весна 2017'),
+                         dict(self.item,path='/Курс/Видео.mp4')),
+                         '2017-spring/Курс/Видео.mp4')
+        with self.assertRaisesRegex(ValueError,'Conflicting'):
+            nextcloud.remote_path(dict(title='ШАД весна 2017'),
+                                 dict(self.item,path='/Осень/Курс/Видео.mp4'))
+        with self.assertRaises(ValueError):
+            nextcloud.remote_path(dict(title='ШАД'),self.item)
+
+    def test_annual_archive_uploads_to_year_folder(self):
+        self.data['title']='ШАД 2017'
+        download.write_json(self.state/'source.json',self.data)
+        sync=nextcloud.Sync(None,self.upload,Event())
+        jobs=sync.jobs([self.root])
+        self.assertEqual(len(jobs),1)
+        with patch.object(sync,'upload') as upload:
+            sync.transfer(jobs[0])
+        upload.assert_called_once()
+        self.assertEqual(upload.call_args.args[5],
+                         '2017/Course/001 - 2023-09-15 Лекция.mp4')
+
+    def test_annual_archive_nextcloud_lookup_does_not_match_other_seasons(self):
+        data=dict(self.data,title='ШАД 2017')
+        expected='2017/Course/001 - 2023-09-15 Лекция.mp4'
+        other=[dict(path=f'{prefix}/Course/001 - 2023-09-15 Лекция.mp4',
+                    size=self.item['size'],directory=False,
+                    checksums=['SHA256:'+self.item['sha256']])
+               for prefix in ('2017-spring','2017-fall','2018')]
+        requested=[]
+        def listing(folder):
+            requested.append(folder)
+            return other
+        with patch.object(nextcloud.Share,'listing',side_effect=listing):
+            self.assertFalse(nextcloud.Index(self.root,self.read).contains(data,self.item))
+        matching=dict(other[0],path=expected)
+        with patch.object(nextcloud.Share,'listing',return_value=other+[matching]):
+            self.assertTrue(nextcloud.Index(self.root,self.read).contains(data,self.item))
+        self.assertEqual(requested,['2017/Course'])
+
     def test_old_year_archive_uses_nested_semester_without_duplicate_folder(self):
         item=dict(self.item,path='/Весна 2021/Course/video.mp4')
         for title in ('ШАД 2021','ШАД весна 2021'):

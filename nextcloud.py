@@ -73,11 +73,12 @@ def remote_path(data, item):
         season = nested_season
         year = year or nested[2]
         parts.pop(0)
-    if not year or not season or len(parts) < 2:
-        raise ValueError('Nextcloud requires a course archive with a known year and semester')
+    if not year or len(parts) < 2:
+        raise ValueError('Nextcloud requires a course archive with a known year')
+    # An annual archive has no reliable semester; never infer one from video dates.
     # Nextcloud rejects literal backslashes; keep them visible as a filename character.
     parts[-1] = parts[-1].replace('\\', '＼')
-    return year+'-'+season+'/'+normalized('/'.join(parts))
+    return year+('-'+season if season else '')+'/'+normalized('/'.join(parts))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
