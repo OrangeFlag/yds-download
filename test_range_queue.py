@@ -507,6 +507,26 @@ class SharedRangeChecks(unittest.TestCase):
             self.assertEqual(scanner.call_args.kwargs['start'],0)
             self.assertEqual(restored['/one']['status'],'valid')
 
+    def test_event_index_replays_when_device_changes_but_inode_matches(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'events.jsonl'
+            d.append_events(path,[dict(path='/one',status='valid')])
+            index=d.EventIndex(path)
+            index.refresh()
+            self.assertEqual(index.scanned_events,1)
+            original_stat=Path.stat
+            def changed_device(p, *args, **kwargs):
+                stat=original_stat(p,*args,**kwargs)
+                if p == path:
+                    return SimpleNamespace(st_ino=stat.st_ino,st_dev=stat.st_dev+1,
+                                           st_size=stat.st_size,st_mtime_ns=stat.st_mtime_ns)
+                return stat
+            with patch.object(Path,'stat',changed_device):
+                index.refresh()
+            self.assertEqual(index.scanned_events,2,
+                             'Device switch must not reuse proofs solely by inode')
+
     def test_event_checkpoint_invalidates_replaced_and_rewritten_journal(self):
         with tempfile.TemporaryDirectory() as folder:
             path=Path(folder)/'events.jsonl'
