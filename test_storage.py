@@ -28,6 +28,20 @@ class StorageChecks(unittest.TestCase):
         self.env = dict(YDS_DISK_ROOT=str(self.root), YDS_DISK_DEVICE=str(self.root.stat().st_dev))
         self.filesystem_sync = self.enterContext(patch('storage.sync_filesystem'))
 
+    def test_failed_json_fsync_preserves_previous_value_and_removes_temp(self):
+        target=self.root/'shared-checkpoint.json'
+        download.write_json(target,dict(status='old'))
+        original_fsync=os.fsync
+        def fail_file_sync(fd):
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO,'simulated checkpoint fsync failure')
+            return original_fsync(fd)
+        with patch.object(download.os,'fsync',side_effect=fail_file_sync):
+            with self.assertRaises(OSError):
+                download.write_json(target,dict(status='new'))
+        self.assertEqual(json.loads(target.read_text())['status'],'old')
+        self.assertEqual(list(self.root.glob('shared-checkpoint.json*.tmp')),[])
+
     def test_independent_writers_publish_json_with_distinct_temporary_files(self):
         from concurrent.futures import ThreadPoolExecutor
         from contextlib import nullcontext
