@@ -489,6 +489,7 @@ class SharedRangeChecks(unittest.TestCase):
             self.assertEqual(scanner.call_args.kwargs['start'],saved_offset)
             self.assertEqual(events[rows[0]['path']]['status'],'valid')
             self.assertNotIn('range_attempts',str(events))
+            self.assertNotIn('range_attempts',checkpoint.read_text())
             self.assertEqual(len(events),30)
 
     def test_event_checkpoint_corruption_falls_back_to_full_history(self):
@@ -533,6 +534,29 @@ class SharedRangeChecks(unittest.TestCase):
             self.assertEqual(path.read_text(),json.dumps(row)+chr(10))
             d.append_events(path,[dict(row,status='other')])
             self.assertEqual(d.EventIndex(path,checkpoint=True).refresh()['/one']['status'],'other')
+
+    def test_event_checkpoint_keeps_appends_during_snapshot_publication(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'events.jsonl'
+            first=dict(path='/one',status='invalid')
+            last=dict(path='/one',status='valid')
+            d.append_events(path,[first])
+            snapshot=path.with_name(path.name+'.index.json')
+            original_write=d.write_json
+            appended=[]
+            def append_during_save(destination, data):
+                if destination==snapshot and not appended:
+                    d.append_events(path,[last])
+                    appended.append(True)
+                return original_write(destination,data)
+            with patch.object(d,'write_json',side_effect=append_during_save):
+                old=d.EventIndex(path,checkpoint=True).refresh()
+            self.assertEqual(old['/one']['status'],'invalid')
+            self.assertTrue(appended)
+            restored=d.EventIndex(path,checkpoint=True)
+            self.assertEqual(restored.refresh()['/one']['status'],'valid')
+            self.assertEqual(restored.scanned_events,1,
+                             'Only the concurrent append should be replayed')
 
     def test_event_checkpoint_failed_publication_preserves_history(self):
         with tempfile.TemporaryDirectory() as folder:
