@@ -240,7 +240,7 @@ class JsonCache:
         _, paths, current, previous = scan
         reads = 0
         complete = False
-        # shortcut: cold starts still read every task; persist summaries if bounded batches remain too costly.
+        # Read bounded batches only when the task index is missing or stale.
         while limit is None or reads < limit:
             try:
                 path = next(paths)
