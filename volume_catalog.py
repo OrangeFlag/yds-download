@@ -156,7 +156,7 @@ def _catalog_archive(root, archive):
                 raise ValueError('Invalid archive manifest item')
             entries[name] = dict(size=size, sha256=sha.lower(), status='expected')
     journal = state / 'events.jsonl'
-    proofs = d.EventIndex(journal, repair=False, checkpoint=True).refresh()
+    proofs = d.EventIndex(journal, repair=False, checkpoint=True, checkpoint_read_only=True).refresh()
     base = root.resolve()
     for name, row in entries.items():
         event = proofs.get(name, {})
