@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 from datetime import datetime
 import storage
@@ -20,6 +21,10 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('queue', type=Path)
+    parser.add_argument('--before', type=Path, action='append', default=[],
+                        help='Run this personal queue first without course cloud filters (repeatable)')
+    parser.add_argument('--no-wait-range', action='store_true',
+                        help='Return after foreground downloads while deferred Range recovery continues')
     parser.add_argument('--defer-range', action='store_true', help='Continue archives while range_queue.py recovers failures')
     parser.add_argument('--range-budget', type=Path, help='Shared budget directory for overlapping foreground and worker Range')
     parser.add_argument('--range-files', type=int, default=16)
@@ -37,9 +42,27 @@ def main():
         parser.error('--range-budget requires --defer-range and positive --range-files')
     storage.check(args.queue)
     path = args.queue.resolve()
+    before = [queue.resolve() for queue in args.before]
+    if path in before or len(set(before)) != len(before):
+        parser.error('--before queues must be distinct and cannot include the current queue')
     with path.with_suffix('.lock').open('a') as lock, Metrics(path.with_suffix('.metrics.jsonl'),'semester-queue',
             interval=resolve(json.loads(path.read_text()).get('tuning',{}))['metrics_interval']) as metrics:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for queue in before:
+            storage.check(queue)
+            command = [sys.executable, str(Path(__file__).resolve()), str(queue),
+                       '--defer-range', '--no-wait-range']
+            command += source_arguments(budget=download_budget)
+            if args.range_budget is not None:
+                command += ['--range-budget', str(args.range_budget.resolve()),
+                            '--range-files', str(args.range_files)]
+            code = transfer_process(command, env=os.environ.copy(), on_tick=lambda: None, stop_timeout=80)
+            if code in (130, -2, 143, -15):
+                raise KeyboardInterrupt
+            if code == storage.TEMPFAIL:
+                raise storage.StorageUnavailable(queue)
+            if code not in (0, 1):
+                raise RuntimeError('Personal queue stopped: ' + str(queue) + '; exit=' + str(code))
         data = storage.read_queue(path)
         resolve(data.get('tuning', {}))
         for job in data['archives']:
@@ -63,7 +86,7 @@ def main():
                 retry_reports(Path(job['destination']))
             summary_path = Path(job['destination']) / '.download/summary.json'
             summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
-            remote_archive = bool(summary.get('remote_available'))
+            remote_archive = bool(summary.get('remote_available') or summary.get('offline_available'))
             if not job.get('enabled', True) or ((job.get('state') == 'finished' or (args.defer_range and job.get('downloads_complete'))) and not (data.get('deep', False) or data.get('retry_check', False) or remote_archive)):
                 continue
             if args.defer_range and not (data.get('deep') or data.get('retry_check')):
@@ -117,7 +140,7 @@ def main():
                     job['state'] = 'recovering'
             write_json(path, data)
             print('ARCHIVE FINISHED: ' + job['title'] + '; exit=' + str(code), flush=True)
-        if args.defer_range:
+        if args.defer_range and not args.no_wait_range:
             while any(job.get('state') == 'recovering' for job in data['archives']):
                 metrics.gauge('archives',dict(Counter(a.get('state','pending') for a in data['archives'])))
                 changed = False
