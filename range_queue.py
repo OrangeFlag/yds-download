@@ -185,10 +185,11 @@ class JsonCache:
         self.checkpoint_writes[directory] = time.monotonic()
 
     def read(self, path, default=None):
-        if not path.exists():
+        try:
+            stamp = Background.stat(path)
+        except FileNotFoundError:
             self.entries.pop(path, None)
             return default
-        stamp = Background.stat(path)
         saved = self.entries.get(path)
         if saved is None or saved[0] != stamp:
             saved = stamp, json.loads(path.read_text())
@@ -197,10 +198,12 @@ class JsonCache:
         return saved[1]
 
     def tasks_complete(self, directory):
-        if not directory.exists():
+        try:
+            stamp = Background.stat(directory)
+        except FileNotFoundError:
             return True
         saved = self.directories.get(directory)
-        return directory not in self.scans and saved is not None and saved[0] == Background.stat(directory)
+        return directory not in self.scans and saved is not None and saved[0] == stamp
 
     def tasks(self, directory, limit=None):
         if self.profile is None:
@@ -225,11 +228,12 @@ class JsonCache:
             return iter(paths)
 
     def _tasks(self, directory, limit=None):
-        if not directory.exists():
+        try:
+            stamp = Background.stat(directory)
+        except FileNotFoundError:
             self.directories.pop(directory, None)
             self.scans.pop(directory, None)
             return []
-        stamp = Background.stat(directory)
         saved = self.directories.get(directory)
         if saved is None and self.checkpoint and directory not in self.scans:
             self._restore_tasks(directory, stamp)
