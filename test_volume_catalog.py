@@ -1,6 +1,7 @@
 """Sequential-disk catalog: offline volumes remain known without mounting them."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -77,7 +78,10 @@ class VolumeCatalogChecks(unittest.TestCase):
     def test_edited_file_is_listed_as_expected_but_never_stays_verified(self):
         archive, item, path = self.archive(self.old, 'Archive 1')
         catalog.snapshot(self.old, OLD, self.host, archives=[archive])
-        path.write_bytes(b'changed')
+        previous = path.stat()
+        path.write_bytes(b'changed')  # Same size, but different bytes.
+        os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        self.assertNotEqual(path.stat().st_ctime_ns, previous.st_ctime_ns)
         catalog.snapshot(self.old, OLD, self.host, archives=[archive])
         proof = catalog.load(self.host)['volumes'][OLD]['archives']['Archive 1']['files'][item['path']]
         self.assertEqual(proof['sha256'], item['sha256'])
