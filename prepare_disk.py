@@ -13,7 +13,6 @@ from pathlib import Path
 import sys
 import uuid
 
-import download
 import services
 import storage
 import volume_catalog
@@ -43,6 +42,34 @@ def _new_json(path, data):
     storage.sync_directory(path.parent)
 
 
+def _new_json_at(root_fd, relative, data):
+    """Create disk metadata through pinned directories without following symlinks."""
+    descriptor = os.dup(root_fd)
+    device = os.fstat(root_fd).st_dev
+    try:
+        parts = Path(relative).parts
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                os.fsync(descriptor)
+            except FileExistsError:
+                pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+            if os.fstat(descriptor).st_dev != device:
+                raise ValueError('Metadata directory is on another filesystem')
+        file_fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                          0o600, dir_fd=descriptor)
+        with os.fdopen(file_fd, 'w', encoding='utf-8') as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def export(config_path, bundle, catalog_state=None):
     config = services.load(Path(config_path))
     root = volume_catalog._mounted(config['mount_root'], config['disk_uuid'])
@@ -52,6 +79,9 @@ def export(config_path, bundle, catalog_state=None):
     state = Path(catalog_state or Path(config['state_dir']) / 'volume-registry').expanduser().resolve()
     if state.is_relative_to(root):
         raise ValueError('Host catalog must be outside the source disk')
+    inventory = volume_catalog.load(state)
+    if inventory is None or config['disk_uuid'] not in inventory['volumes']:
+        raise ValueError('Export requires a saved inventory of the source disk UUID')
     values = services.variables(config, root)
     course = Path(services.expand(config['course_queue'], values)).resolve()
     queues, extras = [course], []
@@ -103,7 +133,7 @@ def export(config_path, bundle, catalog_state=None):
         destinations.add(destination)
     files[_relative(course, root)]['archives'][:0] = extra_jobs
     payload = dict(schema=1, config=config, catalog_state=str(state),
-                   volume_catalog=volume_catalog.load(state), files=files,
+                   volume_catalog=inventory, files=files,
                    queues=[_relative(path, root) for path in dict.fromkeys(queues)])
     _new_json(bundle, payload)
     return payload
@@ -180,15 +210,14 @@ def provision(bundle, mount, identity, output_config):
         for key in ('YDS_VOLUME_CATALOG', 'YDS_VOLUME_UUID'):
             if key in service.get('environment', {}):
                 service['environment'][key] = config['environment'][key]
-    # Preserve offline inventory even when the source disk is already unplugged.
-    catalog = volume_catalog._merge(volume_catalog.load(state), saved.get('volume_catalog'))
-    state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    download.write_json(state / volume_catalog.CATALOG,
-                        dict(payload=catalog, sha256=volume_catalog._digest(catalog)))
-    for path, data in files.items():
-        volume_catalog._mounted(root, identity)
-        _new_json(path, data)
-    volume_catalog.synchronize(root, identity, state)
+    # The catalog lock protects importing a bundle from racing newer observations.
+    with volume_catalog._pinned(root, identity) as root_fd:
+        if any(name != 'lost+found' for name in os.listdir(root_fd)):
+            raise ValueError('New disk must be empty (only lost+found is allowed)')
+        for path, data in files.items():
+            _new_json_at(root_fd, path.relative_to(root), data)
+        volume_catalog.synchronize(root, identity, state,
+                                   snapshot_catalog=saved.get('volume_catalog'))
     _new_json(output, config)
     return config
 

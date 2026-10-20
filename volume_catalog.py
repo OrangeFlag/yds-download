@@ -172,26 +172,58 @@ def _guarded_catalog(root, identity, state):
         yield root, state, _merge(*catalogs)
 
 
+@contextmanager
+def _pinned(root, identity):
+    """Pin the filesystem before validation, so unplugging cannot redirect writes."""
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        root = _mounted(root, identity)
+        opened, current = os.fstat(descriptor), root.stat()
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise ValueError('Mounted volume changed during preparation')
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
 def _publish(root, identity, state, catalog):
-    # An offline disk must never redirect the backup into an ordinary empty folder.
-    _mounted(root, identity)
-    disk_state = root / MIRROR_DIR
-    if not disk_state.exists():
-        disk_state.mkdir(mode=0o700)
-        storage.sync_directory(root)
-    if not disk_state.is_dir() or disk_state.stat().st_dev != root.stat().st_dev:
-        raise ValueError('Volume catalog mirror must be on the connected disk')
-    signed = dict(payload=catalog, sha256=_digest(catalog))
-    # Host first: even a failed/unplugged disk cannot erase its previous inventory.
-    d.write_json(state / CATALOG, signed)
-    _mounted(root, identity)
-    d.write_json(disk_state / CATALOG, signed)
+    with _pinned(root, identity) as root_fd:
+        try:
+            os.mkdir(MIRROR_DIR, mode=0o700, dir_fd=root_fd)
+            os.fsync(root_fd)
+        except FileExistsError:
+            pass
+        mirror = os.open(MIRROR_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+        try:
+            if os.fstat(mirror).st_dev != os.fstat(root_fd).st_dev:
+                raise ValueError('Volume catalog mirror must be on the connected disk')
+            signed = dict(payload=catalog, sha256=_digest(catalog))
+            # Host first: a failed/unplugged disk cannot erase its previous inventory.
+            d.write_json(state / CATALOG, signed)
+            temporary = CATALOG + '.' + uuidlib.uuid4().hex + '.tmp'
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                 0o600, dir_fd=mirror)
+            try:
+                with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
+                    json.dump(signed, stream, ensure_ascii=False, indent=2)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, CATALOG, src_dir_fd=mirror, dst_dir_fd=mirror)
+                os.fsync(mirror)
+            finally:
+                try:
+                    os.unlink(temporary, dir_fd=mirror)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(mirror)
     return catalog
 
 
-def synchronize(root, identity, state, label=None):
+def synchronize(root, identity, state, label=None, *, snapshot_catalog=None):
     """Reconcile the host and inserted disk; keep other disconnected volumes."""
     with _guarded_catalog(root, identity, state) as (root, state, catalog):
+        catalog = _merge(catalog, snapshot_catalog)
         if identity not in catalog['volumes']:
             catalog['volumes'][identity] = dict(
                 updated_ns=time.time_ns(), label=label or identity, archives={})

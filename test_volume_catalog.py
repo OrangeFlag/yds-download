@@ -146,6 +146,21 @@ class VolumeCatalogChecks(unittest.TestCase):
         catalog.snapshot(self.old, OLD, self.host, archives=[archive])
         self.assertEqual(catalog.load(self.host)['volumes'][OLD]['supplementary'], {})
 
+    def test_unplug_during_mirror_creation_never_writes_underlying_mountpoint(self):
+        original = os.mkdir
+        detached = self.root / 'detached'
+        def unplug(path, *args, **kwargs):
+            if path == catalog.MIRROR_DIR and kwargs.get('dir_fd') is not None:
+                self.old.rename(detached)
+                self.old.mkdir()
+                self.online = {}
+            return original(path, *args, **kwargs)
+        with patch.object(os, 'mkdir', side_effect=unplug):
+            catalog.synchronize(self.old, OLD, self.host)
+        self.assertEqual(list(self.old.iterdir()), [])
+        self.assertIsNotNone(catalog.load(detached / catalog.MIRROR_DIR))
+        self.assertIsNotNone(catalog.load(self.host))
+
     def test_switch_only_one_connected_disk_keeps_offline_files_in_host_and_new_mirror(self):
         archive, item, local = self.archive(self.old, 'Archive 1')
         with patch.object(d, 'sha256_file', side_effect=AssertionError('Rehashed entire HDD')):

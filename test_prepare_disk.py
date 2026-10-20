@@ -1,5 +1,7 @@
 """Metadata handoff works after source removal and never carries local progress."""
 import json
+import fcntl
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -52,6 +54,7 @@ class PrepareDiskChecks(unittest.TestCase):
                                     range=dict(command=['python3', '$repo/range_queue.py', '--queue', '$mount_root/Personal/.download/queue.json']),
                                     opencloud=dict(command=['python3', '$repo/opencloud.py', '--destination', '$mount_root/Spring2026'])))
         self.write(self.config, config)
+        volume_catalog.synchronize(self.old, OLD, self.state)
 
     def write(self, path, data):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,6 +134,65 @@ class PrepareDiskChecks(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Unsafe handoff'):
             self.provision()
         self.assertEqual(list(self.new.iterdir()), [])
+
+    def test_export_requires_source_inventory(self):
+        (self.state / volume_catalog.CATALOG).unlink()
+        (self.old / volume_catalog.MIRROR_DIR / volume_catalog.CATALOG).unlink()
+        with self.assertRaisesRegex(ValueError, 'saved inventory'):
+            self.export()
+        self.assertFalse(self.bundle.exists())
+
+    def test_unplug_during_metadata_write_never_writes_mountpoint(self):
+        self.export()
+        self.online = {NEW: self.new}
+        original = prep._new_json_at
+        detached = self.home / 'detached'
+        def unplug(descriptor, relative, data):
+            if not detached.exists():
+                self.new.rename(detached)
+                self.new.mkdir()
+                self.online = {}
+            original(descriptor, relative, data)
+        with patch.object(prep, '_new_json_at', side_effect=unplug):
+            with self.assertRaisesRegex(ValueError, 'not mounted writable'):
+                self.provision()
+        self.assertEqual(list(self.new.iterdir()), [])
+        self.assertTrue((detached / 'Archive/.download/queue.json').is_file())
+        self.assertFalse(self.output.exists())
+
+    def test_pinned_metadata_rejects_symlink_directory(self):
+        elsewhere = self.home / 'elsewhere'
+        elsewhere.mkdir()
+        (self.new / 'link').symlink_to(elsewhere, target_is_directory=True)
+        descriptor = os.open(self.new, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with self.assertRaises(OSError):
+                prep._new_json_at(descriptor, Path('link/metadata.json'), {})
+        finally:
+            os.close(descriptor)
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_bundle_merge_is_locked_and_keeps_newer_host_snapshot(self):
+        saved = self.export()
+        newer = volume_catalog.load(self.state)
+        newer['volumes'][OLD]['updated_ns'] += 10
+        newer['volumes'][OLD]['label'] = 'newer host'
+        self.write(self.state / volume_catalog.CATALOG,
+                   dict(payload=newer, sha256=volume_catalog._digest(newer)))
+        self.online = {NEW: self.new}
+        original = volume_catalog._merge
+        locked = []
+        def merge(*catalogs):
+            if any(catalog == saved['volume_catalog'] for catalog in catalogs):
+                with (self.state / '.volume-catalog.lock').open('a') as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked.append(True)
+            return original(*catalogs)
+        with patch.object(volume_catalog, '_merge', side_effect=merge):
+            self.provision()
+        self.assertTrue(locked)
+        self.assertEqual(volume_catalog.load(self.state)['volumes'][OLD]['label'], 'newer host')
 
     def test_export_refuses_disk_bundle_and_conflicts(self):
         with self.assertRaisesRegex(ValueError, 'on the host'):
