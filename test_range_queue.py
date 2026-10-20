@@ -534,6 +534,45 @@ class SharedRangeChecks(unittest.TestCase):
                       recheck_interval=1, recheck_files=2, stopping=stopping)
             self.assertIn('/Course/video.mp4', submitted)
 
+    def test_early_rechecks_rotate_across_three_archives(self):
+        with tempfile.TemporaryDirectory() as folder:
+            archives = []
+            queue = None
+            for name in ('first', 'second', 'third'):
+                root = Path(folder) / name
+                state, candidate = self._finished_archive_with_cached_range(root)
+                queue = queue or candidate
+                path = state / 'tasks/00.json'
+                job = json.loads(path.read_text())
+                job.update(state='applied', result={'event': {'status': 'missing'}})
+                d.write_json(path, job)
+                d.write_json(state / 'local-copies.json', [])
+                archives.append(dict(destination=str(root), catalog=str(state / 'catalog.json'),
+                                     state='finished'))
+            d.write_json(queue, dict(archives=archives))
+            stopping = Event()
+            selected = []
+            passes = 0
+
+            def submit(background, kind, item, *args, **kwargs):
+                if kwargs.get('yandex_recheck'):
+                    selected.append(background.root.name)
+
+            def wait(_):
+                nonlocal passes
+                passes += 1
+                if passes >= 3:
+                    stopping.set()
+                return stopping.is_set()
+
+            with patch.object(q.Background, 'submit', submit), \
+                 patch.object(stopping, 'wait', side_effect=wait), \
+                 patch('report.update_report'):
+                q.run([queue], files=1, recheck_interval=1, recheck_files=1,
+                      stopping=stopping)
+            self.assertEqual(selected, ['first', 'second', 'third'],
+                             'Early dispatch must not starve later archives')
+
     def test_recheck_revalidates_task_before_submit(self):
         with tempfile.TemporaryDirectory() as folder:
             state, queue = self._finished_archive_with_cached_range(Path(folder))
