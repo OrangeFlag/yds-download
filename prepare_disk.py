@@ -195,6 +195,7 @@ def provision(bundle, mount, identity, output_config):
     config = _rebase(config, roots, root)
     config.update(mount_root=str(root), disk_uuid=identity, previous_mounts=[])
     config.setdefault('environment', {}).update(YDS_VOLUME_CATALOG=str(state), YDS_VOLUME_UUID=identity)
+    config['environment'].setdefault('YDS_HASH_LOCK', str(Path(config['state_dir']) / 'sha.lock'))
     values = services.variables(config, root)
     course = Path(services.expand(config['course_queue'], values)).resolve()
     for queue in saved['queues']:
@@ -206,6 +207,8 @@ def provision(bundle, mount, identity, output_config):
                   for index, arg in enumerate(command[:-1]) if arg == '--before']
         if path not in before:
             command.extend(['--before', str(path)])
+        if '--download-budget' in command and '--parallel-before' not in command:
+            command.insert(command.index('--before'), '--parallel-before')
     for service in config['services'].values():
         for key in ('YDS_VOLUME_CATALOG', 'YDS_VOLUME_UUID'):
             if key in service.get('environment', {}):

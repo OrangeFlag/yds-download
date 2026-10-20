@@ -30,7 +30,8 @@
     "all_proxy": "socks://127.0.0.1:7890",
     "http_proxy": "http://127.0.0.1:7890",
     "https_proxy": "http://127.0.0.1:7890",
-    "no_proxy": "localhost,127.0.0.0/8,::1"
+    "no_proxy": "localhost,127.0.0.0/8,::1",
+    "YDS_HASH_LOCK": "$state_dir/sha.lock"
   },
   "properties": {
     "MemoryMax": "infinity",
@@ -62,7 +63,10 @@
         "--download-min-files",
         "2",
         "--download-max-files",
-        "8"
+        "8",
+        "--parallel-before",
+        "--before",
+        "$mount_root/YandexDisk/Личный Яндекс Диск/.download/personal-queue.json"
       ],
       "environment": {
         "FTP_PROXY": "ftp://127.0.0.1:2334",

@@ -96,6 +96,19 @@ class PrepareDiskChecks(unittest.TestCase):
                          [dict(name='B', enabled=True), dict(name='A', enabled=False)])
         self.assertIn(NEW, volume_catalog.load(self.new / volume_catalog.MIRROR_DIR)['volumes'])
 
+    def test_shared_budget_provision_runs_personal_and_courses_in_parallel(self):
+        config = prep._read(self.config)
+        config['services']['queue']['command'] += ['--download-budget', '$state_dir/download-budget']
+        self.write(self.config, config)
+        self.export()
+        self.online = {NEW: self.new}
+        config = self.provision()
+        command = config['services']['queue']['command']
+        self.assertIn('--parallel-before', command)
+        self.assertEqual(command.count('--parallel-before'), 1)
+        self.assertIn('--before', command)
+        self.assertEqual(config['environment']['YDS_HASH_LOCK'], str(self.home / 'state/sha.lock'))
+
     def test_offline_registry_is_carried_by_bundle(self):
         volume_catalog.synchronize(self.old, OLD, self.state)
         self.export()

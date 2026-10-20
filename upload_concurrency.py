@@ -113,11 +113,12 @@ class SharedUploadBudget:
     """One adaptive limit for all cloud processes; each waiting cloud gets a turn."""
     fields=('limit','total','window','trial','direction','next_probe','last_rate','last_rate_time')
 
-    def __init__(self, directory, name, minimum=2, maximum=8, probe_zero=False, target_mbit_s=None):
+    def __init__(self, directory, name, minimum=2, maximum=8, probe_zero=False, target_mbit_s=None, *, priority=False):
         self.target_mbit_s=UploadConcurrency(minimum,maximum,probe_zero,target_mbit_s).target_mbit_s
         self.directory=Path(directory)
         self.directory.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.name,self.minimum,self.maximum=name,minimum,maximum
+        self.priority=priority
         self.probe_zero=probe_zero
         self.key=uuid.uuid4().hex
         self.lease_path=self.directory/(self.key+'.member')
@@ -165,6 +166,7 @@ class SharedUploadBudget:
                 state['controller']={k:getattr(controller,k) for k in self.fields}
                 state['transfer_stats']=dict(epoch=uuid.uuid4().hex,sources={},last_log=None)
             member=members.setdefault(self.key,dict(name=self.name,active=0,waiting=0,confirmed_bytes=0,active_slots=[],waiting_slots=[]))
+            member['priority']=self.priority
             delta=max(0,self.confirmed_bytes-member['confirmed_bytes'])
             state['controller']['total']+=delta
             stats=state.setdefault('transfer_stats',dict(epoch=uuid.uuid4().hex,sources={},last_log=None))
@@ -220,7 +222,17 @@ class SharedUploadBudget:
                     active=sum(row['active'] for row in state['members'].values())
                     reserved=sum(row['waiting']>0 and row['active']==0 for key,row in state['members'].items() if key!=self.key)
                     limit=state['controller']['limit']
-                    if active<limit and (member['active']==0 or active<limit-reserved):
+                    preferred_waiting=any(row.get('priority') and row['waiting'] for row in state['members'].values())
+                    preferred_active=sum(row['active'] for row in state['members'].values() if row.get('priority'))
+                    if self.priority:
+                        # Reserve one turn for courses collectively, rather than one per cloud.
+                        reserved=sum(row.get('priority') and row['waiting']>0 and row['active']==0
+                                     for key,row in state['members'].items() if key!=self.key)
+                        reserved+=int(any(not row.get('priority') and row['waiting'] for row in state['members'].values())
+                                      and not any(not row.get('priority') and row['active'] for row in state['members'].values()))
+                    preferred_reserve=(max(0,min(limit-1,(2*limit+2)//3)-preferred_active)
+                                       if preferred_waiting and not self.priority else 0)
+                    if active<limit-preferred_reserve and (member['active']==0 or active<limit-reserved):
                         member['waiting_slots'].remove(token)
                         member['active_slots'].append(token)
                         acquired=True
