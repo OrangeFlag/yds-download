@@ -534,6 +534,25 @@ class SharedRangeChecks(unittest.TestCase):
                       recheck_interval=1, recheck_files=2, stopping=stopping)
             self.assertIn('/Course/video.mp4', submitted)
 
+    def test_pending_superseded_recheck_does_not_become_regular_range(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state, queue = self._finished_archive_with_cached_range(Path(folder))
+            path = state / 'tasks/00.json'
+            job = json.loads(path.read_text())
+            job.update(state='pending', yandex_recheck=True, superseded_by_nextcloud=True,
+                       result={'event': {'status': 'missing'}})
+            d.write_json(path, job)
+            d.write_json(state / 'local-copies.json', [])
+            stopping = Event()
+            submitted = []
+            with patch.object(q.Background, 'submit',
+                              side_effect=lambda *args, **kwargs: submitted.append(args[2]['path'])), \
+                 patch.object(stopping, 'wait',
+                              side_effect=lambda _: stopping.set() or True), \
+                 patch('report.update_report'):
+                q.run([queue], files=1, recheck_interval=1, recheck_files=1, stopping=stopping)
+            self.assertEqual(submitted, [], 'Superseded Recheck must never fall through to Range')
+
     def test_early_rechecks_rotate_across_three_archives(self):
         with tempfile.TemporaryDirectory() as folder:
             archives = []
