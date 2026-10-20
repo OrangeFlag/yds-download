@@ -61,6 +61,16 @@ class FastRecheckChecks(unittest.TestCase):
         self.assertEqual(second['yandex_full_recheck_at'],deadline)
         self.assertEqual(self.body.read_bytes(),self.content[:64])
 
+    def test_recheck_request_hook_observes_actual_range_http_attempts(self):
+        bg, path = self.prepare()
+        starts = []
+        bg.recheck_request = lambda: starts.append(len(self.requests))
+        with patch.object(download.OPENER, 'open', side_effect=self.unavailable):
+            bg.work(path, bg.jobs[path])
+        self.assertTrue(starts)
+        self.assertEqual(starts[0], 0)
+        self.assertEqual(len(starts), len(self.requests))
+
     def test_successful_coarse_probe_finishes_original_with_sha(self):
         bg,path = self.prepare()
         with patch.object(download.OPENER,'open',side_effect=self.serve):
