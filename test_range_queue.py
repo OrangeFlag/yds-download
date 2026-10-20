@@ -72,6 +72,7 @@ class DiscoveryProfileChecks(unittest.TestCase):
         self.assertEqual(self.metrics.counters['range_discovery_task_enumeration_calls'],1)
         self.assertEqual(self.metrics.counters['range_discovery_task_enumeration_entries'],5)
         self.assertEqual(self.metrics.counters['range_discovery_tasks_json_reads'],5)
+        self.assertEqual(self.metrics.counters['range_discovery_tasks_task_stats'],5)
 
     def test_manifest_profile_does_not_reload_unchanged_json(self):
         d.write_json(self.root/'courses.json',['Course'])
@@ -348,6 +349,9 @@ class SharedRangeChecks(unittest.TestCase):
                 self.assertEqual(len(tasks),40)
                 self.assertTrue(warm.tasks_complete(directory))
             self.assertEqual(warm.task_reads,0)
+            self.assertEqual(warm.task_stats,40, 'Cold restart validates each indexed task')
+            warm.tasks(directory)
+            self.assertEqual(warm.task_stats,40, 'Unchanged passes must not stat every task')
 
     def test_task_checkpoint_invalidates_when_tasks_are_created_changed_or_removed(self):
         with tempfile.TemporaryDirectory() as folder:
