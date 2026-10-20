@@ -484,8 +484,10 @@ def is_due_recheck(job, interval):
 
 
 def current_range_task(background, job):
+    if job.get('kind') != 'range':
+        return False
     item = job['item']
-    return (job['kind'] == 'range' and job['source'] == background.source
+    return (job['source'] == background.source
             and not any(job.get('superseded_by_' + reason)
                         for reason in ('manifest', 'nextcloud', 'local_copy'))
             and background.manifest_items.get((job['course'], item['path']))
