@@ -74,6 +74,9 @@ class PrepareDiskChecks(unittest.TestCase):
         self.assertEqual(result['previous_mounts'], [])
         self.assertEqual(result['environment']['YDS_VOLUME_UUID'], NEW)
         self.assertEqual(result['environment']['YDS_VOLUME_CATALOG'], str(self.state))
+        command = result['services']['queue']['command']
+        self.assertEqual(command[-2:], ['--before', str(self.new / 'Personal/.download/queue.json')])
+        self.assertEqual(command.count('--before'), 1)
         course = storage.read_queue(self.new / 'Archive/.download/queue.json')
         self.assertEqual([row['title'] for row in course['archives']], ['spring', 'Course0', 'Course1'])
         self.assertNotIn('wait_for', course)

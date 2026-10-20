@@ -165,6 +165,17 @@ def provision(bundle, mount, identity, output_config):
     config = _rebase(config, roots, root)
     config.update(mount_root=str(root), disk_uuid=identity, previous_mounts=[])
     config.setdefault('environment', {}).update(YDS_VOLUME_CATALOG=str(state), YDS_VOLUME_UUID=identity)
+    values = services.variables(config, root)
+    course = Path(services.expand(config['course_queue'], values)).resolve()
+    for queue in saved['queues']:
+        path = root / queue
+        if path == course:
+            continue
+        command = config['services']['queue']['command']
+        before = [Path(services.expand(command[index + 1], values)).resolve()
+                  for index, arg in enumerate(command[:-1]) if arg == '--before']
+        if path not in before:
+            command.extend(['--before', str(path)])
     for service in config['services'].values():
         for key in ('YDS_VOLUME_CATALOG', 'YDS_VOLUME_UUID'):
             if key in service.get('environment', {}):
