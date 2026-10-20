@@ -167,6 +167,7 @@ def calculate(path, stopping=None, root=None, progress=None, expected_sha256=Non
                 if progress is not None and now - last_progress >= 30:
                     progress(amount, before[2])
                     last_progress = now
+            os.fsync(stream.fileno())
             if _stamp(os.fstat(stream.fileno())) != before:
                 raise OSError('File changed during SHA verification')
         storage.check(path)
