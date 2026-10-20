@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, perf/recheck-task-discovery-20261020]
   workflow_dispatch:
 
 jobs:
