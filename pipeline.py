@@ -365,6 +365,7 @@ class Background:
                             r.finish_recovery(self.root, event, job['item'], self.retries, tuning=self.tuning,
                                               stopping=self.stopping, download_active=self.download_active if self.budget is None else None,
                                               background=True, request_budget=self.budget, metrics=self.metrics,
+                                              on_request=getattr(self, 'recheck_request', None) if job.get('yandex_recheck') else None,
                                               **(dict(probe_requests=probe_requests) if probe_requests else {}))
                             completed_yandex = True
                 except InterruptedError:
