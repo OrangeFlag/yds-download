@@ -322,6 +322,11 @@ class SharedRangeChecks(unittest.TestCase):
                 self.assertIsNone(cache.read(state))
             self.assertEqual(cache.json_reads, 1)
 
+    def test_current_range_task_ignores_other_kinds_without_range_item(self):
+        from types import SimpleNamespace
+        background = SimpleNamespace(source='test', manifest_items={})
+        self.assertFalse(q.current_range_task(background, {'kind': 'sha', 'source': 'test'}))
+
     def test_regular_range_skips_task_superseded_after_discovery(self):
         with tempfile.TemporaryDirectory() as folder:
             state, queue = self._finished_archive_with_cached_range(Path(folder))
