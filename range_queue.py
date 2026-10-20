@@ -714,7 +714,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                 metrics.gauge('range_task_discovery_pending_archives',len(cache.scans))
                 metrics.gauge('range_task_discovery_reads',cache.task_reads)
                 profile.milestone('first_pass')
-                stopping.wait(2)
+                # Finish bounded cold discovery promptly without spinning in steady state.
+                stopping.wait(.25 if cache.scans else 2)
         finally:
             for background, _, _ in roots.values():
                 background.stopping.set()
