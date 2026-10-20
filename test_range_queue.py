@@ -337,9 +337,13 @@ class SharedRangeChecks(unittest.TestCase):
             self.assertTrue(checkpoint.exists())
             self.assertNotIn('expensive history',checkpoint.read_text())
             warm=q.JsonCache(checkpoint=True)
-            with patch.object(Path,'glob',side_effect=AssertionError('Tasks were re-enumerated')), \\
-                 patch.object(Path,'read_text',wraps=None,side_effect=lambda *args,**kw:
-                     (_ for _ in ()).throw(AssertionError('Task JSON reread'))):
+            original_read=Path.read_text
+            def read(path,*args,**kwargs):
+                if path.parent==directory:
+                    raise AssertionError('Task JSON reread')
+                return original_read(path,*args,**kwargs)
+            with patch.object(Path,'glob',side_effect=AssertionError('Tasks were re-enumerated')), \
+                 patch.object(Path,'read_text',new=read):
                 tasks=warm.tasks(directory)
                 self.assertEqual(len(tasks),40)
                 self.assertTrue(warm.tasks_complete(directory))
