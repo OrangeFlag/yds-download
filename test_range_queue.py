@@ -297,6 +297,31 @@ class SharedRangeChecks(unittest.TestCase):
             d.write_json(path, {'value': 2})
             self.assertEqual(cache.read(path), {'value': 2})
 
+    def test_task_cache_uses_one_stat_without_extra_exists_probes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder) / 'tasks'
+            directory.mkdir()
+            state = Path(folder) / 'state.json'
+            d.write_json(state, {'value': 1})
+            task = directory / 'a.json'
+            d.write_json(task, dict(kind='range', state='pending', course='Course',
+                                    source='test', attempt=0,
+                                    item=dict(path='/Course/a', size=1, sha256='a'*64)))
+            cache = q.JsonCache()
+            original = Path.exists
+            def exists(path):
+                if path in (state, directory):
+                    raise AssertionError('Redundant exists() before stat()')
+                return original(path)
+            with patch.object(Path, 'exists', exists):
+                self.assertEqual(cache.read(state), {'value': 1})
+                self.assertEqual(cache.read(state), {'value': 1})
+                self.assertEqual(len(cache.tasks(directory)), 1)
+                self.assertTrue(cache.tasks_complete(directory))
+                state.unlink()
+                self.assertIsNone(cache.read(state))
+            self.assertEqual(cache.json_reads, 1)
+
     def test_task_cache_retains_only_compact_summaries_and_reloads_changed_tasks(self):
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder) / 'tasks'
