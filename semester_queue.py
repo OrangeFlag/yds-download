@@ -4,6 +4,7 @@ import argparse
 import fcntl
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -17,12 +18,62 @@ from metrics import Metrics
 from collections import Counter
 from settings import arguments, resolve, add_source_arguments, source_settings, source_arguments
 
+def queue_exit(code, path):
+    if code in (130, -2, 143, -15):
+        raise KeyboardInterrupt
+    if code == storage.TEMPFAIL:
+        raise storage.StorageUnavailable(path)
+    if code not in (0, 1):
+        raise RuntimeError('Queue stopped: ' + str(path) + '; exit=' + str(code))
+
+
+def parallel_queues(commands):
+    children = []
+    try:
+        for command, env in commands:
+            children.append((subprocess.Popen(command, env=env, start_new_session=True), command[2]))
+        pending = list(children)
+        while pending:
+            for child, path in pending[:]:
+                code = child.poll()
+                if code is not None:
+                    queue_exit(code, path)
+                    pending.remove((child, path))
+            if pending:
+                time.sleep(0.2)
+    except BaseException:
+        # Signal leaders once; their normal transfer cleanup signals their own children.
+        for child, _ in children:
+            if child.poll() is None:
+                try:
+                    child.send_signal(signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+        deadline = time.monotonic() + 90
+        for child, _ in children:
+            timed_out = False
+            try:
+                child.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            # A crashed leader can leave transfers alive in its isolated session.
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if timed_out:
+                child.wait()
+        raise
+
+
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('queue', type=Path)
     parser.add_argument('--before', type=Path, action='append', default=[],
                         help='Run this personal queue first without course cloud filters (repeatable)')
+    parser.add_argument('--parallel-before', action='store_true',
+                        help='Run personal queues alongside the course queue, starting personal queues first')
     parser.add_argument('--no-wait-range', action='store_true',
                         help='Return after foreground downloads while deferred Range recovery continues')
     parser.add_argument('--defer-range', action='store_true', help='Continue archives while range_queue.py recovers failures')
@@ -45,24 +96,36 @@ def main():
     before = [queue.resolve() for queue in args.before]
     if path in before or len(set(before)) != len(before):
         parser.error('--before queues must be distinct and cannot include the current queue')
+    if args.parallel_before and before and download_budget is None:
+        parser.error('--parallel-before requires --download-budget to share transfer limits')
+    commands = []
+    for queue in before:
+        storage.check(queue)
+        command = [sys.executable, str(Path(__file__).resolve()), str(queue),
+                   '--defer-range', '--no-wait-range']
+        command += source_arguments(budget=download_budget)
+        if args.range_budget is not None:
+            command += ['--range-budget', str(args.range_budget.resolve()),
+                        '--range-files', str(args.range_files)]
+        commands.append((command, {**os.environ, 'YDS_DOWNLOAD_PRIORITY': 'personal'}))
+    if args.parallel_before and before:
+        course_args = []
+        remaining = iter(sys.argv[1:])
+        for argument in remaining:
+            if argument == '--before':
+                next(remaining)
+            elif argument != '--parallel-before' and not argument.startswith('--before='):
+                course_args.append(argument)
+        commands.append(([sys.executable, str(Path(__file__).resolve()), *course_args],
+                         {**os.environ, 'YDS_DOWNLOAD_PRIORITY': 'normal'}))
+        parallel_queues(commands)
+        return
     with path.with_suffix('.lock').open('a') as lock, Metrics(path.with_suffix('.metrics.jsonl'),'semester-queue',
             interval=resolve(json.loads(path.read_text()).get('tuning',{}))['metrics_interval']) as metrics:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        for queue in before:
-            storage.check(queue)
-            command = [sys.executable, str(Path(__file__).resolve()), str(queue),
-                       '--defer-range', '--no-wait-range']
-            command += source_arguments(budget=download_budget)
-            if args.range_budget is not None:
-                command += ['--range-budget', str(args.range_budget.resolve()),
-                            '--range-files', str(args.range_files)]
-            code = transfer_process(command, env=os.environ.copy(), on_tick=lambda: None, stop_timeout=80)
-            if code in (130, -2, 143, -15):
-                raise KeyboardInterrupt
-            if code == storage.TEMPFAIL:
-                raise storage.StorageUnavailable(queue)
-            if code not in (0, 1):
-                raise RuntimeError('Personal queue stopped: ' + str(queue) + '; exit=' + str(code))
+        for command, env in commands:
+            code = transfer_process(command, env=env, on_tick=lambda: None, stop_timeout=80)
+            queue_exit(code, command[2])
         data = storage.read_queue(path)
         resolve(data.get('tuning', {}))
         for job in data['archives']:
