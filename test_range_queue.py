@@ -326,6 +326,7 @@ class SharedRangeChecks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             state, queue = self._finished_archive_with_cached_range(Path(folder))
             task = state / 'tasks/00.json'
+            d.write_json(state / 'local-copies.json', [])
             submitted = []
             changed = []
             stopping = Event()
