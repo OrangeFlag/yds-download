@@ -182,6 +182,24 @@ class VolumeCatalogChecks(unittest.TestCase):
         offline=catalog.load(self.new/'.yds-download')['volumes'][OLD]['archives']['Archive 1']
         self.assertEqual(offline['recovery'],recovery)
 
+    def test_offline_catalog_show_reports_unverified_corrupted_bytes_separately(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        archive, item, _ = self.archive(self.old, 'Archive 1')
+        body = archive/'corrupted/20261020/Course/Lecture.mp4'
+        body.parent.mkdir(parents=True)
+        body.write_bytes(b'incomplete')
+        d.write_json(archive/'corrupted/20261020/failed.json',
+                     [dict(item, time='2026-10-20',
+                           corrupted_path=str(body.relative_to(archive)))])
+        catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+        self.online = {}
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(catalog.main(['show','--state-dir',str(self.host)]),0)
+        self.assertIn('corrupted_bodies=1',output.getvalue())
+        self.assertIn('corrupted_logical_bytes=10',output.getvalue())
+
     def test_missing_recovery_body_remains_in_index_without_claiming_resumable_data(self):
         archive, item, _ = self.archive(self.old, 'Archive 1')
         directory=archive/'corrupted/20261020'
