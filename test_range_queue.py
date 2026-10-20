@@ -546,7 +546,7 @@ class SharedRangeChecks(unittest.TestCase):
             stopping = Event()
             submitted = []
             with patch.object(q.Background, 'submit',
-                              side_effect=lambda *args, **kwargs: submitted.append(args[2]['path'])), \
+                              side_effect=lambda *args, **kwargs: submitted.append(args[1]['path'])), \
                  patch.object(stopping, 'wait',
                               side_effect=lambda _: stopping.set() or True), \
                  patch('report.update_report'):
