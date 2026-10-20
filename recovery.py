@@ -746,7 +746,8 @@ def _finish_recovery(root, event, item=None, retries=2, _redownload=True, tuning
         try:
             if background:
                 retry_ranges(root, event, item, retries, tuning, stopping, download_active, request_budget, metrics=metrics,
-                             on_request=on_request, **(dict(probe_requests=probe_requests) if probe_requests else {}))
+                             **(dict(on_request=on_request) if on_request else {}),
+                             **(dict(probe_requests=probe_requests) if probe_requests else {}))
             else:
                 retry_ranges(root, event, item, retries, tuning)
         except InterruptedError:
