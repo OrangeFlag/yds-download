@@ -348,6 +348,40 @@ def retire_cached_copy(background, path, job, proofs):
     return False
 
 
+def offline_due(index, job):
+    event = job.get('result', {}).get('event', {})
+    return (event.get('status') == 'stored_offline'
+            or bool(index and job['state'] == 'applied'
+                    and not any(job.get('superseded_by_' + reason)
+                                for reason in ('manifest', 'nextcloud', 'local_copy'))
+                    and event.get('status') != 'valid' and not event.get('range_recovered_complete')
+                    and index.lookup(job['item'])))
+
+
+def retire_offline_copy(background, path, job, index):
+    proof = index.lookup(job['item']) if index else None
+    previous = job.get('result', {}).get('event', {})
+    if not proof:
+        if previous.get('status') == 'stored_offline':
+            job.update(state='pending', time=now())
+            job.pop('result', None)
+            d.write_json(path, job)
+        return False
+    detail='SHA-256 copy on volume '+proof['volume_uuid']+': '+proof['local']
+    if previous.get('status') == 'stored_offline' and previous.get('detail')==detail:
+        return True
+    event = dict(previous or job.get('event', {}), path=job['item']['path'],
+                 size=job['item']['size'], sha256=job['item']['sha256'],
+                 course=job['course'], attempt=job['attempt'], status='stored_offline', time=now(),
+                 detail=detail)
+    event.pop('range_recovered_complete', None)
+    d.append_events(background.state/'events.jsonl', [event])
+    background.checkpoint(job['item'],job['course'],job['attempt'],'offline',event)
+    job.update(state='applied',result={'event':event},time=now())
+    d.write_json(path,job)
+    return True
+
+
 def finish_courses(background, config, changed_courses=()):
     root, state = background.root, background.state
     if hasattr(background, 'task_cache'):
@@ -373,6 +407,8 @@ def finish_courses(background, config, changed_courses=()):
     remote_path = state/'nextcloud-existing.json'
     saved = json.loads(remote_path.read_text()) if link and remote_path.exists() else {}
     remote_files = saved_remote_files(state, link, source=background.source, saved=saved)
+    from volume_catalog import from_environment
+    offline_index = from_environment()
     for index, course in enumerate(courses, 1):
         pending = any(job['kind'] == 'range' and job['course'] == course and job['state'] != 'applied' for job in jobs)
         if history.get(course, {}).get('state') == 'finished' and not pending and course not in changed_courses:
@@ -393,20 +429,21 @@ def finish_courses(background, config, changed_courses=()):
         remote=sum((remote_files.get(item['path'], {}).get('size'),
                     remote_files.get(item['path'], {}).get('sha256')) == (item['size'], item['sha256'])
                    for item in entries if item['path'] not in verified_paths)
+        offline = sum(bool(offline_index.lookup(item)) for item in entries if item['path'] not in verified_paths and (remote_files.get(item['path'],{}).get('size'), remote_files.get(item['path'],{}).get('sha256')) != (item['size'],item['sha256'])) if offline_index else 0
         status = dict(course=course, source=background.source, state='recovering' if pending else 'finished',
-                      complete=not pending and valid + remote == len(entries), total=len(entries), verified=valid, remote_available=remote,
-                      failed=0 if pending else len(entries) - valid - remote, pending=len(entries) - valid - remote if pending else 0, time=now())
+                      complete=not pending and valid + remote + offline == len(entries), total=len(entries), verified=valid, remote_available=remote, offline_available=offline,
+                      failed=0 if pending else len(entries) - valid - remote - offline, pending=len(entries) - valid - remote - offline if pending else 0, time=now())
         if not pending and config.get('report_repo'):
             queue_report(root, Path(config['report_repo']), config['mark'], config.get('git_push', False),
                          f"Update {config['mark']} copies: {root.name} / {course}")
         history[course] = status
         d.write_json(state / f'{index:02d}-status.json', status)
         if not pending:
-            print(('COURSE AVAILABLE: ' if status['complete'] and remote else 'COURSE VERIFIED COMPLETE: ' if status['complete'] else 'COURSE FINISHED WITH ERRORS: ') + str(root) + ' / ' + course, flush=True)
+            print(('COURSE AVAILABLE: ' if status['complete'] and (remote or offline) else 'COURSE VERIFIED COMPLETE: ' if status['complete'] else 'COURSE FINISHED WITH ERRORS: ') + str(root) + ' / ' + course, flush=True)
     d.write_json(history_path, history)
     pending = [course for course in courses if history[course]['state'] != 'finished']
     failed = sum(history[course]['failed'] for course in courses)
-    d.write_json(state / 'summary.json', dict(verified=sum(history[course]['verified'] for course in courses),remote_available=sum(history[course].get('remote_available',0) for course in courses),
+    d.write_json(state / 'summary.json', dict(verified=sum(history[course]['verified'] for course in courses),remote_available=sum(history[course].get('remote_available',0) for course in courses),offline_available=sum(history[course].get('offline_available',0) for course in courses),
                  failed=failed, pending_courses=pending, downloads_complete=True, complete=not failed and not pending))
 
 
@@ -490,6 +527,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
     else:
         from request_budget import ProcessRangeBudget
         budget = ProcessRangeBudget(budget_directory, requests, rps)
+    from volume_catalog import from_environment
+    offline_index = from_environment()
     cache = JsonCache(checkpoint=True)
     roots = {}
     changed_courses_by_root = {}
@@ -644,7 +683,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                 fallbacks[root] = fallback_key, source_fallback
                             fallback = fallbacks[root][1]
                         legacy=recheck_interval and archive.get('legacy_recheck') and not cache.read(state/'legacy-recheck-seeded.json',{}).get('complete')
-                        if not legacy and not dirty_courses and not summary.get('pending_courses') and not any(job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or recheck_due(job,recheck_interval) or fallback_due(fallback,job)) for _, job in tasks):
+                        if not legacy and not dirty_courses and not summary.get('pending_courses') and not any(job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or offline_due(offline_index,job) or recheck_due(job,recheck_interval) or fallback_due(fallback,job)) for _, job in tasks):
                             continue
                         if root not in roots:
                             lock = (state / 'download.lock').open('a')
@@ -701,7 +740,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                             if any(job.get('superseded_by_'+reason)
                                    for reason in ('manifest', 'nextcloud', 'local_copy')):
                                 continue
-                            if job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or checking or fallback_due(fallback,job)):
+                            if job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or offline_due(offline_index,job) or checking or fallback_due(fallback,job)):
                                 if job['source'] != background.source:
                                     raise ValueError('Range task source mismatch')
                                 d.target(root, job['item'], job['course'])
@@ -720,6 +759,14 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                     saved.update(state='applied', time=now(), superseded_by_manifest=True)
                                     d.write_json(path, saved)
                                     continue
+                                was_offline = job.get('result',{}).get('event',{}).get('status')=='stored_offline'
+                                if was_offline or offline_index and offline_index.lookup(item):
+                                    saved = json.loads(path.read_text())
+                                    if retire_offline_copy(background,path,saved,offline_index):
+                                        if not was_offline:mark_courses(background,[job['course']])
+                                        continue
+                                    mark_courses(background,[job['course']])
+                                    job=saved
                                 proofs = [background.cached_events.get(item['path'], {}), *external_by_path.get(item['path'], [])]
                                 if any(proof.get('status') == 'valid' for proof in proofs):
                                     mark_courses(background, [job['course']])

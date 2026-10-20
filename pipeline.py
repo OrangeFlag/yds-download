@@ -610,6 +610,8 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             raise ValueError('Use a separate destination for a different public folder/year')
         d.write_json(identity, dict(source=source, title=data['title']))
         d.write_json(state / 'settings.json', dict(retries=retries, deep=False, retry_check=retry_check, tuning=tuning, defer_range=defer_range, nextcloud_existing=nextcloud_existing, nextcloud_fallback=nextcloud_fallback,opencloud_fallback=opencloud_fallback,download_budget=download_budget))
+        from volume_catalog import from_environment
+        offline_index = from_environment()
         remote_index = None
         remote_files = {}
         if nextcloud_existing:
@@ -678,6 +680,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             if (job['source'] == source and job['course'] in courses
                     and job['kind'] == 'sha' and job['state'] in ('pending', 'running', 'done')
                     and (current.get('size'), current.get('sha256')) == (job['item']['size'], job['item']['sha256'])
+                    and not (offline_index and offline_index.lookup(job['item']))
                     and background.continuation(job['item']).get('phase') == 'verifying'):
                 background.submit('sha', job['item'], job['course'], job['attempt'], job.get('event'))
         if report_repo:
@@ -695,6 +698,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                 jobs = [job for job in background.jobs.values() if job['course'] == course]
                 waiting = bool(background.transferring == course or jobs or any(name == course for _, name, _ in background.retry))
                 valid = 0
+                verified_paths = set()
                 for item in entries:
                     for proof in (proofs.get(item['path'], {}), events.get(item['path'], {})):
                         local = storage.saved_local(root, proof['local']) if proof.get('local') else d.target(root, item, course)
@@ -702,11 +706,14 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                                 and file_hashes.proof_current(local,proof,root=root,legacy=True)
                                 and not Path(str(local) + '.aria2').exists()):
                             valid += 1
+                            verified_paths.add(item['path'])
                             break
+                offline = sum(bool(offline_index.lookup(item)) for item in entries
+                              if item['path'] not in verified_paths and item['path'] not in remote_files) if offline_index else 0
                 remote = sum(item['path'] in remote_files for item in entries)
                 status = dict(course=course, source=source, state=('recovering' if any(job['kind'] == 'range' for job in jobs) else 'verifying') if waiting else 'finished',
-                              complete=not waiting and valid + remote == len(entries), total=len(entries), verified=valid, remote_available=remote,
-                              failed=0 if waiting else len(entries) - valid - remote, pending=len(entries) - valid - remote if waiting else 0, time=now())
+                              complete=not waiting and valid + remote + offline == len(entries), total=len(entries), verified=valid, remote_available=remote, offline_available=offline,
+                              failed=0 if waiting else len(entries) - valid - remote - offline, pending=len(entries) - valid - remote - offline if waiting else 0, time=now())
                 if not waiting and report_repo:
                     from report import queue_report
                     queue_report(root, report_repo, mark, git_push,
@@ -717,7 +724,7 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                     d.write_json(history_path, history)
                 if not waiting:
                     del active[course]
-                    print(('COURSE AVAILABLE: ' if status['complete'] and remote else 'COURSE VERIFIED COMPLETE: ' if status['complete'] else 'COURSE FINISHED WITH ERRORS: ') + course, flush=True)
+                    print(('COURSE AVAILABLE: ' if status['complete'] and (remote or offline) else 'COURSE VERIFIED COMPLETE: ' if status['complete'] else 'COURSE FINISHED WITH ERRORS: ') + course, flush=True)
             summary = dict(verified=sum(history.get(course, {}).get('verified', 0) for course in courses),
                          failed=sum(history.get(course, {}).get('failed', 0) for course in courses),
                          pending_courses=list(active), complete=False)
@@ -733,8 +740,14 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                 finalize()
                 events.update({path: row for path, row in proofs.items() if row['status'] == 'valid'})
                 previous = history.get(course, {})
+                offline_current = not previous.get('offline_available')
+                if not offline_current and offline_index:
+                    saved_manifest = state / f'{index:02d}-manifest.json'
+                    prior = json.loads(saved_manifest.read_text()) if saved_manifest.exists() else []
+                    offline_current = sum(events.get(item['path'], {}).get('status') == 'stored_offline'
+                                          and bool(offline_index.lookup(item)) for item in prior) == previous['offline_available']
                 if (previous.get('state') == 'finished' and previous.get('source') == source
-                        and not (retry_check and previous.get('failed')) and not previous.get('remote_available')):
+                        and not (retry_check and previous.get('failed')) and not previous.get('remote_available') and offline_current):
                     d.write_json(state / f'{index:02d}-status.json', previous)
                     print('COURSE SKIPPED: ' + course, flush=True)
                     continue
@@ -762,6 +775,13 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
                     if (cached.get('status') == 'valid' and (cached.get('size'), cached.get('sha256')) == (item['size'], item['sha256'])
                             and file_hashes.proof_current(local,cached,root=root)
                             and not Path(str(local) + '.aria2').exists()):
+                        continue
+                    offline = offline_index.lookup(item) if offline_index else None
+                    if offline:
+                        event = d.record(state,item,course,0,'stored_offline',
+                            'SHA-256 copy on volume '+offline['volume_uuid']+': '+offline['local'])
+                        events[item['path']] = event
+                        background.checkpoint(item,course,0,'offline',event)
                         continue
                     if remote_index and remote_index.contains(data,item):
                         remote_files[item['path']] = {key:item[key] for key in ('size','sha256')}
@@ -831,6 +851,6 @@ def run(data, courses, root, retries, report_repo, mark, git_push, retry_check, 
             background.close()
         failed = sum(history[course]['failed'] for course in courses)
         verified = sum(history[course]['verified'] for course in courses)
-        d.write_json(state / 'summary.json', dict(verified=verified, remote_available=sum(history[course].get('remote_available',0) for course in courses), failed=failed, pending_courses=list(active), downloads_complete=True, complete=not failed and not active))
+        d.write_json(state / 'summary.json', dict(verified=verified, remote_available=sum(history[course].get('remote_available',0) for course in courses), offline_available=sum(history[course].get('offline_available',0) for course in courses), failed=failed, pending_courses=list(active), downloads_complete=True, complete=not failed and not active))
         print(f'ALL SELECTED COURSES PROCESSED: verified={verified}, failed={failed}', flush=True)
         return 1 if failed or active else 0
