@@ -134,6 +134,7 @@ class JsonCache:
         self.directories = {}
         self.scans = {}
         self.checkpoint_writes = {}
+        self.checkpoint_loads = 0
         self.task_reads = self.json_reads = 0
 
     def _checkpoint_path(self, directory):
@@ -170,6 +171,7 @@ class JsonCache:
         self.directories[directory] = stamp, records, [
             (path, summary) for path, (_, summary) in records.items() if summary is not None]
         self.checkpoint_writes[directory] = time.monotonic()
+        self.checkpoint_loads += 1
 
     def _save_tasks(self, directory, stamp, records):
         # Snapshot is derivative; a failed durable write must not hide disk errors.
@@ -200,7 +202,7 @@ class JsonCache:
     def tasks(self, directory, limit=None):
         if self.profile is None:
             return self._tasks(directory, limit)
-        reads = self.task_reads
+        reads, loads = self.task_reads, self.checkpoint_loads
         with self.profile.stage('tasks', directory) as counts:
             try:
                 result = self._tasks(directory, limit)
@@ -208,6 +210,7 @@ class JsonCache:
                 return result
             finally:
                 counts['json_reads'] = self.task_reads - reads
+                counts['checkpoint_loads'] = self.checkpoint_loads - loads
 
     def _paths(self, directory):
         if self.profile is None:
