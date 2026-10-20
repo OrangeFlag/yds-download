@@ -322,6 +322,35 @@ class SharedRangeChecks(unittest.TestCase):
                 self.assertIsNone(cache.read(state))
             self.assertEqual(cache.json_reads, 1)
 
+    def test_regular_range_skips_task_superseded_after_discovery(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state, queue = self._finished_archive_with_cached_range(Path(folder))
+            task = state / 'tasks/00.json'
+            submitted = []
+            changed = []
+            stopping = Event()
+            original_tasks = q.JsonCache.tasks
+
+            def tasks(cache, directory, limit=None):
+                result = original_tasks(cache, directory, limit)
+                if directory == state / 'tasks' and not changed:
+                    job = json.loads(task.read_text())
+                    job['superseded_by_manifest'] = True
+                    d.write_json(task, job)
+                    changed.append(True)
+                return result
+
+            def submit(background, kind, item, *args, **kwargs):
+                submitted.append(item['path'])
+
+            with patch.object(q.JsonCache, 'tasks', tasks), \
+                 patch.object(q.Background, 'submit', submit), \
+                 patch.object(stopping, 'wait', side_effect=lambda _: stopping.set() or True), \
+                 patch('report.update_report'):
+                q.run([queue], stopping=stopping)
+            self.assertTrue(changed)
+            self.assertEqual(submitted, [], 'Stale regular task was submitted after supersession')
+
     def test_task_cache_retains_only_compact_summaries_and_reloads_changed_tasks(self):
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder) / 'tasks'
