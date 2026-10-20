@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import time
 import uuid as uuidlib
@@ -158,16 +159,21 @@ def _catalog_archive(root, archive):
     journal = state / 'events.jsonl'
     proofs = d.EventIndex(journal, repair=False, checkpoint=True, checkpoint_read_only=True).refresh()
     base = root.resolve()
+    device = base.stat().st_dev
     for name, row in entries.items():
         event = proofs.get(name, {})
         primary = local_path(archive, name)
         candidates = ([storage.saved_local(archive, event['local'])] if event.get('local') else []) + [primary]
         for candidate in dict.fromkeys(candidates):
             resolved = candidate.resolve()
-            if (not resolved.is_relative_to(base) or not resolved.is_file()
-                    or resolved.stat().st_dev != base.stat().st_dev
-                    or Path(str(resolved) + '.aria2').exists()
-                    or resolved.stat().st_size != row['size']):
+            if not resolved.is_relative_to(base):
+                continue
+            try:
+                current = resolved.stat()
+            except FileNotFoundError:
+                continue
+            if (not stat.S_ISREG(current.st_mode) or current.st_dev != device
+                    or current.st_size != row['size'] or Path(str(resolved) + '.aria2').exists()):
                 continue
             same = (event.get('status') == 'valid'
                     and (event.get('size'), event.get('sha256')) == (row['size'], row['sha256'])
