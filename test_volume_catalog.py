@@ -154,6 +154,101 @@ class VolumeCatalogChecks(unittest.TestCase):
         proof = catalog.load(self.host)['volumes'][OLD]['archives']['Archive 1']['files'][item['path']]
         self.assertEqual(proof['status'],'verified')
 
+    def test_corrupted_recovery_bodies_are_indexed_without_hashing_or_copying(self):
+        archive, item, _ = self.archive(self.old, 'Archive 1')
+        body = archive/'corrupted/20261020/Course/Lecture.mp4'
+        body.parent.mkdir(parents=True)
+        body.write_bytes(b'partially received')
+        control=Path(str(body)+'.ranges.json')
+        d.write_json(control,dict(size=item['size'],sha256=item['sha256'],ranges=[[0,4]]))
+        Path(str(body)+'.aria2').write_bytes(b'aria2 resume state')
+        event=dict(item, status='invalid', course='Course',attempt=3,
+                   corrupted_path=str(body.relative_to(archive)),time='2026-10-20')
+        d.write_json(archive/'corrupted/20261020/failed.json',[event])
+        with patch.object(d,'sha256_file',side_effect=AssertionError('Do not hash corrupted body')):
+            catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+        recovery=catalog.load(self.host)['volumes'][OLD]['archives']['Archive 1']['recovery']
+        key='corrupted/20261020/Course/Lecture.mp4'
+        self.assertEqual(recovery[key]['source_path'],item['path'])
+        self.assertEqual(recovery[key]['expected_sha256'],item['sha256'])
+        self.assertEqual(recovery[key]['body_bytes'],len(b'partially received'))
+        self.assertTrue(recovery[key]['has_ranges'])
+        self.assertTrue(recovery[key]['has_aria2'])
+        self.assertEqual(recovery[key]['status'],'retained_unverified')
+        self.assertFalse('body' in recovery[key])
+        self.assertFalse((self.new/'corrupted').exists())
+        self.online={NEW:self.new}
+        catalog.synchronize(self.new, NEW, self.host)
+        offline=catalog.load(self.new/'.yds-download')['volumes'][OLD]['archives']['Archive 1']
+        self.assertEqual(offline['recovery'],recovery)
+
+    def test_offline_catalog_show_reports_unverified_corrupted_bytes_separately(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        archive, item, _ = self.archive(self.old, 'Archive 1')
+        body = archive/'corrupted/20261020/Course/Lecture.mp4'
+        body.parent.mkdir(parents=True)
+        body.write_bytes(b'incomplete')
+        d.write_json(archive/'corrupted/20261020/failed.json',
+                     [dict(item, time='2026-10-20',
+                           corrupted_path=str(body.relative_to(archive)))])
+        catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+        self.online = {}
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(catalog.main(['show','--state-dir',str(self.host)]),0)
+        self.assertIn('corrupted_bodies=1',output.getvalue())
+        self.assertIn('corrupted_logical_bytes=10',output.getvalue())
+
+    def test_missing_recovery_body_remains_in_index_without_claiming_resumable_data(self):
+        archive, item, _ = self.archive(self.old, 'Archive 1')
+        directory=archive/'corrupted/20261020'
+        directory.mkdir(parents=True)
+        d.write_json(directory/'failed.json',[dict(item,course='Course',
+            status='missing',time='2026-10-20',corrupted_path='corrupted/20261020/Course/Lecture.mp4')])
+        catalog.snapshot(self.old,OLD,self.host,archives=[archive])
+        record=next(iter(catalog.load(self.host)['volumes'][OLD]['archives']['Archive 1']['recovery'].values()))
+        self.assertEqual(record['status'],'missing')
+        self.assertFalse(record['has_ranges'])
+        self.assertFalse(record['has_aria2'])
+
+    def test_replaced_recovery_body_preserves_older_raw_versions_in_inventory(self):
+        archive, item, _ = self.archive(self.old, 'Archive 1')
+        older = archive/'corrupted/first/Course/Lecture.mp4'
+        newer = archive/'corrupted/second/Course/Lecture.mp4'
+        rejected = archive/'corrupted/rejected/Course/Lecture.mp4'
+        for path in (older, newer, rejected):
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b'old raw data')
+        d.write_json(archive/'corrupted/second/failed.json', [dict(
+            item, time='2026-10-20', corrupted_path=str(newer.relative_to(archive)),
+            preserved_archive_paths=[str(older.relative_to(archive))],
+            sha256_rejected_paths=[str(rejected.relative_to(archive))])])
+        catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+        entries=catalog.load(self.host)['volumes'][OLD]['archives']['Archive 1']['recovery']
+        self.assertEqual(set(entries), {
+            str(path.relative_to(archive)) for path in (older,newer,rejected)})
+        self.assertTrue(all(v['status']=='retained_unverified' for v in entries.values()))
+
+    def test_symlinked_corrupted_directory_cannot_inventory_another_volume(self):
+        archive, _, _ = self.archive(self.old, 'Archive 1')
+        outside=self.root/'outside'
+        outside.mkdir()
+        (archive/'corrupted').symlink_to(outside,target_is_directory=True)
+        with self.assertRaisesRegex(ValueError,'Unsafe corrupted directory'):
+            catalog.snapshot(self.old,OLD,self.host,archives=[archive])
+        self.assertFalse((self.host/'volume-catalog.json').exists())
+
+    def test_corrupted_recovery_cannot_escape_the_selected_disk(self):
+        archive, item, _ = self.archive(self.old,'Archive 1')
+        directory=archive/'corrupted/20261020'
+        directory.mkdir(parents=True)
+        d.write_json(directory/'failed.json',[dict(item,course='Course',
+           status='invalid',time='2026-10-20',corrupted_path='../outside.mp4')])
+        with self.assertRaisesRegex(ValueError,'Unsafe corrupted path'):
+            catalog.snapshot(self.old,OLD,self.host,archives=[archive])
+        self.assertFalse((self.host/'volume-catalog.json').exists())
+
     def test_unfinished_jsonl_tail_is_not_repaired_by_catalog(self):
         archive, _, _ = self.archive(self.old, 'Archive 1')
         path = archive / '.download/events.jsonl'

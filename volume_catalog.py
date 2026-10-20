@@ -139,6 +139,58 @@ def _archives(root, queues, archives):
     return sorted(found)
 
 
+def _recovery_inventory(root, archive):
+    """Inventory retained bodies without treating them as SHA-verified files.
+
+    Includes previous/rejected bodies saved during repeated Range recovery.
+    The raw data and control files remain on the original volume.
+    """
+    recovery = {}
+    parent = (archive / 'corrupted').resolve()
+    device = root.stat().st_dev
+    if not parent.is_relative_to(root):
+        raise ValueError('Unsafe corrupted directory')
+    for failure in sorted(parent.glob('**/failed.json')):
+        for event in json.loads(failure.read_text(encoding='utf-8')):
+            current = event.get('corrupted_path')
+            if current is None:
+                current = str(local_path(failure.parent, event['path']).relative_to(archive))
+            paths = [current]
+            for key in ('preserved_archive_paths', 'sha256_rejected_paths'):
+                paths.extend(event.get(key, []))
+            for relative in dict.fromkeys(paths):
+                if not isinstance(relative, str):
+                    raise ValueError('Unsafe corrupted path')
+                name = Path(relative)
+                body = (archive / name).resolve()
+                if (name.is_absolute() or '..' in name.parts or
+                        not body.is_relative_to(parent) or not body.is_relative_to(root)):
+                    raise ValueError('Unsafe corrupted path: ' + relative)
+                metadata = {}
+                for suffix, key in (('', 'body_bytes'), ('.ranges.json', 'has_ranges'),
+                                    ('.aria2', 'has_aria2')):
+                    candidate = (archive / (relative + suffix)).resolve()
+                    if not candidate.is_relative_to(parent):
+                        raise ValueError('Unsafe corrupted path: ' + relative + suffix)
+                    try:
+                        stat_result = candidate.stat()
+                    except FileNotFoundError:
+                        stat_result = None
+                    if stat_result and (stat_result.st_dev != device
+                                        or not stat.S_ISREG(stat_result.st_mode)):
+                        raise ValueError('Unsafe corrupted artifact: ' + str(candidate))
+                    if suffix:
+                        metadata[key] = stat_result is not None
+                    elif stat_result is not None:
+                        metadata[key] = stat_result.st_size
+                recovery[relative] = dict(
+                    source_path=event['path'], expected_sha256=event['sha256'],
+                    expected_size=event['size'],
+                    status='retained_unverified' if 'body_bytes' in metadata else 'missing',
+                    **metadata)
+    return recovery
+
+
 def _catalog_archive(root, archive):
     state = archive / '.download'
     manifests = sorted(state.glob('*-manifest.json'), key=lambda p: (p.stat().st_mtime_ns, str(p)))
@@ -182,7 +234,8 @@ def _catalog_archive(root, archive):
                     or (file_hashes.load(resolved, root=archive) or {}).get('sha256') == row['sha256']):
                 row.update(status='verified', local=str(resolved.relative_to(base)))
                 break
-    return dict(source=source['source'], title=source.get('title', ''), scanned_ns=time.time_ns(), files=entries)
+    return dict(source=source['source'], title=source.get('title', ''), scanned_ns=time.time_ns(),
+                files=entries, recovery=_recovery_inventory(root, archive))
 
 
 def snapshot(root, identity, state, *, archives=(), queues=(), label=None):
@@ -218,8 +271,13 @@ def main(argv=None):
             result = load(args.state_dir) or dict(volumes={})
             for identity, volume in result['volumes'].items():
                 records = [f for a in volume['archives'].values() for f in a['files'].values()]
+                recovery = [entry for archive in volume['archives'].values()
+                            for entry in archive.get('recovery', {}).values()
+                            if entry['status'] == 'retained_unverified']
                 print(f'{volume["label"]}: UUID={identity}; files={len(records)}; '
-                      f'verified_last_seen={sum(f["status"] == "verified" for f in records)}')
+                      f'verified_last_seen={sum(f["status"] == "verified" for f in records)}; '
+                      f'corrupted_bodies={len(recovery)}; '
+                      f'corrupted_logical_bytes={sum(e["body_bytes"] for e in recovery)}')
         else:
             if not args.uuid or args.mount is None:
                 parser.error('snapshot/sync require --uuid and --mount')
