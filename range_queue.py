@@ -557,10 +557,13 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
 
                 checking_active=Counter(min(priorities[bg.root],1) for bg,_,_ in roots.values()
                                         for path in bg.futures if is_recheck(bg,path))
+                early_dispatched = Counter()
                 def dispatch_rechecks(early=False):
                     rechecks.sort(key=lambda row:recheck_times[row[2]])
                     for group,limit in enumerate(recheck_limits):
-                        while checking_active[group] < (min(limit, 1) if early else limit):
+                        if early and early_dispatched[group]:
+                            continue
+                        while checking_active[group] < limit:
                             options=[row for row in rechecks if min(row[0],1)==group]
                             if not options:break
                             candidates=list(dict.fromkeys(row[1].root for row in options))
@@ -584,6 +587,9 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                                   force=job['state']=='applied',yandex_recheck=True)
                                 profile.milestone('first_recheck_submit')
                             recheck_roots[group]=root;checking_active[group]+=1
+                            if early:
+                                early_dispatched[group] += 1
+                                break
 
                 for priority, queue in enumerate(queues):
                     config = storage.read_queue(queue, cache.read(queue))
