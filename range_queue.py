@@ -427,6 +427,16 @@ def recheck_due(job, interval, timestamp=None):
     if not last:return True
     return (time.time() if timestamp is None else timestamp)-last>=interval
 
+def is_due_recheck(job, interval):
+    event = job.get('result', {}).get('event', {})
+    return bool(interval and job.get('kind') == 'range'
+                and not any(job.get('superseded_by_' + reason)
+                            for reason in ('manifest', 'nextcloud', 'local_copy'))
+                and not event.get('range_recovered_complete') and event.get('status') != 'valid'
+                and (job.get('yandex_recheck') and job.get('state') != 'applied'
+                     or recheck_due(job, interval)))
+
+
 
 def seed_legacy_tasks(background):
     """Convert legacy failed manifests to replayable tasks under the archive lock."""
@@ -552,7 +562,15 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                             row=next(row for row in options if row[1].root==root);rechecks.remove(row)
                             _,background,path=row
                             with profile.stage('recheck_submit', path):
-                                job=json.loads(path.read_text())
+                                try:
+                                    job=json.loads(path.read_text())
+                                except FileNotFoundError:
+                                    continue
+                                if (not is_due_recheck(job,recheck_interval)
+                                        or job['source']!=background.source
+                                        or background.manifest_items.get((job['course'],job['item']['path']))
+                                           != (job['item']['size'],job['item']['sha256'])):
+                                    continue
                                 event=job.get('result',{}).get('event') or job['event']
                                 print('YANDEX RECHECK START: '+str(background.root)+job['item']['path'],flush=True)
                                 background.submit('range',job['item'],job['course'],job['attempt'],event,
@@ -655,7 +673,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         for path, job in tasks:
                             if path in background.futures:
                                 continue
-                            checking=bool(recheck_interval and (job.get('yandex_recheck') and job['state']!='applied' or recheck_due(job,recheck_interval)))
+                            checking=is_due_recheck(job,recheck_interval)
                             if job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or checking or fallback_due(fallback,job)):
                                 if job['source'] != background.source:
                                     raise ValueError('Range task source mismatch')
