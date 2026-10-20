@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import download as d
+import file_hashes
 import storage
 import volume_catalog as catalog
 
@@ -51,6 +52,79 @@ class VolumeCatalogChecks(unittest.TestCase):
                         [dict(item, status='valid', mtime_ns=stat.st_mtime_ns,
                               ctime_ns=stat.st_ctime_ns, local=str(path))])
         return root, item, path
+
+    def cache(self, path, root):
+        body = path.read_bytes()
+        hashes = {name: hashlib.new(name, body).hexdigest() for name in file_hashes.ALGORITHMS}
+        file_hashes.save(path, hashes, path.stat(), root=root)
+        return hashes
+
+    def test_offline_index_matches_content_without_touching_offline_volume(self):
+        archive, item, local = self.archive(self.old, 'Archive 1')
+        catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+        index = catalog.OfflineIndex(self.host, NEW)
+        local.unlink()
+        self.online = {}
+        renamed = dict(item, path='/Another identity/video.mp4')
+        self.assertEqual(index.lookup(renamed), dict(volume_uuid=OLD,
+            local='Archive 1/Course/Lecture.mp4', size=7, sha256=item['sha256']))
+        self.assertIsNone(index.lookup(dict(item, size=8)))
+        self.assertIsNone(catalog.OfflineIndex(self.host, OLD).lookup(item))
+        # Replacing the catalog must invalidate the host-memory lookup.
+        self.online = {OLD: self.old}
+        catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+        self.assertIsNone(index.lookup(item))
+
+    def test_configured_index_rejects_missing_corrupt_and_unsafe_proofs(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(catalog.from_environment())
+            os.environ['YDS_VOLUME_UUID'] = NEW
+            with self.assertRaises(ValueError):
+                catalog.from_environment()
+            os.environ['YDS_VOLUME_CATALOG'] = str(self.host)
+            with self.assertRaises((ValueError, FileNotFoundError)):
+                catalog.from_environment()
+            archive, item, _ = self.archive(self.old, 'Archive 1')
+            catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+            self.assertIsNotNone(catalog.from_environment().lookup(item))
+            saved = catalog.load(self.host)
+            saved['volumes'][OLD]['archives']['Archive 1']['files'][item['path']]['local'] = '../escape'
+            d.write_json(self.host / catalog.CATALOG, dict(payload=saved, sha256=catalog._digest(saved)))
+            with self.assertRaises(ValueError):
+                catalog.from_environment()
+            (self.host / catalog.CATALOG).write_text('corrupt')
+            with self.assertRaises(ValueError):
+                catalog.from_environment()
+
+    def test_snapshot_includes_registry_and_unassociated_import_only_with_current_hash_cache(self):
+        archive, item, _ = self.archive(self.old, 'YandexDisk/Archive 1')
+        extra = archive / 'Course/Extra.mp4'
+        extra.write_bytes(b'extra')
+        hashes = self.cache(extra, archive)
+        extra_item = dict(path='/Original/Extra.mp4', size=5, sha256=hashes['sha256'])
+        d.write_json(archive / '.download/local-copies.json', [dict(extra_item,
+            source='https://disk.yandex.ru/d/other', status='valid', local=str(extra))])
+        imported = self.old / 'YandexDisk/Unassociated.mp4'
+        imported.write_bytes(b'imported')
+        import_hashes = self.cache(imported, self.old / 'YandexDisk')
+        results = self.old / 'YandexDisk/.download/local-imports/session/results.json'
+        results.parent.mkdir(parents=True)
+        d.write_json(results, dict(files=[dict(status='copied', local='Unassociated.mp4',
+            size=8, hashes=import_hashes, source='/offline/original.mp4', metadata_matches=[])]))
+        with patch.object(file_hashes, 'calculate', side_effect=AssertionError('payload read')):
+            catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+        saved = catalog.load(self.host)['volumes'][OLD]['supplementary']
+        registry = saved['YandexDisk/Archive 1/Course/Extra.mp4']
+        self.assertEqual(registry['identities'][0]['path'], '/Original/Extra.mp4')
+        self.assertEqual(registry['identities'][0]['source'], 'https://disk.yandex.ru/d/other')
+        self.assertEqual(saved['YandexDisk/Unassociated.mp4']['identities'], [])
+        self.assertEqual(catalog.OfflineIndex(self.host, NEW).lookup(extra_item)['volume_uuid'], OLD)
+        self.assertEqual(catalog.OfflineIndex(self.host, NEW).lookup(dict(
+            size=8, sha256=import_hashes['sha256']))['local'], 'YandexDisk/Unassociated.mp4')
+        imported.write_bytes(b'changed!')
+        extra.unlink()
+        catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+        self.assertEqual(catalog.load(self.host)['volumes'][OLD]['supplementary'], {})
 
     def test_switch_only_one_connected_disk_keeps_offline_files_in_host_and_new_mirror(self):
         archive, item, local = self.archive(self.old, 'Archive 1')

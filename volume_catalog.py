@@ -51,6 +51,69 @@ def load(directory):
     return payload
 
 
+def _content_key(row):
+    size, sha = row.get('size'), row.get('sha256')
+    if (type(size) is not int or size < 0 or not isinstance(sha, str)
+            or not re.fullmatch(r'[a-fA-F0-9]{64}', sha)):
+        raise ValueError('Invalid catalog file size or SHA-256')
+    return sha.lower(), size
+
+
+class OfflineIndex:
+    """Content proofs from the host snapshot; never access an offline mount."""
+    def __init__(self, state_dir, current_uuid):
+        self.current_uuid = str(uuidlib.UUID(current_uuid))
+        path = Path(state_dir).expanduser()
+        self.state_dir = path.parent if path.name == CATALOG else path
+        self.stamp = None
+        self.files = {}
+        self._refresh()
+
+    def _refresh(self):
+        current = (self.state_dir / CATALOG).stat()
+        stamp = (current.st_dev, current.st_ino, current.st_size,
+                 current.st_mtime_ns, current.st_ctime_ns)
+        if stamp == self.stamp:
+            return
+        saved = load(self.state_dir)
+        if saved is None:
+            raise ValueError('Configured volume catalog is missing')
+        files = {}
+        try:
+            for identity, volume in saved['volumes'].items():
+                rows = [row for archive in volume['archives'].values()
+                        for row in archive['files'].values()]
+                rows.extend(volume.get('supplementary', {}).values())
+                for row in rows:
+                    key = _content_key(row)
+                    if row['status'] != 'verified':
+                        continue
+                    local = row['local']
+                    if (not isinstance(local, str) or not local or Path(local).is_absolute()
+                            or '..' in Path(local).parts or local == '.'):
+                        raise ValueError('Unsafe catalog local path')
+                    if str(uuidlib.UUID(identity)) != self.current_uuid:
+                        files.setdefault(key, dict(volume_uuid=identity, local=local,
+                                                   size=key[1], sha256=key[0]))
+        except (AttributeError, KeyError, TypeError) as error:
+            raise ValueError('Damaged volume catalog file records') from error
+        self.files, self.stamp = files, stamp
+
+    def lookup(self, item):
+        self._refresh()
+        proof = self.files.get(_content_key(item))
+        return dict(proof) if proof is not None else None
+
+
+def from_environment():
+    directory, identity = os.environ.get('YDS_VOLUME_CATALOG'), os.environ.get('YDS_VOLUME_UUID')
+    if directory is None and identity is None:
+        return None
+    if not directory or not identity:
+        raise ValueError('YDS_VOLUME_CATALOG and YDS_VOLUME_UUID must be configured together')
+    return OfflineIndex(directory, identity)
+
+
 def _merge(*catalogs):
     merged = dict(schema=1, volumes={})
     for catalog in catalogs:
@@ -238,6 +301,69 @@ def _catalog_archive(root, archive):
                 files=entries, recovery=_recovery_inventory(root, archive))
 
 
+def _supplementary(root, archives):
+    """Retain imported content only when its existing full hash cache is current."""
+    disk = root / 'YandexDisk'
+    registries = {a / '.download/local-copies.json' for a in archives}
+    registries.update(disk.glob('*/.download/local-copies.json'))
+    records = {}
+    device = root.stat().st_dev
+
+    def include(local, owner, row, identities):
+        path = Path(local)
+        candidate = path if path.is_absolute() else owner / path
+        # Check lexically before resolving, so foreign absolute paths are never probed.
+        if '..' in candidate.parts or not candidate.is_relative_to(root):
+            return
+        candidate = candidate.resolve()
+        if not candidate.is_relative_to(root):
+            return
+        try:
+            current = candidate.stat()
+        except FileNotFoundError:
+            return
+        key = _content_key(row)
+        if (not stat.S_ISREG(current.st_mode) or current.st_dev != device
+                or current.st_size != key[1] or Path(str(candidate) + '.aria2').exists()):
+            return
+        hashes = file_hashes.load(candidate, root=owner) or file_hashes.load(candidate)
+        if not hashes or hashes['sha256'] != key[0]:
+            return
+        local = str(candidate.relative_to(root))
+        record = records.setdefault(local, dict(size=key[1], sha256=key[0], status='verified',
+                                                local=local, identities=[]))
+        for identity in identities:
+            if identity not in record['identities']:
+                record['identities'].append(identity)
+
+    for registry in sorted(registries):
+        if not registry.resolve().is_relative_to(root):
+            raise ValueError('Unsafe local-copies registry')
+        if not registry.exists():
+            continue
+        for row in json.loads(registry.read_text(encoding='utf-8')):
+            if row.get('status') == 'valid' and row.get('local'):
+                identity = {k: row[k] for k in ('source', 'path', 'course', 'course_path', 'sheet') if k in row}
+                include(row['local'], registry.parent.parent, row, [identity] if identity else [])
+    for results in sorted((disk / '.download/local-imports').glob('*/results.json')):
+        if not results.resolve().is_relative_to(root):
+            raise ValueError('Unsafe local-import results')
+        for row in json.loads(results.read_text(encoding='utf-8'))['files']:
+            if row.get('status') not in ('copied', 'already_present') or not row.get('local'):
+                continue
+            proof = dict(size=row['size'], sha256=row['hashes']['sha256'])
+            identities = []
+            for match in row.get('metadata_matches', []):
+                item = match['item']
+                if _content_key(item) != _content_key(proof):
+                    continue
+                identity = dict(item)
+                identity.update({k: match[k] for k in ('source', 'semester') if k in match})
+                identities.append(identity)
+            include(row['local'], disk, proof, identities)
+    return records
+
+
 def snapshot(root, identity, state, *, archives=(), queues=(), label=None):
     """Observe current disk; never reinterpret an offline volume as missing."""
     with _guarded_catalog(root, identity, state) as (root, state, catalog):
@@ -250,7 +376,8 @@ def snapshot(root, identity, state, *, archives=(), queues=(), label=None):
                 current_archives[str(archive.relative_to(root))] = details
         catalog['volumes'][identity] = dict(
             updated_ns=max(time.time_ns(), previous.get('updated_ns', 0) + 1),
-            label=label or previous.get('label', identity), archives=current_archives)
+            label=label or previous.get('label', identity), archives=current_archives,
+            supplementary=_supplementary(root, found))
         return _publish(root, identity, state, catalog)
 
 
@@ -271,6 +398,7 @@ def main(argv=None):
             result = load(args.state_dir) or dict(volumes={})
             for identity, volume in result['volumes'].items():
                 records = [f for a in volume['archives'].values() for f in a['files'].values()]
+                records.extend(volume.get('supplementary', {}).values())
                 recovery = [entry for archive in volume['archives'].values()
                             for entry in archive.get('recovery', {}).values()
                             if entry['status'] == 'retained_unverified']
