@@ -234,7 +234,7 @@ class VolumeCatalogChecks(unittest.TestCase):
         archive, _, _ = self.archive(self.old, 'Archive 1')
         outside=self.root/'outside'
         outside.mkdir()
-        (archive/'corrupted').symlink_to(outside,directory=True)
+        (archive/'corrupted').symlink_to(outside,target_is_directory=True)
         with self.assertRaisesRegex(ValueError,'Unsafe corrupted directory'):
             catalog.snapshot(self.old,OLD,self.host,archives=[archive])
         self.assertFalse((self.host/'volume-catalog.json').exists())
