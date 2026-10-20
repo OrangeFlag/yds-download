@@ -85,9 +85,16 @@ def _guarded_catalog(root, identity, state):
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (state / '.volume-catalog.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        host = load(state)
-        disk = load(root / MIRROR_DIR)
-        yield root, state, _merge(host, disk)
+        catalogs, errors = [], []
+        for directory in (state, root / MIRROR_DIR):
+            try:
+                catalogs.append(load(directory))
+            except ValueError as error:
+                catalogs.append(None)
+                errors.append(error)
+        if not any(catalog is not None for catalog in catalogs) and errors:
+            raise errors[0]  # Never overwrite the last surviving evidence.
+        yield root, state, _merge(*catalogs)
 
 
 def _publish(root, identity, state, catalog):
