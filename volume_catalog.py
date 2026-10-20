@@ -182,7 +182,7 @@ def _catalog_archive(root, archive):
                     or (file_hashes.load(resolved, root=archive) or {}).get('sha256') == row['sha256']):
                 row.update(status='verified', local=str(resolved.relative_to(base)))
                 break
-    return dict(source=source['source'], title=source.get('title', ''), files=entries)
+    return dict(source=source['source'], title=source.get('title', ''), scanned_ns=time.time_ns(), files=entries)
 
 
 def snapshot(root, identity, state, *, archives=(), queues=(), label=None):
