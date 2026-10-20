@@ -148,6 +148,8 @@ def _recovery_inventory(root, archive):
     recovery = {}
     parent = (archive / 'corrupted').resolve()
     device = root.stat().st_dev
+    if not parent.is_relative_to(root):
+        raise ValueError('Unsafe corrupted directory')
     for failure in sorted(parent.glob('**/failed.json')):
         for event in json.loads(failure.read_text(encoding='utf-8')):
             current = event.get('corrupted_path')
