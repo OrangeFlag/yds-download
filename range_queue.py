@@ -157,6 +157,11 @@ class JsonCache:
                     return
                 if summary is not None and (not isinstance(summary, dict) or summary.get('kind') != 'range'):
                     return
+                try:
+                    if Background.stat(directory / name) != stat:
+                        return
+                except FileNotFoundError:
+                    return
                 records[directory / name] = stat, summary
             if len(records) != len(payload['tasks']):
                 return
@@ -167,7 +172,7 @@ class JsonCache:
         self.checkpoint_writes[directory] = time.monotonic()
 
     def _save_tasks(self, directory, stamp, records):
-        # Snapshot creation is best-effort: the canonical task JSONs remain authoritative.
+        # Snapshot is derivative; a failed durable write must not hide disk errors.
         payload = dict(schema=1, device=directory.stat().st_dev, stamp=stamp,
                        tasks=[[path.name, file_stamp, row] for path, (file_stamp, row) in records.items()])
         d.write_json(self._checkpoint_path(directory),
