@@ -534,6 +534,28 @@ class SharedRangeChecks(unittest.TestCase):
                       recheck_interval=1, recheck_files=2, stopping=stopping)
             self.assertIn('/Course/video.mp4', submitted)
 
+    def test_done_verified_recheck_still_replays_before_applied(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state, queue = self._finished_archive_with_cached_range(Path(folder))
+            path = state / 'tasks/00.json'
+            job = json.loads(path.read_text())
+            job.update(state='done', yandex_recheck=True,
+                       result={'event': {'status': 'valid', 'range_recovered_complete': True}})
+            d.write_json(path, job)
+            d.write_json(state / 'local-copies.json', [])
+            stopping = Event()
+            submitted = []
+
+            def submit(background, kind, item, *args, **kwargs):
+                submitted.append((item['path'], kwargs.get('yandex_recheck')))
+
+            with patch.object(q.Background, 'submit', submit), \
+                 patch.object(stopping, 'wait', side_effect=lambda _: stopping.set() or True), \
+                 patch('report.update_report'):
+                q.run([queue], files=1, recheck_interval=1, recheck_files=1, stopping=stopping)
+            self.assertEqual(submitted, [('/Course/video.mp4', True)],
+                             'Unapplied done result must be replayed after a crash')
+
     def test_pending_superseded_recheck_does_not_become_regular_range(self):
         with tempfile.TemporaryDirectory() as folder:
             state, queue = self._finished_archive_with_cached_range(Path(folder))
