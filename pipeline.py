@@ -550,17 +550,73 @@ class Background:
                    '--max-tries=1', f"--connect-timeout={t['connect_timeout']}", f"--timeout={t['timeout']}",
                    f"--summary-interval={t['summary_interval']}", '--enable-color=false', '--console-log-level=warn',
                    '--log=' + str(self.state / 'aria2.log'), '--log-level=info']
+        submitted = set()
+        announced = {}
+        items_by_local = {str(d.target(self.root, item, course)): item for item in pending}
+        log = self.state / 'aria2.log'
+        offset = log.stat().st_size if log.exists() else 0
+        runner = None
+        attempt = previous_attempt + 1
+
+        def submit_completed():
+            nonlocal offset
+            if runner is not None:
+                completions = runner.completed.copy()
+            else:
+                completions = {}
+                if log.exists():
+                    with log.open() as stream:
+                        stream.seek(offset)
+                        while True:
+                            position = stream.tell()
+                            line = stream.readline()
+                            if not line or not line.endswith('\n'):
+                                offset = position
+                                break
+                            if 'Download complete:' in line:
+                                local = line.partition('Download complete:')[2].strip()
+                                if local in items_by_local and Path(local).is_file():
+                                    announced[local] = self.stat(Path(local))
+                completions = announced.copy()
+            ready = []
+            for name, stamp in completions.items():
+                item = items_by_local.get(name)
+                if item is None or item['path'] in submitted:
+                    continue
+                local = Path(name)
+                if (local.is_file() and local.stat().st_size == item['size']
+                        and not Path(name + '.aria2').exists()
+                        and (runner.stamp(local) if runner is not None else self.stat(local)) == stamp):
+                    self.checkpoint(item, course, attempt, 'verifying', persist=False)
+                    ready.append(item)
+            self.flush_checkpoints()
+            for item in ready:
+                self.submit('sha', item, course, attempt, force=True)
+                submitted.add(item['path'])
+
+        def tick():
+            submit_completed()
+            self.on_tick()
+
+        def run_pending(command, **kwargs):
+            # Network retries must not reopen files already handed to SHA/recovery.
+            remaining = [line for item, line in zip(pending, lines) if item['path'] not in submitted]
+            if not remaining:
+                return 0
+            (self.state / 'queue.txt').write_text(''.join(remaining))
+            code = (runner.run if runner is not None else _transfer_process_once)(command, **kwargs)
+            submit_completed()
+            return code
+
         self.download_active.set()
         self.transferring = course
         try:
-            extra={}
             if self.download_budgets:
                 from adaptive_downloads import AriaBatch
                 runner=AriaBatch(self.download_budgets['yandex'],self.stopping,
                                  {str(d.target(self.root,item,course)):progress[item['path']] for item in pending},
                                  rpc_timeout=t['rpc_timeout'],rpc_status_retries=t['rpc_status_retries'],metrics=self.metrics)
-                extra['runner']=runner.run
-            code = transfer_process(command, env=d.ENV, on_tick=self.on_tick, stopping=self.stopping, **extra)
+            code = transfer_process(command, env=d.ENV, on_tick=tick, stopping=self.stopping, runner=run_pending)
         finally:
             self.download_active.clear()
             self.transferring = None
@@ -568,11 +624,11 @@ class Background:
             raise OSError(errno.ENOSPC, 'aria2 reports insufficient disk space')
         if code in (130, -2) or self.stopping.is_set():
             raise InterruptedError('Download interrupted')
-        attempt = previous_attempt + 1
-        for item in pending:
+        remaining = [item for item in pending if item['path'] not in submitted]
+        for item in remaining:
             self.checkpoint(item, course, attempt, 'verifying', persist=False)
         self.flush_checkpoints()
-        for item in pending:
+        for item in remaining:
             self.submit('sha', item, course, attempt, force=True)
         self.poll()
 

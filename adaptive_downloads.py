@@ -23,13 +23,14 @@ _groups_lock=Lock()
 
 def get_budgets(config):
     if not config:return None
-    key=(str(Path(config['directory']).expanduser().resolve()),config['minimum'],config['maximum'])
+    key=(str(Path(config['directory']).expanduser().resolve()),config['minimum'],config['maximum'],
+         os.environ.get('YDS_DOWNLOAD_PRIORITY')=='personal')
     with _groups_lock:
         if key not in _groups:
             group={}
             try:
                 for source in ('yandex','nextcloud','opencloud','s3'):
-                    group[source]=SharedUploadBudget(key[0],source,key[1],key[2],probe_zero=True)
+                    group[source]=SharedUploadBudget(key[0],source,key[1],key[2],probe_zero=True,priority=key[3])
             except BaseException:
                 for budget in group.values():budget.close()
                 raise
@@ -228,6 +229,9 @@ class AriaBatch:
                         if self.first_error is not None:raise self.first_error
                         if self.stopping.is_set():return 130
                         raise
+                if done:
+                    on_tick()
+                    next_tick=time.monotonic()+5
             finished=True
             return 9 if 9 in codes else 1 if any(codes) else 0
         finally:
