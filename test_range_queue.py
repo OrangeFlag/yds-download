@@ -499,6 +499,37 @@ class SharedRangeChecks(unittest.TestCase):
             d.write_json(state / 'tasks' / f'zz-{index:02}.json', dict(kind='sha'))
         return state, queue
 
+    def test_recheck_starts_before_discovering_later_archive(self):
+        with tempfile.TemporaryDirectory() as folder:
+            first, personal = self._finished_archive_with_cached_range(Path(folder) / 'personal')
+            second, courses = self._finished_archive_with_cached_range(Path(folder) / 'courses')
+            path = first / 'tasks/00.json'
+            job = json.loads(path.read_text())
+            job.update(state='applied', result={'event': {'status': 'missing'}})
+            d.write_json(path, job)
+            d.write_json(first / 'local-copies.json', [])
+            stopping = Event()
+            submitted = []
+            original_tasks = q.JsonCache.tasks
+
+            def tasks(cache, directory, limit=None):
+                if directory == second / 'tasks':
+                    self.assertEqual(submitted, ['/Course/video.mp4'],
+                                     'Recheck waited for unrelated archive discovery')
+                    stopping.set()
+                return original_tasks(cache, directory, limit)
+
+            def submit(background, kind, item, *args, **kwargs):
+                if kwargs.get('yandex_recheck'):
+                    submitted.append(item['path'])
+
+            with patch.object(q.JsonCache, 'tasks', tasks), \
+                 patch.object(q.Background, 'submit', submit), \
+                 patch('report.update_report'):
+                q.run([personal, courses], files=2, secondary_slots=1,
+                      recheck_interval=1, recheck_files=2, stopping=stopping)
+            self.assertIn('/Course/video.mp4', submitted)
+
     def test_incomplete_task_discovery_does_not_wait_two_seconds_between_batches(self):
         with tempfile.TemporaryDirectory() as folder:
             _,queue=self._finished_archive_with_cached_range(Path(folder))
