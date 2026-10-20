@@ -51,6 +51,16 @@ class FileHashChecks(unittest.TestCase):
         self.assertEqual(proof['local'], 'Course/video.mp4')
         self.assertEqual(proof['stat'], hashes.fingerprint(self.video))
 
+    def test_sha_large_file_does_not_probe_mount_for_every_megabyte(self):
+        self.video.write_bytes(b'v' * (12 * 1024 * 1024))
+        original = hashes.storage.check
+        with patch.object(hashes.storage, 'check', wraps=original) as check:
+            result = hashes.calculate(self.video, root=self.root)
+        self.assertEqual(result['sha256'], hashlib.sha256(self.video.read_bytes()).hexdigest())
+        checks = sum(call.args[0] == self.video for call in check.call_args_list)
+        self.assertLessEqual(checks, 5, 'Repeated statvfs and mount checks cause needless metadata I/O')
+        self.assertEqual(hashes.load(self.video, root=self.root), result)
+
     def test_fresh_process_load_uses_persistent_metadata_without_reading_video(self):
         hashes.calculate(self.video)
         script = '''import json, sys

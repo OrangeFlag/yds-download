@@ -297,6 +297,66 @@ class SharedRangeChecks(unittest.TestCase):
             d.write_json(path, {'value': 2})
             self.assertEqual(cache.read(path), {'value': 2})
 
+    def test_task_cache_uses_one_stat_without_extra_exists_probes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder) / 'tasks'
+            directory.mkdir()
+            state = Path(folder) / 'state.json'
+            d.write_json(state, {'value': 1})
+            task = directory / 'a.json'
+            d.write_json(task, dict(kind='range', state='pending', course='Course',
+                                    source='test', attempt=0,
+                                    item=dict(path='/Course/a', size=1, sha256='a'*64)))
+            cache = q.JsonCache()
+            original = Path.exists
+            def exists(path):
+                if path in (state, directory):
+                    raise AssertionError('Redundant exists() before stat()')
+                return original(path)
+            with patch.object(Path, 'exists', exists):
+                self.assertEqual(cache.read(state), {'value': 1})
+                self.assertEqual(cache.read(state), {'value': 1})
+                self.assertEqual(len(cache.tasks(directory)), 1)
+                self.assertTrue(cache.tasks_complete(directory))
+                state.unlink()
+                self.assertIsNone(cache.read(state))
+            self.assertEqual(cache.json_reads, 1)
+
+    def test_current_range_task_ignores_other_kinds_without_range_item(self):
+        from types import SimpleNamespace
+        background = SimpleNamespace(source='test', manifest_items={})
+        self.assertFalse(q.current_range_task(background, {'kind': 'sha', 'source': 'test'}))
+
+    def test_regular_range_skips_task_superseded_after_discovery(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state, queue = self._finished_archive_with_cached_range(Path(folder))
+            task = state / 'tasks/00.json'
+            d.write_json(state / 'local-copies.json', [])
+            submitted = []
+            changed = []
+            stopping = Event()
+            original_tasks = q.JsonCache.tasks
+
+            def tasks(cache, directory, limit=None):
+                result = original_tasks(cache, directory, limit)
+                if directory == state / 'tasks' and not changed:
+                    job = json.loads(task.read_text())
+                    job['superseded_by_manifest'] = True
+                    d.write_json(task, job)
+                    changed.append(True)
+                return result
+
+            def submit(background, kind, item, *args, **kwargs):
+                submitted.append(item['path'])
+
+            with patch.object(q.JsonCache, 'tasks', tasks), \
+                 patch.object(q.Background, 'submit', submit), \
+                 patch.object(stopping, 'wait', side_effect=lambda _: stopping.set() or True), \
+                 patch('report.update_report'):
+                q.run([queue], stopping=stopping)
+            self.assertTrue(changed)
+            self.assertEqual(submitted, [], 'Stale regular task was submitted after supersession')
+
     def test_task_cache_retains_only_compact_summaries_and_reloads_changed_tasks(self):
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder) / 'tasks'

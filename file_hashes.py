@@ -150,18 +150,20 @@ def calculate(path, stopping=None, root=None, progress=None, expected_sha256=Non
         before = fingerprint(path)
         digests = {name: hashlib.new(name) for name in ALGORITHMS}
         amount = 0
-        last_progress = time.monotonic()
+        last_check = last_progress = time.monotonic()
         with path.open('rb') as stream:
             if _stamp(os.fstat(stream.fileno())) != before:
                 raise OSError('File changed during SHA verification')
             while chunk := stream.read(1024 * 1024):
                 if stopping is not None and stopping.is_set():
                     raise InterruptedError('SHA interrupted')
-                storage.check(path)
                 for digest in digests.values():
                     digest.update(chunk)
                 amount += len(chunk)
                 now = time.monotonic()
+                if now - last_check >= 1:
+                    storage.check(path)
+                    last_check = now
                 if progress is not None and now - last_progress >= 30:
                     progress(amount, before[2])
                     last_progress = now
