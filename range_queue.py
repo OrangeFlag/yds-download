@@ -483,6 +483,15 @@ def is_due_recheck(job, interval):
 
 
 
+def current_range_task(background, job):
+    item = job['item']
+    return (job['kind'] == 'range' and job['source'] == background.source
+            and not any(job.get('superseded_by_' + reason)
+                        for reason in ('manifest', 'nextcloud', 'local_copy'))
+            and background.manifest_items.get((job['course'], item['path']))
+                == (item['size'], item['sha256']))
+
+
 def seed_legacy_tasks(background):
     """Convert legacy failed manifests to replayable tasks under the archive lock."""
     root,state=background.root,background.state
@@ -596,7 +605,12 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                     break
                         _, background, path = eligible.pop(chosen)
                         with profile.stage('submit', path):
-                            job = json.loads(path.read_text())
+                            try:
+                                job = json.loads(path.read_text())
+                            except FileNotFoundError:
+                                continue
+                            if not current_range_task(background, job):
+                                continue
                             profile.milestone('first_range_submit')
                             print('RANGE START: ' + str(background.root) + job['item']['path'], flush=True)
                             background.submit('range', job['item'], job['course'], job['attempt'], job['event'],
@@ -629,10 +643,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                     job=json.loads(path.read_text())
                                 except FileNotFoundError:
                                     continue
-                                if (not is_due_recheck(job,recheck_interval)
-                                        or job['source']!=background.source
-                                        or background.manifest_items.get((job['course'],job['item']['path']))
-                                           != (job['item']['size'],job['item']['sha256'])):
+                                if not is_due_recheck(job,recheck_interval) or not current_range_task(background,job):
                                     continue
                                 event=job.get('result',{}).get('event') or job['event']
                                 print('YANDEX RECHECK START: '+str(background.root)+job['item']['path'],flush=True)
