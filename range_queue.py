@@ -137,7 +137,7 @@ class JsonCache:
         self.scans = {}
         self.checkpoint_writes = {}
         self.checkpoint_loads = 0
-        self.task_reads = self.json_reads = 0
+        self.task_reads = self.json_reads = self.task_stats = 0
 
     def _checkpoint_path(self, directory):
         return directory.parent / 'tasks.index.json'
@@ -161,6 +161,7 @@ class JsonCache:
                 if summary is not None and (not isinstance(summary, dict) or summary.get('kind') != 'range'):
                     return
                 try:
+                    self.task_stats += 1
                     if Background.stat(directory / name) != stat:
                         return
                 except FileNotFoundError:
@@ -204,7 +205,7 @@ class JsonCache:
     def tasks(self, directory, limit=None):
         if self.profile is None:
             return self._tasks(directory, limit)
-        reads, loads = self.task_reads, self.checkpoint_loads
+        reads, loads, stats = self.task_reads, self.checkpoint_loads, self.task_stats
         with self.profile.stage('tasks', directory) as counts:
             try:
                 result = self._tasks(directory, limit)
@@ -212,6 +213,7 @@ class JsonCache:
                 return result
             finally:
                 counts['json_reads'] = self.task_reads - reads
+                counts['task_stats'] = self.task_stats - stats
                 counts['checkpoint_loads'] = self.checkpoint_loads - loads
 
     def _paths(self, directory):
@@ -250,6 +252,7 @@ class JsonCache:
                 complete = True
                 break
             try:
+                self.task_stats += 1
                 file_stamp = Background.stat(path)
             except FileNotFoundError:
                 continue
@@ -281,6 +284,7 @@ class JsonCache:
                 continue
             if latest != scan[0]:
                 try:
+                    self.task_stats += 1
                     if Background.stat(path) != file_stamp:
                         continue
                 except FileNotFoundError:
@@ -510,6 +514,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
         cache.profile = profile
         try:
             while not stopping.is_set():
+                pass_started = time.monotonic()
                 for queue in queues:
                     storage.check(queue)
                 # Poll applies every result under the archive's exclusive download lock.
@@ -742,6 +747,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                 metrics.gauge('archives_owned',len(roots))
                 metrics.gauge('range_task_discovery_pending_archives',len(cache.scans))
                 metrics.gauge('range_task_discovery_reads',cache.task_reads)
+                metrics.add(range_discovery_passes=1,
+                            range_discovery_pass_wall_seconds=time.monotonic()-pass_started)
                 profile.milestone('first_pass')
                 # Finish bounded cold discovery promptly without spinning in steady state.
                 stopping.wait(.25 if cache.scans else 2)
