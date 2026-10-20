@@ -77,6 +77,141 @@ class S3Checks(unittest.TestCase):
     def cloud(self):
         return cloud_fallback.CloudFallback(self.root, None, Event(), s3=self.config)
 
+    def uploader(self):
+        import opencloud
+        from test_opencloud import Server as UploadServer
+        local = d.target(self.root, self.item, 'Course')
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_bytes(self.body)
+        d.append_events(self.state/'events.jsonl', [dict(self.item, status='valid',
+            mtime_ns=local.stat().st_mtime_ns, local=str(local))])
+        server = UploadServer(); server.size = len(self.body)
+        uploader = opencloud.Uploader(server, Event(), s3_existing=s3.S3Index(self.config, Event()))
+        return uploader, server, local
+
+    def test_opencloud_skips_renamed_s3_original_without_reading_bodies(self):
+        uploader, server, local = self.uploader()
+        with patch('file_hashes.calculate', side_effect=AssertionError('Unnecessary hash')):
+            self.assertEqual(uploader.run_once([self.root], upload=True), 0)
+        self.assertFalse(server.calls)
+        self.assertEqual((self.server.lists, self.server.heads, self.server.gets), (1, 1, 0))
+
+    def test_opencloud_uses_cached_payload_hashes_to_skip_renamed_s3_copy(self):
+        import file_hashes
+        self.item.pop('md5'); d.write_json(self.state/'01-manifest.json', [self.item])
+        uploader, server, local = self.uploader()
+        file_hashes.calculate(local, Event(), root=self.root)
+        with patch('file_hashes.calculate', side_effect=AssertionError('Hash cache ignored')), \
+                patch.object(d, 'api', side_effect=AssertionError('Original hash cache should suffice')):
+            self.assertEqual(uploader.run_once([self.root], upload=True), 0)
+        self.assertFalse(server.calls)
+        self.assertEqual(self.server.gets, 0)
+
+    def test_opencloud_does_not_skip_a_conflicting_s3_hash_with_same_name_and_size(self):
+        self.server.key = 'Other/001 - Lecture.mp4'
+        self.server.body = b'x'*len(self.body)
+        uploader, server, local = self.uploader()
+        self.assertEqual(uploader.run_once([self.root], upload=True), 0)
+        self.assertEqual(bytes(server.payload), self.body)
+        self.assertEqual(self.server.gets, 0)
+
+    def test_opencloud_resolves_s3_md5_before_trusting_name_and_size(self):
+        self.item.pop('md5'); d.write_json(self.state/'01-manifest.json', [self.item])
+        self.server.key = 'Other/001 - Lecture.mp4'
+        self.server.body = b'x'*len(self.body)
+        uploader, server, local = self.uploader()
+        self.assertEqual(uploader.run_once([self.root], upload=True), 0)
+        self.assertEqual(bytes(server.payload), self.body)
+        self.assertEqual(self.server.gets, 0)
+
+    def test_opencloud_skips_by_name_and_size_only_when_s3_has_no_hash(self):
+        self.server.key = 'Other/001 - Lecture.mp4'
+        head = self.server.head_object
+        self.server.head_object = lambda **kwargs: dict(head(**kwargs), Metadata={})
+        uploader, server, local = self.uploader()
+        with patch('file_hashes.calculate', side_effect=AssertionError('Unnecessary hash')):
+            self.assertEqual(uploader.run_once([self.root], upload=True), 0)
+        self.assertFalse(server.calls)
+        self.assertEqual(self.server.gets, 0)
+
+    def test_opencloud_does_not_skip_a_different_lecture_number_without_hashes(self):
+        self.item['path'] = '/Course/Lecture 10.mp4'
+        d.write_json(self.state/'01-manifest.json', [self.item])
+        self.server.key = 'Other/001 - Lecture 11.mp4'
+        head = self.server.head_object
+        self.server.head_object = lambda **kwargs: dict(head(**kwargs), Metadata={})
+        uploader, server, local = self.uploader()
+        self.assertEqual(uploader.run_once([self.root], upload=True), 0)
+        self.assertEqual(bytes(server.payload), self.body)
+
+    def test_s3_original_md5_suppresses_partial_and_is_cached_without_original_body(self):
+        self.item.pop('md5'); d.write_json(self.state/'01-manifest.json', [self.item])
+        uploader, server, local = self.uploader()
+        job = list(uploader.jobs([self.root])[0])
+        local.write_bytes(b'partial-copy')
+        uploader.job_stamps.clear()
+        job[5] = 'partial'; job[6] = local.stat().st_size
+        job[7] = 71.43; job[10] = local.stat().st_mtime_ns
+        metadata = dict(self.item, md5=hashlib.md5(self.body).hexdigest())
+        with patch.object(uploader, 'jobs', return_value=[tuple(job)]), patch.object(d, 'api', return_value=metadata) as api:
+            self.assertEqual(uploader.run_once([self.root], upload=True), 0)
+            self.assertEqual(api.call_count, 1)
+        with patch.object(d, 'api', side_effect=AssertionError('Source MD5 cache ignored')):
+            self.assertTrue(uploader.original_exists(dict(self.item), self.root, self.data['source']))
+        self.assertFalse(server.calls)
+        self.assertEqual(self.server.gets, 0)
+
+    def test_s3_original_md5_lookup_failure_defers_partial_without_upload(self):
+        self.item.pop('md5'); d.write_json(self.state/'01-manifest.json', [self.item])
+        uploader, server, local = self.uploader()
+        job = list(uploader.jobs([self.root])[0]); local.write_bytes(b'partial-copy')
+        uploader.job_stamps.clear()
+        job[5] = 'partial'; job[6] = local.stat().st_size
+        job[7] = 71.43; job[10] = local.stat().st_mtime_ns
+        with patch.object(uploader, 'jobs', return_value=[tuple(job)]), patch.object(d, 'api', side_effect=TimeoutError('metadata offline')):
+            self.assertEqual(uploader.run_once([self.root], upload=True), 1)
+        self.assertFalse(server.calls)
+        self.assertEqual(self.server.gets, 0)
+
+    def test_conflicting_s3_sha_does_not_require_yandex_md5_lookup(self):
+        self.item.pop('md5'); d.write_json(self.state/'01-manifest.json', [self.item])
+        head = self.server.head_object
+        self.server.head_object = lambda **kwargs: dict(head(**kwargs), Metadata={'sha256':'0'*64, 'md5':'1'*32})
+        uploader, server, local = self.uploader()
+        uploader.index = []
+        with patch.object(d, 'api', side_effect=TimeoutError('metadata offline')) as api:
+            self.assertFalse(uploader.original_exists(dict(self.item), self.root, self.data['source']))
+            self.assertEqual(uploader.run_once([self.root], upload=True), 0)
+            self.assertEqual(api.call_count, 0)
+        self.assertEqual(bytes(server.payload), self.body)
+        self.assertEqual(self.server.gets, 0)
+
+    def test_lost_original_session_uses_known_payload_md5_without_source_lookup(self):
+        import opencloud
+        self.item.pop('md5'); d.write_json(self.state/'01-manifest.json', [self.item])
+        uploader, server, local = self.uploader(); uploader.index = []
+        job = uploader.jobs([self.root])[0]
+        sha1 = hashlib.sha1(self.body).hexdigest()
+        row = dict(path=self.item['path'], target='ingest/Walterit/2023-fall/Course/001 - Lecture.mp4',
+                   payload_sha256=self.item['sha256'], payload_md5=hashlib.md5(self.body).hexdigest(),
+                   size=len(self.body), state='pending', sent_bytes=7, session_url='https://cloud.example/lost')
+        with patch.object(uploader, 'confirm_publication', side_effect=opencloud.PublicationPending()), \
+                patch.object(d, 'api', side_effect=AssertionError('Known original payload hashes should suffice')):
+            self.assertIsNone(uploader.recover_session(job, row, 'ingest/stage', sha1, job[10], True))
+        self.assertEqual(row['state'], 'existing')
+        self.assertFalse(server.calls)
+        self.assertEqual(self.server.gets, 0)
+
+    def test_opencloud_defers_upload_when_s3_refresh_fails_despite_cached_listing(self):
+        uploader, server, local = self.uploader()
+        self.server.body = b'x'*len(self.body)
+        self.assertFalse(uploader.s3_exists(self.item))
+        uploader.s3_existing.catalog['expires'] = 0
+        self.server.fail_listing = True
+        self.assertEqual(uploader.run_once([self.root], upload=True), 1)
+        self.assertFalse(server.calls)
+        self.assertEqual(self.server.gets, 0)
+
     def test_recovers_renamed_original_by_md5_and_does_not_download_twice(self):
         cloud = self.cloud()
         self.assertEqual(cloud.recover_all(self.item, self.event)['status'], 'valid')

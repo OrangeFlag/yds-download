@@ -80,16 +80,21 @@ def hashes(row):
         r'\b(SHA256|SHA1|MD5):([a-fA-F0-9]+)', ' '.join(row.get('checksums',[])),re.I)}
 
 
+def upload_name(path):
+    return nextcloud.normalized(re.sub(r'^\d+\s*-\s*','',PurePosixPath(path).name))
+
+
 class Uploader(nextcloud.Sync):
     ledger_name='opencloud-uploads'
 
-    def __init__(self, client, stopping, chunk_size=10_000_000, retries=2, transfers=1):
+    def __init__(self, client, stopping, chunk_size=10_000_000, retries=2, transfers=1, s3_existing=None):
         super().__init__(None,None,stopping,nickname=client.nickname,transfers=transfers,share=client)
         if not client.nickname or client.nickname in ('.','..') or any(c in client.nickname for c in '/\\'):
             raise ValueError('Invalid OpenCloud folder name')
         if chunk_size<1 or retries<0:
             raise ValueError('Expected positive chunk size and non-negative retries')
         self.chunk_size,self.retries=chunk_size,retries
+        self.s3_existing=s3_existing
         self.folder='ingest/'+client.nickname
         self.index=None
         self._lookup_cache=None
@@ -248,8 +253,7 @@ class Uploader(nextcloud.Sync):
                 if 'md5' in parsed:
                     md5_sizes.add(row['size'])
                 if not parsed:
-                    name=re.sub(r'^\d+\s*-\s*','',PurePosixPath(row['path']).name)
-                    unnamed.add((row['size'],nextcloud.normalized(name)))
+                    unnamed.add((row['size'],upload_name(row['path'])))
             result=(checksums,unnamed,md5_sizes)
             self._lookup_cache=(index,size,generation,result)
             return result
@@ -261,10 +265,22 @@ class Uploader(nextcloud.Sync):
 
     def name_exists(self, name, size):
         _,unnamed,_=self._remote_lookup()
-        name=re.sub(r'^\d+\s*-\s*','',PurePosixPath(name).name)
-        return (size,nextcloud.normalized(name)) in unnamed
+        return (size,upload_name(name)) in unnamed
 
-    def original_exists(self, item, root=None, source=None, strict=False):
+    def s3_candidates(self, item):
+        if self.s3_existing is None:return []
+        matches=self.s3_existing.candidates({},item,include_unmatched=True)
+        error=self.s3_existing.catalog.get('error')
+        if error is not None:raise error.with_traceback(None)
+        return matches
+
+    def s3_exists(self, item):
+        matched=any(row["match_rank"]==0 or not hashes(row) and upload_name(row["path"])==upload_name(item["path"])
+                    for row in self.s3_candidates(item))
+        if matched:print("OPENCLOUD EXISTS IN S3: "+item["path"],flush=True)
+        return matched
+
+    def original_exists(self, item, root=None, source=None, strict=False, resolve_md5=True):
         if self.exists(item['sha256'],item.get('sha1')):return True
         md5=item.get('md5')
         path=None
@@ -279,25 +295,29 @@ class Uploader(nextcloud.Sync):
             item['md5']=md5.lower()
         if md5 and md5.lower() in checksums['md5']:return True
         if self.name_exists(item['path'],item['size']):return True
-        if not checksums['md5']:return False
-        if not md5 and path is not None and item['size'] in md5_sizes:
+        if self.s3_exists(item):return True
+        s3_md5=resolve_md5 and not md5 and any('md5' in (checks:=hashes(row))
+            and not any(checks.get(kind) and item.get(kind) for kind in ('sha256','sha1'))
+            for row in self.s3_candidates(item))
+        if not checksums['md5'] and not s3_md5:return False
+        if resolve_md5 and not md5 and path is not None and (item['size'] in md5_sizes or s3_md5):
             try:
                 metadata=d.api(source,item['path'],stopping=self.stopping)
                 if (metadata.get('size'),metadata.get('sha256'))==(item['size'],item['sha256']):
                     md5=metadata.get('md5')
-                elif strict:
+                elif strict or s3_md5:
                     raise ValueError('OpenCloud source metadata identity changed; session retained')
                 if md5 and re.fullmatch('[0-9a-fA-F]{32}',md5):
                     path.parent.mkdir(mode=0o700,exist_ok=True)
                     d.write_json(path,dict(identity,md5=md5.lower()))
-                elif strict:
+                elif strict or s3_md5:
                     raise ValueError('OpenCloud source metadata lacks a valid MD5; session retained')
             except (OSError,http.client.HTTPException,ValueError) as error:
-                if strict or isinstance(error,InterruptedError) or storage.disk_error(error):raise
+                if strict or s3_md5 or isinstance(error,InterruptedError) or storage.disk_error(error):raise
                 print(f'OPENCLOUD METADATA WARNING: {item["path"]}; {type(error).__name__}; HTTP={getattr(error,"code",None)}',flush=True)
         if md5 and re.fullmatch('[0-9a-fA-F]{32}',md5):
             item['md5']=md5.lower()
-            return md5.lower() in checksums['md5']
+            return md5.lower() in checksums['md5'] or self.s3_exists(item)
         return False
 
     def confirm_publication(self, row, stage, sha1, wait=True):
@@ -355,7 +375,9 @@ class Uploader(nextcloud.Sync):
         self.refresh_index(observed)
         del observed
         if (self.exists(row['payload_sha256'],sha1,row['payload_md5']) or self.name_exists(row['target'],row['size'])
-                or self.original_exists(job[3],job[1],job[2]['source'],strict=True)):
+                or self.original_exists(job[3],job[1],job[2]['source'],strict=True,resolve_md5=job[5]!='original')
+                or self.s3_exists(dict(path=row['target'],size=row['size'],
+                    sha256=row['payload_sha256'],sha1=sha1,md5=row['payload_md5']))):
             row.update(state='existing',error_type=None,http_status=None,error_reason=None,error_errno=None)
             self.save_record(job,row)
             print('OPENCLOUD EXISTS AFTER SESSION LOSS: '+row['path'],flush=True)
@@ -389,6 +411,12 @@ class Uploader(nextcloud.Sync):
         if not upload:
             for job in jobs[:limit or 10]:print(f'OPENCLOUD CANDIDATE: {job[5]}; {job[6]} bytes; {job[3]["path"]}',flush=True)
             return 0
+        if self.s3_existing is not None and jobs:
+            try:self.s3_exists(jobs[0][3])
+            except (OSError,ValueError) as error:
+                if isinstance(error,InterruptedError) or storage.disk_error(error):raise
+                print(f'OPENCLOUD S3 CHECK DEFERRED: {type(error).__name__}; HTTP={getattr(error,"code",None)}',flush=True)
+                return 1
         if isinstance(self.share,Client) and self.share.base is None:self.share.discover()
         if self.index is None:self.index=self.scan()
         jobs.sort(key=lambda job:not bool(self.record(job).get('session_url')))
@@ -411,6 +439,8 @@ class Uploader(nextcloud.Sync):
                         except (OSError,http.client.HTTPException,RuntimeError,ValueError) as error:
                             if storage.disk_error(error):raise
                             errors+=1
+                            if self.s3_existing is not None and self.s3_existing.catalog.get('error') is not None:
+                                pending=iter(())
                             print(f'OPENCLOUD ERROR: {job[3]["path"]}; {type(error).__name__}; HTTP={getattr(error,"code",None)}',flush=True)
             except BaseException:
                 self.stopping.set()
@@ -431,7 +461,8 @@ class Uploader(nextcloud.Sync):
         suffix=(f' (partially available {percent:.2f}%)' if variant=='partial' else ' (CamRip, completeness unverified)' if variant=='camrip' else '')
         name=d.local_path(Path('/'),f'/{ordinal:03} - {relative.stem}{suffix}{local.suffix}').name
         target=self.folder+'/'+str(relative.with_name(name))
-        original_exists=self.original_exists(item,root,data['source'])
+        # An original payload's hashes are checked below; source lookup is needed only for other variants.
+        original_exists=self.original_exists(item,root,data['source'],resolve_md5=variant!='original')
         if original_exists or self.name_exists(name,size):
             if row:
                 row.update(state='existing',error_type=None,http_status=None,error_reason=None,error_errno=None)
@@ -465,7 +496,7 @@ class Uploader(nextcloud.Sync):
         row=row or dict(source=data['source'],path=item['path'],variant=variant,target=target,
                         payload_sha256=actual,size=size,sent_bytes=0,state='pending')
         row.update(payload_md5=md5,payload_sha1=sha1,local_fingerprint=list(fingerprint))
-        if self.exists(actual,sha1,md5):
+        if self.exists(actual,sha1,md5) or self.s3_exists(dict(path=name,size=size,sha256=actual,sha1=sha1,md5=md5)):
             row.update(state='existing',error_type=None,http_status=None,error_reason=None,error_errno=None)
             self.save_record(job,row)
             print('OPENCLOUD EXISTS: '+item['path'],flush=True);return False
@@ -560,6 +591,9 @@ def main():
     parser.add_argument('--queue',type=Path)
     parser.add_argument('--destination',type=Path,action='append',default=[],help='Course archive; repeat to add archives outside queue')
     parser.add_argument('--server',required=True)
+    parser.add_argument('--s3-existing',help='S3 origin whose existing videos suppress uploads to OpenCloud')
+    parser.add_argument('--s3-bucket')
+    parser.add_argument('--s3-key-file',type=Path)
     parser.add_argument('--username',required=True)
     parser.add_argument('--password-file',type=Path,required=True,help='App Token or enabled Basic Auth password; never passed in argv')
     parser.add_argument('--upload',action='store_true',help='Actually upload; default only lists local candidates')
@@ -576,6 +610,9 @@ def main():
             or args.chunk_size<1 or args.retries<0 or args.transfers<1 or not math.isfinite(args.timeout) or args.timeout<=0
             or args.poll_interval is not None and (not args.upload or not math.isfinite(args.poll_interval) or args.poll_interval<=0)):
         parser.error('Specify archives and positive limit/chunk-size/timeout, non-negative retries')
+    import s3_fallback
+    try:s3_config=s3_fallback.configuration(args.s3_existing,args.s3_bucket,args.s3_key_file)
+    except ValueError as error:parser.error(str(error))
     roots=[Path(x['destination']).resolve() for x in storage.read_queue(args.queue)['archives'] if x.get('enabled',True)] if args.queue else []
     roots=list(dict.fromkeys(roots+[p.resolve() for p in args.destination]))
     if not roots:parser.error('No selected archives')
@@ -590,7 +627,8 @@ def main():
         client=Client(args.server,args.username,args.password_file.expanduser().read_text().rstrip('\r\n'),args.timeout)
         if args.upload:client.discover()
         else:client.base=client.server+'/dav/spaces/not-connected/'
-        uploader=Uploader(client,stopping,args.chunk_size,args.retries,args.transfers)
+        s3_index=s3_fallback.S3Index(s3_config,stopping) if s3_config else None
+        uploader=Uploader(client,stopping,args.chunk_size,args.retries,args.transfers,s3_existing=s3_index)
         if args.upload_budget:
             uploader.upload_budget=resources.enter_context(nextcloud.SharedUploadBudget(
                 args.upload_budget,'opencloud',args.min_transfers,args.transfers))

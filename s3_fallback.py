@@ -152,7 +152,7 @@ class S3Index:
             self.catalog['cache_disabled'] = True
             print(f'S3 CACHE WARNING: persistence disabled; error={type(error).__name__}; errno={error.errno}', flush=True)
 
-    def candidates(self, data, item):
+    def candidates(self, data, item, *, include_unmatched=False):
         catalog = self.catalog
         with catalog['lock']:
             if time.time() >= catalog['expires'] and time.time() >= catalog['retry_at']:
@@ -211,8 +211,8 @@ class S3Index:
                         matched = checks[common] == item[common].lower()
                     else:
                         matched = similar_upload_name(PurePosixPath(key).name, PurePosixPath(item['path']).name)
-                    if matched:
-                        result.append(dict(row, directory=False, match_rank=0 if common else 1,
+                    if matched or include_unmatched:
+                        result.append(dict(row, directory=False, match_rank=(0 if common else 1) if matched else 2,
                                            checksums=[k.upper()+':'+v for k,v in checks.items()]))
             finally:
                 if changed:
