@@ -366,6 +366,24 @@ class SharedRangeChecks(unittest.TestCase):
             self.assertEqual(result[directory/'new.json']['state'],'pending')
             self.assertNotIn(directory/'1.json',result)
 
+    def test_task_checkpoint_aborts_restore_if_new_task_appears_during_validation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory=Path(folder)/'.download/tasks';directory.mkdir(parents=True)
+            job=dict(kind='range',state='applied',course='Course',source='test',
+                     attempt=1,item=dict(path='/Course/a.mp4',size=7,sha256='a'*64))
+            d.write_json(directory/'a.json',job)
+            q.JsonCache(checkpoint=True).tasks(directory)
+            original=q.Background.stat
+            created=[]
+            def concurrent_update(path):
+                if path == directory/'a.json' and not created:
+                    created.append(True)
+                    d.write_json(directory/'new.json',dict(job,state='pending'))
+                return original(path)
+            with patch.object(q.Background,'stat',side_effect=concurrent_update):
+                tasks=q.JsonCache(checkpoint=True).tasks(directory)
+            self.assertEqual({p.name for p,_ in tasks},{'a.json','new.json'})
+
     def test_task_checkpoint_detects_inplace_edits_even_if_directory_unchanged(self):
         with tempfile.TemporaryDirectory() as folder:
             directory=Path(folder)/'.download/tasks';directory.mkdir(parents=True)
