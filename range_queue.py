@@ -566,8 +566,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                         for path in bg.futures if is_recheck(bg,path))
                 early_dispatched = Counter()
                 def dispatch_rechecks(early=False):
-                    if not rechecks or (early and all(early_dispatched[group]
-                                                      for group in range(len(recheck_limits)))):
+                    if not rechecks or (early and all(early_dispatched[min(row[0], 1)]
+                                                      for row in rechecks)):
                         return
                     rechecks.sort(key=lambda row:recheck_times[row[2]])
                     for group,limit in enumerate(recheck_limits):
