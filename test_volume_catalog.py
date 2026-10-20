@@ -103,6 +103,18 @@ class VolumeCatalogChecks(unittest.TestCase):
             catalog.synchronize(self.old, OLD, self.host)
         self.assertFalse((self.old / '.yds-download').exists())
 
+    def test_queue_snapshot_reads_portable_archive_destinations(self):
+        archive, item, _ = self.archive(self.old, 'Archive 1')
+        queue = self.old / 'queue.json'
+        d.write_json(queue, dict(archives=[dict(destination='Archive 1',
+                                                catalog='Archive 1/.download/catalog.json')]))
+        catalog.snapshot(self.old, OLD, self.host, queues=[queue])
+        self.assertEqual(catalog.load(self.host)['volumes'][OLD]['archives']['Archive 1']
+                         ['files'][item['path']]['status'], 'verified')
+        d.write_json(queue, dict(archives=[dict(destination=str(self.new / 'Archive 2'))]))
+        with self.assertRaisesRegex(ValueError,'Archive is not on this volume'):
+            catalog.snapshot(self.old, OLD, self.host, queues=[queue])
+
     def test_partial_rescan_keeps_other_archives_but_replaces_scanned_proofs(self):
         first, _, _ = self.archive(self.old, 'Archive 1')
         second, _, _ = self.archive(self.old, 'Archive 2')
