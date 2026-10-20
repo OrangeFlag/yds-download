@@ -39,10 +39,7 @@ def sha256_file(path, stopping=None):
     if path.suffix.casefold() in file_hashes.VIDEO:
         return file_hashes.calculate(path, stopping=stopping)['sha256']
     storage.check(path)
-    while not HASH_LOCK.acquire(timeout=0.25):
-        if stopping is not None and stopping.is_set():
-            raise InterruptedError('SHA interrupted')
-    try:
+    with file_hashes.hash_lock(stopping):
         before = path.stat()
         digest = hashlib.sha256()
         with path.open('rb') as stream:
@@ -55,8 +52,6 @@ def sha256_file(path, stopping=None):
         if file_hashes.proof_stat(before) != file_hashes.proof_stat(after):
             raise OSError('File changed during SHA verification')
         return digest.hexdigest()
-    finally:
-        HASH_LOCK.release()
 
 
 def api(source, path='/', offset=0, stopping=None):

@@ -1,4 +1,6 @@
 """Archive-local hashes of stable files, shared by verification and uploads."""
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -13,6 +15,39 @@ import storage
 ALGORITHMS = ('sha256', 'sha1', 'md5')
 VIDEO = {'.mp4', '.mkv', '.mov', '.webm', '.avi', '.m4v', '.ts', '.3gp'}
 HASH_LOCK = Lock()
+
+
+@contextmanager
+def hash_lock(stopping=None):
+    while not HASH_LOCK.acquire(timeout=0.25):
+        if stopping is not None and stopping.is_set():
+            raise InterruptedError('SHA interrupted')
+    stream = None
+    try:
+        if stopping is not None and stopping.is_set():
+            raise InterruptedError('SHA interrupted')
+        name = os.environ.get('YDS_HASH_LOCK')
+        if name:
+            path = Path(name)
+            if not path.is_absolute():
+                raise ValueError('YDS_HASH_LOCK must be an absolute path')
+            stream = path.open('a+b')
+            while True:
+                if stopping is not None and stopping.is_set():
+                    raise InterruptedError('SHA interrupted')
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if stopping is None:
+                        time.sleep(.25)
+                    else:
+                        stopping.wait(.25)
+        yield
+    finally:
+        if stream is not None:
+            stream.close()
+        HASH_LOCK.release()
 
 
 def _stamp(stat):
@@ -141,12 +176,7 @@ def calculate(path, stopping=None, root=None, progress=None, expected_sha256=Non
     """Always read once; only explicit load() calls may reuse saved hashes."""
     path = Path(path)
     storage.check(path)
-    while not HASH_LOCK.acquire(timeout=0.25):
-        if stopping is not None and stopping.is_set():
-            raise InterruptedError('SHA interrupted')
-    try:
-        if stopping is not None and stopping.is_set():
-            raise InterruptedError('SHA interrupted')
+    with hash_lock(stopping):
         before = fingerprint(path)
         digests = {name: hashlib.new(name) for name in ALGORITHMS}
         amount = 0
@@ -181,5 +211,3 @@ def calculate(path, stopping=None, root=None, progress=None, expected_sha256=Non
         if not save(path, hashes, before, root=root) and fingerprint(path) != before:
             raise OSError('File changed during SHA verification')
         return hashes
-    finally:
-        HASH_LOCK.release()
