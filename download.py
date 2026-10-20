@@ -253,12 +253,15 @@ class EventIndex:
     FIELDS = ('path', 'source', 'status', 'local', 'size', 'sha256', 'mtime_ns', 'ctime_ns')
     CHECKPOINT_INTERVAL = 64 * 1024 * 1024
 
-    def __init__(self, path, by_copy=False, repair=True, checkpoint=False):
+    def __init__(self, path, by_copy=False, repair=True, checkpoint=False, checkpoint_read_only=False):
+        if checkpoint_read_only and not checkpoint:
+            raise ValueError('Read-only checkpoint requires checkpoint=True')
         if checkpoint and by_copy:
             raise ValueError('Persistent event checkpoints require path keys')
         self.by_copy, self.repair = by_copy, repair
         self.path = path
         self.checkpoint = path.with_name(path.name + '.index.json') if checkpoint else None
+        self.checkpoint_read_only = checkpoint_read_only
         self.events = {}
         self.inode = self.device = None
         self.offset = self.checkpoint_offset = 0
@@ -343,7 +346,7 @@ class EventIndex:
                     identity = (row['path'], row.get('local')) if self.by_copy else row['path']
                     fields = self.FIELDS + ('state', 'actual_sha256', 'local_stat', 'recovered_stat') if self.by_copy else self.FIELDS
                     self.events[identity] = {key: row[key] for key in fields if key in row}
-            if (self.checkpoint and self.offset
+            if (self.checkpoint and not self.checkpoint_read_only and self.offset
                     and (not self.checkpoint_offset
                          or self.offset - self.checkpoint_offset >= self.CHECKPOINT_INTERVAL)):
                 self._save_checkpoint()
