@@ -58,6 +58,7 @@ class DiscoveryProfile:
         self.metrics = metrics
         self.first_pass = True
         self.milestones = set()
+        self.milestone_lock = Lock()
         self.active = ('idle', '')
 
     def log(self, prefix, row):
@@ -116,14 +117,15 @@ class DiscoveryProfile:
                 counts['json_reads'] = cache.json_reads - reads
 
     def milestone(self, name):
-        if name in self.milestones:
-            return
-        self.milestones.add(name)
-        seconds = max(0, time.monotonic() - PROCESS_STARTED)
-        self.metrics.gauge('range_startup_' + name + '_seconds', seconds)
-        if name == 'first_pass':
-            self.first_pass = False
-        self.log('RANGE STARTUP: ', dict(milestone=name, seconds=seconds))
+        with self.milestone_lock:
+            if name in self.milestones:
+                return
+            self.milestones.add(name)
+            seconds = max(0, time.monotonic() - PROCESS_STARTED)
+            self.metrics.gauge('range_startup_' + name + '_seconds', seconds)
+            if name == 'first_pass':
+                self.first_pass = False
+            self.log('RANGE STARTUP: ', dict(milestone=name, seconds=seconds))
 
 
 class JsonCache:
@@ -652,6 +654,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                             background.event_index = EventIndex(state / 'events.jsonl', checkpoint=True)
                             background.cached_events = profile.events(background.event_index)
                             background.task_cache = cache
+                            background.recheck_request = lambda: profile.milestone('first_recheck_range_request')
                             if legacy:
                                 seed_legacy_tasks(background)
                                 tasks=cache.tasks(state/'tasks', limit=32)
