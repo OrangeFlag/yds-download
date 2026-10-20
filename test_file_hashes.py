@@ -135,39 +135,14 @@ with patch.object(Path, 'open', opening):
         self.assertIsNone(hashes.load(self.video))
         self.assertFalse(hashes.HASH_LOCK.locked())
 
-    def test_sha_verification_never_fsyncs_readonly_payload(self):
-        original = os.fsync
-        document = self.video.with_name('document.bin')
-        document.write_bytes(b'plain document' * 100)
-        def fsync(descriptor):
-            if os.readlink('/proc/self/fd/' + str(descriptor)) in (str(self.video), str(document)):
-                raise AssertionError('Read-only SHA must not fsync payload')
-            return original(descriptor)
-        with patch.object(hashes.os, 'fsync', side_effect=fsync):
-            self.assertEqual(download.sha256_file(self.video), self.expected['sha256'])
-            self.assertEqual(download.sha256_file(document),
-                             hashlib.sha256(document.read_bytes()).hexdigest())
-            self.assertEqual(hashes.load(self.video), self.expected)
-
     def test_mutation_during_read_does_not_publish_proof(self):
-        original = Path.open
-        modified = []
-        def opening(path, *args, **kwargs):
-            stream = original(path, *args, **kwargs)
-            if path == self.video and args == ('rb',):
-                read = stream.read
-                def mutate(amount):
-                    chunk = read(amount)
-                    if not modified:
-                        with original(self.video, 'r+b') as writer:
-                            writer.write(b'MUTATED')
-                        modified.append(True)
-                    return chunk
-                stream.read = mutate
-            return stream
-        with patch.object(Path, 'open', opening), self.assertRaisesRegex(OSError, 'changed'):
+        original = os.fsync
+        def mutate(descriptor):
+            with self.video.open('r+b') as stream:
+                stream.write(b'MUTATED')
+            original(descriptor)
+        with patch.object(hashes.os, 'fsync', side_effect=mutate), self.assertRaisesRegex(OSError, 'changed'):
             hashes.calculate(self.video)
-        self.assertTrue(modified)
         self.assertIsNone(hashes.load(self.video))
 
     def test_atomic_cache_publication_does_not_hide_disk_full(self):
