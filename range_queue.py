@@ -127,12 +127,59 @@ class DiscoveryProfile:
 
 
 class JsonCache:
-    def __init__(self, profile=None):
+    def __init__(self, profile=None, checkpoint=False):
         self.profile = profile
+        self.checkpoint = checkpoint
         self.entries = {}
         self.directories = {}
         self.scans = {}
+        self.checkpoint_writes = {}
+        self.checkpoint_loads = 0
         self.task_reads = self.json_reads = 0
+
+    def _checkpoint_path(self, directory):
+        return directory.parent / 'tasks.index.json'
+
+    def _restore_tasks(self, directory, stamp):
+        checkpoint = self._checkpoint_path(directory)
+        try:
+            saved = json.loads(checkpoint.read_text())
+            payload = saved['payload']
+            if (payload['schema'] != 1 or payload['stamp'] != stamp
+                    or payload['device'] != directory.stat().st_dev
+                    or not isinstance(payload['tasks'], list)
+                    or saved['sha256'] != EventIndex._checksum(payload)):
+                return
+            records = {}
+            for name, stat, summary in payload['tasks']:
+                if not isinstance(name, str) or Path(name).name != name or not name.endswith('.json'):
+                    return
+                if not isinstance(stat, list) or len(stat) != 4:
+                    return
+                if summary is not None and (not isinstance(summary, dict) or summary.get('kind') != 'range'):
+                    return
+                try:
+                    if Background.stat(directory / name) != stat:
+                        return
+                except FileNotFoundError:
+                    return
+                records[directory / name] = stat, summary
+            if len(records) != len(payload['tasks']) or Background.stat(directory) != stamp:
+                return
+        except (FileNotFoundError, ValueError, KeyError, TypeError, UnicodeError):
+            return
+        self.directories[directory] = stamp, records, [
+            (path, summary) for path, (_, summary) in records.items() if summary is not None]
+        self.checkpoint_writes[directory] = time.monotonic()
+        self.checkpoint_loads += 1
+
+    def _save_tasks(self, directory, stamp, records):
+        # Snapshot is derivative; a failed durable write must not hide disk errors.
+        payload = dict(schema=1, device=directory.stat().st_dev, stamp=stamp,
+                       tasks=[[path.name, file_stamp, row] for path, (file_stamp, row) in records.items()])
+        d.write_json(self._checkpoint_path(directory),
+                     dict(payload=payload, sha256=EventIndex._checksum(payload)))
+        self.checkpoint_writes[directory] = time.monotonic()
 
     def read(self, path, default=None):
         if not path.exists():
@@ -155,7 +202,7 @@ class JsonCache:
     def tasks(self, directory, limit=None):
         if self.profile is None:
             return self._tasks(directory, limit)
-        reads = self.task_reads
+        reads, loads = self.task_reads, self.checkpoint_loads
         with self.profile.stage('tasks', directory) as counts:
             try:
                 result = self._tasks(directory, limit)
@@ -163,6 +210,7 @@ class JsonCache:
                 return result
             finally:
                 counts['json_reads'] = self.task_reads - reads
+                counts['checkpoint_loads'] = self.checkpoint_loads - loads
 
     def _paths(self, directory):
         if self.profile is None:
@@ -179,6 +227,9 @@ class JsonCache:
             return []
         stamp = Background.stat(directory)
         saved = self.directories.get(directory)
+        if saved is None and self.checkpoint and directory not in self.scans:
+            self._restore_tasks(directory, stamp)
+            saved = self.directories.get(directory)
         if saved is not None and saved[0] == stamp and directory not in self.scans:
             return saved[2]
         scan = self.scans.get(directory)
@@ -189,7 +240,7 @@ class JsonCache:
         _, paths, current, previous = scan
         reads = 0
         complete = False
-        # shortcut: cold starts still read every task; persist summaries if bounded batches remain too costly.
+        # Read bounded batches only when the task index is missing or stale.
         while limit is None or reads < limit:
             try:
                 path = next(paths)
@@ -240,6 +291,8 @@ class JsonCache:
             else:
                 self.directories[directory] = latest, current, tasks
                 del self.scans[directory]
+                if self.checkpoint and (time.monotonic() - self.checkpoint_writes.get(directory, 0) >= 60):
+                    self._save_tasks(directory, latest, current)
         return tasks
 
 
@@ -423,7 +476,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
     else:
         from request_budget import ProcessRangeBudget
         budget = ProcessRangeBudget(budget_directory, requests, rps)
-    cache = JsonCache()
+    cache = JsonCache(checkpoint=True)
     roots = {}
     changed_courses_by_root = {}
     priorities = {}
@@ -664,7 +717,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                 metrics.gauge('range_task_discovery_pending_archives',len(cache.scans))
                 metrics.gauge('range_task_discovery_reads',cache.task_reads)
                 profile.milestone('first_pass')
-                stopping.wait(2)
+                # Finish bounded cold discovery promptly without spinning in steady state.
+                stopping.wait(.25 if cache.scans else 2)
         finally:
             for background, _, _ in roots.values():
                 background.stopping.set()

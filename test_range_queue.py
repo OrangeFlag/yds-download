@@ -323,6 +323,98 @@ class SharedRangeChecks(unittest.TestCase):
             d.write_json(path, changed)
             self.assertEqual(next(job for name, job in cache.tasks(directory) if name == path)['state'], 'done')
 
+    def test_task_checkpoint_restores_summaries_without_reenumerating_or_rereading_json(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory=Path(folder)/'.download/tasks';directory.mkdir(parents=True)
+            job=dict(kind='range',state='applied',course='Course',source='test',
+                     attempt=1,item=dict(path='/Course/movie.mp4',size=7,sha256='a'*64),
+                     event=dict(range_attempts=['expensive history']*100))
+            for i in range(40):
+                d.write_json(directory/f'{i:02}.json',dict(job,item=dict(job['item'],path=f'/Course/{i}.mp4')))
+            first=q.JsonCache(checkpoint=True)
+            self.assertEqual(len(first.tasks(directory)),40)
+            checkpoint=directory.parent/'tasks.index.json'
+            self.assertTrue(checkpoint.exists())
+            self.assertNotIn('expensive history',checkpoint.read_text())
+            warm=q.JsonCache(checkpoint=True)
+            original_read=Path.read_text
+            def read(path,*args,**kwargs):
+                if path.parent==directory:
+                    raise AssertionError('Task JSON reread')
+                return original_read(path,*args,**kwargs)
+            with patch.object(Path,'glob',side_effect=AssertionError('Tasks were re-enumerated')), \
+                 patch.object(Path,'read_text',new=read):
+                tasks=warm.tasks(directory)
+                self.assertEqual(len(tasks),40)
+                self.assertTrue(warm.tasks_complete(directory))
+            self.assertEqual(warm.task_reads,0)
+
+    def test_task_checkpoint_invalidates_when_tasks_are_created_changed_or_removed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory=Path(folder)/'.download/tasks';directory.mkdir(parents=True)
+            job=dict(kind='range',state='applied',course='Course',source='test',
+                     attempt=1,item=dict(path='/Course/movie.mp4',size=7,sha256='a'*64))
+            for i in range(8):d.write_json(directory/f'{i}.json',job)
+            q.JsonCache(checkpoint=True).tasks(directory)
+            d.write_json(directory/'0.json',dict(job,yandex_checked_at='2026-10-20T00:00:00+00:00'))
+            d.write_json(directory/'new.json',dict(job,state='pending'))
+            (directory/'1.json').unlink()
+            cache=q.JsonCache(checkpoint=True)
+            result=dict(cache.tasks(directory))
+            self.assertEqual(len(result),8)
+            self.assertEqual(result[directory/'0.json']['yandex_checked_at'],'2026-10-20T00:00:00+00:00')
+            self.assertEqual(result[directory/'new.json']['state'],'pending')
+            self.assertNotIn(directory/'1.json',result)
+
+    def test_task_checkpoint_aborts_restore_if_new_task_appears_during_validation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory=Path(folder)/'.download/tasks';directory.mkdir(parents=True)
+            job=dict(kind='range',state='applied',course='Course',source='test',
+                     attempt=1,item=dict(path='/Course/a.mp4',size=7,sha256='a'*64))
+            d.write_json(directory/'a.json',job)
+            q.JsonCache(checkpoint=True).tasks(directory)
+            original=q.Background.stat
+            created=[]
+            def concurrent_update(path):
+                if path == directory/'a.json' and not created:
+                    created.append(True)
+                    d.write_json(directory/'new.json',dict(job,state='pending'))
+                return original(path)
+            with patch.object(q.Background,'stat',side_effect=concurrent_update):
+                tasks=q.JsonCache(checkpoint=True).tasks(directory)
+            self.assertEqual({p.name for p,_ in tasks},{'a.json','new.json'})
+
+    def test_task_checkpoint_detects_inplace_edits_even_if_directory_unchanged(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory=Path(folder)/'.download/tasks';directory.mkdir(parents=True)
+            path=directory/'a.json'
+            job=dict(kind='range',state='applied',course='Course',source='test',
+                     attempt=1,item=dict(path='/Course/a.mp4',size=7,sha256='a'*64))
+            d.write_json(path,job)
+            q.JsonCache(checkpoint=True).tasks(directory)
+            stamp=q.Background.stat(directory)
+            path.write_text(json.dumps(dict(job,state='pending')))
+            self.assertEqual(q.Background.stat(directory),stamp,
+                             'The file was edited without a directory mutation')
+            fresh=q.JsonCache(checkpoint=True)
+            self.assertEqual(dict(fresh.tasks(directory))[path]['state'],'pending')
+            self.assertEqual(fresh.task_reads,1)
+
+    def test_corrupt_task_checkpoint_falls_back_to_task_json(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory=Path(folder)/'.download/tasks';directory.mkdir(parents=True)
+            job=dict(kind='range',state='applied',course='Course',source='test',
+                     attempt=1,item=dict(path='/Course/a.mp4',size=7,sha256='a'*64))
+            d.write_json(directory/'a.json',job)
+            q.JsonCache(checkpoint=True).tasks(directory)
+            checkpoint=directory.parent/'tasks.index.json'
+            saved=json.loads(checkpoint.read_text())
+            saved['payload']['tasks'][0][2]['state']='pending'
+            checkpoint.write_text(json.dumps(saved))
+            cache=q.JsonCache(checkpoint=True)
+            self.assertEqual(dict(cache.tasks(directory))[directory/'a.json']['state'],'applied')
+            self.assertEqual(cache.task_reads,1)
+
     def test_task_discovery_is_bounded_and_includes_changes_during_scan(self):
         with tempfile.TemporaryDirectory() as folder:
             directory = Path(folder)
@@ -406,6 +498,37 @@ class SharedRangeChecks(unittest.TestCase):
         for index in range(40):
             d.write_json(state / 'tasks' / f'zz-{index:02}.json', dict(kind='sha'))
         return state, queue
+
+    def test_incomplete_task_discovery_does_not_wait_two_seconds_between_batches(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _,queue=self._finished_archive_with_cached_range(Path(folder))
+            stopping=Event()
+            intervals=[]
+            def wait(seconds):
+                intervals.append(seconds)
+                stopping.set()
+                return True
+            with patch.object(stopping,'wait',side_effect=wait), \
+                    patch('report.update_report'):
+                q.run([queue],stopping=stopping)
+            self.assertEqual(intervals,[.25])
+
+    def test_task_checkpoint_is_not_published_before_bounded_scan_finishes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory=Path(folder)/'.download/tasks';directory.mkdir(parents=True)
+            job=dict(kind='range',state='applied',course='Course',source='test',
+                     attempt=1,item=dict(path='/Course/a.mp4',size=7,sha256='a'*64))
+            for i in range(72):d.write_json(directory/f'{i}.json',job)
+            cache=q.JsonCache(checkpoint=True)
+            self.assertEqual(len(cache.tasks(directory,limit=32)),32)
+            self.assertFalse((directory.parent/'tasks.index.json').exists())
+            self.assertFalse(cache.tasks_complete(directory))
+            for i in range(10):
+                last=cache.tasks(directory,limit=32)
+                if cache.tasks_complete(directory):break
+            self.assertTrue(cache.tasks_complete(directory))
+            self.assertEqual(len(last),72)
+            self.assertTrue((directory.parent/'tasks.index.json').exists())
 
     def test_deferred_finished_course_report_survives_stop_and_restart(self):
         with tempfile.TemporaryDirectory() as folder:
