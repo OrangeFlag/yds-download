@@ -230,6 +230,15 @@ class VolumeCatalogChecks(unittest.TestCase):
             str(path.relative_to(archive)) for path in (older,newer,rejected)})
         self.assertTrue(all(v['status']=='retained_unverified' for v in entries.values()))
 
+    def test_symlinked_corrupted_directory_cannot_inventory_another_volume(self):
+        archive, _, _ = self.archive(self.old, 'Archive 1')
+        outside=self.root/'outside'
+        outside.mkdir()
+        (archive/'corrupted').symlink_to(outside,directory=True)
+        with self.assertRaisesRegex(ValueError,'Unsafe corrupted directory'):
+            catalog.snapshot(self.old,OLD,self.host,archives=[archive])
+        self.assertFalse((self.host/'volume-catalog.json').exists())
+
     def test_corrupted_recovery_cannot_escape_the_selected_disk(self):
         archive, item, _ = self.archive(self.old,'Archive 1')
         directory=archive/'corrupted/20261020'
