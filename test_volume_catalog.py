@@ -124,6 +124,20 @@ class VolumeCatalogChecks(unittest.TestCase):
         with self.assertRaises(ValueError):
             catalog.synchronize(self.old, OLD, self.host)
 
+    def test_full_volume_uses_existing_event_checkpoint_without_writing_new_one(self):
+        archive, item, path = self.archive(self.old, 'Archive 1')
+        journal = archive / '.download/events.jsonl'
+        d.EventIndex(journal, repair=False, checkpoint=True).refresh()
+        stat = path.stat()
+        d.append_events(journal,[dict(item, status='valid',
+             mtime_ns=stat.st_mtime_ns, ctime_ns=stat.st_ctime_ns)])
+        with patch.object(d.EventIndex, 'CHECKPOINT_INTERVAL', 1), \
+                patch.object(d.EventIndex, '_save_checkpoint',
+                             side_effect=AssertionError('Snapshot must not write to full HDD')):
+            catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+        proof = catalog.load(self.host)['volumes'][OLD]['archives']['Archive 1']['files'][item['path']]
+        self.assertEqual(proof['status'],'verified')
+
     def test_unfinished_jsonl_tail_is_not_repaired_by_catalog(self):
         archive, _, _ = self.archive(self.old, 'Archive 1')
         path = archive / '.download/events.jsonl'
