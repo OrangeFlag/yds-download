@@ -164,7 +164,7 @@ class JsonCache:
                 except FileNotFoundError:
                     return
                 records[directory / name] = stat, summary
-            if len(records) != len(payload['tasks']):
+            if len(records) != len(payload['tasks']) or Background.stat(directory) != stamp:
                 return
         except (FileNotFoundError, ValueError, KeyError, TypeError, UnicodeError):
             return
