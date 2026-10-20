@@ -498,6 +498,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
     priorities = {}
     fallbacks = {}
     recheck_roots = {}
+    previous_candidates = {}
     def mark_courses(background, courses):
         marker = background.state / 'range-dirty-courses.json'
         saved = changed_courses_by_root.setdefault(background.root, set(cache.read(marker, [])))
@@ -526,6 +527,12 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                     background.poll()
                 eligible = []
                 rechecks = []
+                discovered_candidates = {}
+                early_targets = {}
+                for group, candidates in previous_candidates.items():
+                    previous = recheck_roots.get(group)
+                    if previous in candidates:
+                        early_targets[group] = candidates[(candidates.index(previous)+1) % len(candidates)]
                 recheck_times = {}
                 selected_roots = set()
                 def is_recheck(background,path):
@@ -559,12 +566,17 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                         for path in bg.futures if is_recheck(bg,path))
                 early_dispatched = Counter()
                 def dispatch_rechecks(early=False):
+                    if not rechecks or (early and all(early_dispatched[group]
+                                                      for group in range(len(recheck_limits)))):
+                        return
                     rechecks.sort(key=lambda row:recheck_times[row[2]])
                     for group,limit in enumerate(recheck_limits):
                         if early and early_dispatched[group]:
                             continue
                         while checking_active[group] < limit:
-                            options=[row for row in rechecks if min(row[0],1)==group]
+                            options=[row for row in rechecks if min(row[0],1)==group
+                                     and (not early or group not in early_targets
+                                          or row[1].root == early_targets[group])]
                             if not options:break
                             candidates=list(dict.fromkeys(row[1].root for row in options))
                             previous=recheck_roots.get(group)
@@ -688,6 +700,10 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                             if path in background.futures:
                                 continue
                             checking=is_due_recheck(job,recheck_interval)
+                            if (any(job.get('superseded_by_'+reason)
+                                    for reason in ('manifest', 'nextcloud', 'local_copy'))
+                                    or job.get('yandex_recheck') and not checking and job['state']!='applied'):
+                                continue
                             if job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or checking or fallback_due(fallback,job)):
                                 if job['source'] != background.source:
                                     raise ValueError('Range task source mismatch')
@@ -713,13 +729,19 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                     if retire_cached_copy(background, path, json.loads(path.read_text()), proofs):
                                         continue
                                 (rechecks if checking else eligible).append((priority, background, path))
-                                if checking:recheck_times[path]=(job['state']=='applied',yandex_checked_time(job))
+                                if checking:
+                                    recheck_times[path]=(job['state']=='applied',yandex_checked_time(job))
+                                    group=min(priority,1)
+                                    seen=discovered_candidates.setdefault(group,[])
+                                    if root not in seen:
+                                        seen.append(root)
                                 if checking:profile.milestone('first_recheck_candidate')
                         # Ready tasks need not wait for unrelated archives to finish discovery.
                         dispatch_regular(max(1, files-secondary_slots) if priority==0 and len(queues)>1 else files)
                         dispatch_rechecks(early=True)
                 dispatch_regular(files, reserve_secondary=False)
                 dispatch_rechecks()
+                previous_candidates = discovered_candidates
                 for root, (background, lock, config) in list(roots.items()):
                     if root not in selected_roots and not background.futures:
                         background.close()
