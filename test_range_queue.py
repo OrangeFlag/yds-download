@@ -366,6 +366,22 @@ class SharedRangeChecks(unittest.TestCase):
             self.assertEqual(result[directory/'new.json']['state'],'pending')
             self.assertNotIn(directory/'1.json',result)
 
+    def test_task_checkpoint_detects_inplace_edits_even_if_directory_unchanged(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory=Path(folder)/'.download/tasks';directory.mkdir(parents=True)
+            path=directory/'a.json'
+            job=dict(kind='range',state='applied',course='Course',source='test',
+                     attempt=1,item=dict(path='/Course/a.mp4',size=7,sha256='a'*64))
+            d.write_json(path,job)
+            q.JsonCache(checkpoint=True).tasks(directory)
+            stamp=q.Background.stat(directory)
+            path.write_text(json.dumps(dict(job,state='pending')))
+            self.assertEqual(q.Background.stat(directory),stamp,
+                             'The file was edited without a directory mutation')
+            fresh=q.JsonCache(checkpoint=True)
+            self.assertEqual(dict(fresh.tasks(directory))[path]['state'],'pending')
+            self.assertEqual(fresh.task_reads,1)
+
     def test_corrupt_task_checkpoint_falls_back_to_task_json(self):
         with tempfile.TemporaryDirectory() as folder:
             directory=Path(folder)/'.download/tasks';directory.mkdir(parents=True)
