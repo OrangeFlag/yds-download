@@ -212,6 +212,24 @@ class VolumeCatalogChecks(unittest.TestCase):
         self.assertFalse(record['has_ranges'])
         self.assertFalse(record['has_aria2'])
 
+    def test_replaced_recovery_body_preserves_older_raw_versions_in_inventory(self):
+        archive, item, _ = self.archive(self.old, 'Archive 1')
+        older = archive/'corrupted/first/Course/Lecture.mp4'
+        newer = archive/'corrupted/second/Course/Lecture.mp4'
+        rejected = archive/'corrupted/rejected/Course/Lecture.mp4'
+        for path in (older, newer, rejected):
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b'old raw data')
+        d.write_json(archive/'corrupted/second/failed.json', [dict(
+            item, time='2026-10-20', corrupted_path=str(newer.relative_to(archive)),
+            preserved_archive_paths=[str(older.relative_to(archive))],
+            sha256_rejected_paths=[str(rejected.relative_to(archive))])])
+        catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+        entries=catalog.load(self.host)['volumes'][OLD]['archives']['Archive 1']['recovery']
+        self.assertEqual(set(entries), {
+            str(path.relative_to(archive)) for path in (older,newer,rejected)})
+        self.assertTrue(all(v['status']=='retained_unverified' for v in entries.values()))
+
     def test_corrupted_recovery_cannot_escape_the_selected_disk(self):
         archive, item, _ = self.archive(self.old,'Archive 1')
         directory=archive/'corrupted/20261020'
