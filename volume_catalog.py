@@ -265,8 +265,13 @@ def main(argv=None):
             result = load(args.state_dir) or dict(volumes={})
             for identity, volume in result['volumes'].items():
                 records = [f for a in volume['archives'].values() for f in a['files'].values()]
+                recovery = [entry for archive in volume['archives'].values()
+                            for entry in archive.get('recovery', {}).values()
+                            if entry['status'] == 'retained_unverified']
                 print(f'{volume["label"]}: UUID={identity}; files={len(records)}; '
-                      f'verified_last_seen={sum(f["status"] == "verified" for f in records)}')
+                      f'verified_last_seen={sum(f["status"] == "verified" for f in records)}; '
+                      f'corrupted_bodies={len(recovery)}; '
+                      f'corrupted_logical_bytes={sum(e["body_bytes"] for e in recovery)}')
         else:
             if not args.uuid or args.mount is None:
                 parser.error('snapshot/sync require --uuid and --mount')
