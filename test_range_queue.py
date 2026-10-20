@@ -530,6 +530,44 @@ class SharedRangeChecks(unittest.TestCase):
                       recheck_interval=1, recheck_files=2, stopping=stopping)
             self.assertIn('/Course/video.mp4', submitted)
 
+    def test_recheck_revalidates_task_before_submit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state, queue = self._finished_archive_with_cached_range(Path(folder))
+            path = state / 'tasks/00.json'
+            job = json.loads(path.read_text())
+            job.update(state='applied', result={'event': {'status': 'missing'}})
+            d.write_json(path, job)
+            d.write_json(state / 'local-copies.json', [])
+            stopping = Event()
+            submitted = []
+            original_tasks = q.JsonCache.tasks
+            changed = []
+
+            def tasks(cache, directory, limit=None):
+                result = original_tasks(cache, directory, limit)
+                if directory == state / 'tasks' and not changed:
+                    saved = json.loads(path.read_text())
+                    saved['superseded_by_nextcloud'] = True
+                    d.write_json(path, saved)
+                    changed.append(True)
+                return result
+
+            def submit(background, kind, item, *args, **kwargs):
+                if kwargs.get('yandex_recheck'):
+                    submitted.append(item['path'])
+
+            def wait(_):
+                stopping.set()
+                return True
+
+            with patch.object(q.JsonCache, 'tasks', tasks), \
+                 patch.object(q.Background, 'submit', submit), \
+                 patch.object(stopping, 'wait', side_effect=wait), \
+                 patch('report.update_report'):
+                q.run([queue], recheck_interval=1, recheck_files=1, stopping=stopping)
+            self.assertTrue(changed)
+            self.assertEqual(submitted, [], 'Superseded task was rechecked')
+
     def test_incomplete_task_discovery_does_not_wait_two_seconds_between_batches(self):
         with tempfile.TemporaryDirectory() as folder:
             _,queue=self._finished_archive_with_cached_range(Path(folder))
