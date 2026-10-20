@@ -2,7 +2,7 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/offline-corrupted-inventory-20261020]
   workflow_dispatch:
 
 jobs:
