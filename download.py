@@ -50,6 +50,7 @@ def sha256_file(path, stopping=None):
                 if stopping is not None and stopping.is_set():
                     raise InterruptedError('SHA interrupted')
                 digest.update(chunk)
+            os.fsync(stream.fileno())
         after = path.stat()
         if file_hashes.proof_stat(before) != file_hashes.proof_stat(after):
             raise OSError('File changed during SHA verification')
