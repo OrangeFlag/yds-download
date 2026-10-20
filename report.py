@@ -305,6 +305,8 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
     changes = []
     reports = []
     totals = {}
+    from volume_catalog import from_environment
+    offline_index = from_environment()
     known_paths = events.keys() | known_external.keys() | known_partial.keys()
     for card in sorted((repo / 'courses').glob('*.md')):
         original = card.read_text(encoding='utf-8')
@@ -344,6 +346,9 @@ def _update_report(destination, repo, mark, git_push=False, message=None, stoppi
                 final = terminal.get(normalized(event['path']))
                 if status != 'valid' and (not final or final['time'] < event['time']):
                     status = 'pending'
+            # A historical copy on another volume keeps its owner mark, not a local-file proof.
+            if offline_index and key in expected and offline_index.lookup(expected[key]):
+                status = 'valid'
             copies = [cell.strip() for cell in cells[2:]]
             partial_prefix = mark + ' (partially available;'
             if status == 'valid':
