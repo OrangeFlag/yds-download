@@ -481,6 +481,37 @@ class SharedRangeChecks(unittest.TestCase):
             d.write_json(state / 'tasks' / f'zz-{index:02}.json', dict(kind='sha'))
         return state, queue
 
+    def test_incomplete_task_discovery_does_not_wait_two_seconds_between_batches(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _,queue=self._finished_archive_with_cached_range(Path(folder))
+            stopping=Event()
+            intervals=[]
+            def wait(seconds):
+                intervals.append(seconds)
+                stopping.set()
+                return True
+            with patch.object(stopping,'wait',side_effect=wait), \
+                    patch('report.update_report'):
+                q.run([queue],stopping=stopping)
+            self.assertEqual(intervals,[.25])
+
+    def test_task_checkpoint_is_not_published_before_bounded_scan_finishes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory=Path(folder)/'.download/tasks';directory.mkdir(parents=True)
+            job=dict(kind='range',state='applied',course='Course',source='test',
+                     attempt=1,item=dict(path='/Course/a.mp4',size=7,sha256='a'*64))
+            for i in range(72):d.write_json(directory/f'{i}.json',job)
+            cache=q.JsonCache(checkpoint=True)
+            self.assertEqual(len(cache.tasks(directory,limit=32)),32)
+            self.assertFalse((directory.parent/'tasks.index.json').exists())
+            self.assertFalse(cache.tasks_complete(directory))
+            for i in range(10):
+                last=cache.tasks(directory,limit=32)
+                if cache.tasks_complete(directory):break
+            self.assertTrue(cache.tasks_complete(directory))
+            self.assertEqual(len(last),72)
+            self.assertTrue((directory.parent/'tasks.index.json').exists())
+
     def test_deferred_finished_course_report_survives_stop_and_restart(self):
         with tempfile.TemporaryDirectory() as folder:
             state, queue = self._finished_archive_with_cached_range(Path(folder))
