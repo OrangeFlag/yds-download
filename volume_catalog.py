@@ -2,7 +2,6 @@
 """Remember verified files on removable volumes without requiring simultaneous mounts."""
 import argparse
 from contextlib import contextmanager
-from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
