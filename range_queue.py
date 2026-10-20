@@ -538,6 +538,28 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                               force=job['state']=='applied',fallback_only=job['state']=='applied')
                         active += 1
 
+                checking_active=Counter(min(priorities[bg.root],1) for bg,_,_ in roots.values()
+                                        for path in bg.futures if is_recheck(bg,path))
+                def dispatch_rechecks(early=False):
+                    rechecks.sort(key=lambda row:recheck_times[row[2]])
+                    for group,limit in enumerate(recheck_limits):
+                        while checking_active[group] < (min(limit, 1) if early else limit):
+                            options=[row for row in rechecks if min(row[0],1)==group]
+                            if not options:break
+                            candidates=list(dict.fromkeys(row[1].root for row in options))
+                            previous=recheck_roots.get(group)
+                            root=candidates[(candidates.index(previous)+1)%len(candidates)] if previous in candidates else candidates[0]
+                            row=next(row for row in options if row[1].root==root);rechecks.remove(row)
+                            _,background,path=row
+                            with profile.stage('recheck_submit', path):
+                                job=json.loads(path.read_text())
+                                event=job.get('result',{}).get('event') or job['event']
+                                print('YANDEX RECHECK START: '+str(background.root)+job['item']['path'],flush=True)
+                                background.submit('range',job['item'],job['course'],job['attempt'],event,
+                                                  force=job['state']=='applied',yandex_recheck=True)
+                                profile.milestone('first_recheck_submit')
+                            recheck_roots[group]=root;checking_active[group]+=1
+
                 for priority, queue in enumerate(queues):
                     config = storage.read_queue(queue, cache.read(queue))
                     archives=list(config['archives'])
@@ -660,29 +682,12 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                         continue
                                 (rechecks if checking else eligible).append((priority, background, path))
                                 if checking:recheck_times[path]=(job['state']=='applied',yandex_checked_time(job))
+                                if checking:profile.milestone('first_recheck_candidate')
                         # Ready tasks need not wait for unrelated archives to finish discovery.
                         dispatch_regular(max(1, files-secondary_slots) if priority==0 and len(queues)>1 else files)
+                        dispatch_rechecks(early=True)
                 dispatch_regular(files, reserve_secondary=False)
-                checking_active=Counter(min(priorities[bg.root],1) for bg,_,_ in roots.values()
-                                        for path in bg.futures if is_recheck(bg,path))
-                rechecks.sort(key=lambda row:recheck_times[row[2]])
-                for group,limit in enumerate(recheck_limits):
-                    while checking_active[group]<limit:
-                        options=[row for row in rechecks if min(row[0],1)==group]
-                        if not options:break
-                        candidates=list(dict.fromkeys(row[1].root for row in options))
-                        previous=recheck_roots.get(group)
-                        root=candidates[(candidates.index(previous)+1)%len(candidates)] if previous in candidates else candidates[0]
-                        row=next(row for row in options if row[1].root==root);rechecks.remove(row)
-                        _,background,path=row
-                        with profile.stage('recheck_submit', path):
-                            job=json.loads(path.read_text())
-                            event=job.get('result',{}).get('event') or job['event']
-                            profile.milestone('first_recheck_submit')
-                            print('YANDEX RECHECK START: '+str(background.root)+job['item']['path'],flush=True)
-                            background.submit('range',job['item'],job['course'],job['attempt'],event,
-                                              force=job['state']=='applied',yandex_recheck=True)
-                        recheck_roots[group]=root;checking_active[group]+=1
+                dispatch_rechecks()
                 for root, (background, lock, config) in list(roots.items()):
                     if root not in selected_roots and not background.futures:
                         background.close()
