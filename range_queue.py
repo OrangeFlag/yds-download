@@ -58,6 +58,7 @@ class DiscoveryProfile:
         self.metrics = metrics
         self.first_pass = True
         self.milestones = set()
+        self.milestone_lock = Lock()
         self.active = ('idle', '')
 
     def log(self, prefix, row):
@@ -116,14 +117,15 @@ class DiscoveryProfile:
                 counts['json_reads'] = cache.json_reads - reads
 
     def milestone(self, name):
-        if name in self.milestones:
-            return
-        self.milestones.add(name)
-        seconds = max(0, time.monotonic() - PROCESS_STARTED)
-        self.metrics.gauge('range_startup_' + name + '_seconds', seconds)
-        if name == 'first_pass':
-            self.first_pass = False
-        self.log('RANGE STARTUP: ', dict(milestone=name, seconds=seconds))
+        with self.milestone_lock:
+            if name in self.milestones:
+                return
+            self.milestones.add(name)
+            seconds = max(0, time.monotonic() - PROCESS_STARTED)
+            self.metrics.gauge('range_startup_' + name + '_seconds', seconds)
+            if name == 'first_pass':
+                self.first_pass = False
+            self.log('RANGE STARTUP: ', dict(milestone=name, seconds=seconds))
 
 
 class JsonCache:
@@ -135,7 +137,7 @@ class JsonCache:
         self.scans = {}
         self.checkpoint_writes = {}
         self.checkpoint_loads = 0
-        self.task_reads = self.json_reads = 0
+        self.task_reads = self.json_reads = self.task_stats = 0
 
     def _checkpoint_path(self, directory):
         return directory.parent / 'tasks.index.json'
@@ -159,6 +161,7 @@ class JsonCache:
                 if summary is not None and (not isinstance(summary, dict) or summary.get('kind') != 'range'):
                     return
                 try:
+                    self.task_stats += 1
                     if Background.stat(directory / name) != stat:
                         return
                 except FileNotFoundError:
@@ -202,7 +205,7 @@ class JsonCache:
     def tasks(self, directory, limit=None):
         if self.profile is None:
             return self._tasks(directory, limit)
-        reads, loads = self.task_reads, self.checkpoint_loads
+        reads, loads, stats = self.task_reads, self.checkpoint_loads, self.task_stats
         with self.profile.stage('tasks', directory) as counts:
             try:
                 result = self._tasks(directory, limit)
@@ -210,6 +213,7 @@ class JsonCache:
                 return result
             finally:
                 counts['json_reads'] = self.task_reads - reads
+                counts['task_stats'] = self.task_stats - stats
                 counts['checkpoint_loads'] = self.checkpoint_loads - loads
 
     def _paths(self, directory):
@@ -248,6 +252,7 @@ class JsonCache:
                 complete = True
                 break
             try:
+                self.task_stats += 1
                 file_stamp = Background.stat(path)
             except FileNotFoundError:
                 continue
@@ -279,6 +284,7 @@ class JsonCache:
                 continue
             if latest != scan[0]:
                 try:
+                    self.task_stats += 1
                     if Background.stat(path) != file_stamp:
                         continue
                 except FileNotFoundError:
@@ -427,6 +433,14 @@ def recheck_due(job, interval, timestamp=None):
     if not last:return True
     return (time.time() if timestamp is None else timestamp)-last>=interval
 
+def is_due_recheck(job, interval):
+    return bool(interval and job.get('kind') == 'range'
+                and not any(job.get('superseded_by_' + reason)
+                            for reason in ('manifest', 'nextcloud', 'local_copy'))
+                and (job.get('yandex_recheck') and job.get('state') != 'applied'
+                     or recheck_due(job, interval)))
+
+
 
 def seed_legacy_tasks(background):
     """Convert legacy failed manifests to replayable tasks under the archive lock."""
@@ -482,6 +496,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
     priorities = {}
     fallbacks = {}
     recheck_roots = {}
+    previous_candidates = {}
     def mark_courses(background, courses):
         marker = background.state / 'range-dirty-courses.json'
         saved = changed_courses_by_root.setdefault(background.root, set(cache.read(marker, [])))
@@ -498,6 +513,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
         cache.profile = profile
         try:
             while not stopping.is_set():
+                pass_started = time.monotonic()
                 for queue in queues:
                     storage.check(queue)
                 # Poll applies every result under the archive's exclusive download lock.
@@ -509,6 +525,12 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                     background.poll()
                 eligible = []
                 rechecks = []
+                discovered_candidates = {}
+                early_targets = {}
+                for group, candidates in previous_candidates.items():
+                    previous = recheck_roots.get(group)
+                    if previous in candidates:
+                        early_targets[group] = candidates[(candidates.index(previous)+1) % len(candidates)]
                 recheck_times = {}
                 selected_roots = set()
                 def is_recheck(background,path):
@@ -537,6 +559,47 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                             background.submit('range', job['item'], job['course'], job['attempt'], job['event'],
                                               force=job['state']=='applied',fallback_only=job['state']=='applied')
                         active += 1
+
+                checking_active=Counter(min(priorities[bg.root],1) for bg,_,_ in roots.values()
+                                        for path in bg.futures if is_recheck(bg,path))
+                early_dispatched = Counter()
+                def dispatch_rechecks(early=False):
+                    if not rechecks or (early and all(early_dispatched[min(row[0], 1)]
+                                                      for row in rechecks)):
+                        return
+                    rechecks.sort(key=lambda row:recheck_times[row[2]])
+                    for group,limit in enumerate(recheck_limits):
+                        if early and early_dispatched[group]:
+                            continue
+                        while checking_active[group] < limit:
+                            options=[row for row in rechecks if min(row[0],1)==group
+                                     and (not early or group not in early_targets
+                                          or row[1].root == early_targets[group])]
+                            if not options:break
+                            candidates=list(dict.fromkeys(row[1].root for row in options))
+                            previous=recheck_roots.get(group)
+                            root=candidates[(candidates.index(previous)+1)%len(candidates)] if previous in candidates else candidates[0]
+                            row=next(row for row in options if row[1].root==root);rechecks.remove(row)
+                            _,background,path=row
+                            with profile.stage('recheck_submit', path):
+                                try:
+                                    job=json.loads(path.read_text())
+                                except FileNotFoundError:
+                                    continue
+                                if (not is_due_recheck(job,recheck_interval)
+                                        or job['source']!=background.source
+                                        or background.manifest_items.get((job['course'],job['item']['path']))
+                                           != (job['item']['size'],job['item']['sha256'])):
+                                    continue
+                                event=job.get('result',{}).get('event') or job['event']
+                                print('YANDEX RECHECK START: '+str(background.root)+job['item']['path'],flush=True)
+                                background.submit('range',job['item'],job['course'],job['attempt'],event,
+                                                  force=job['state']=='applied',yandex_recheck=True)
+                                profile.milestone('first_recheck_submit')
+                            recheck_roots[group]=root;checking_active[group]+=1
+                            if early:
+                                early_dispatched[group] += 1
+                                break
 
                 for priority, queue in enumerate(queues):
                     config = storage.read_queue(queue, cache.read(queue))
@@ -612,6 +675,7 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                             background.event_index = EventIndex(state / 'events.jsonl', checkpoint=True)
                             background.cached_events = profile.events(background.event_index)
                             background.task_cache = cache
+                            background.recheck_request = lambda: profile.milestone('first_recheck_range_request')
                             if legacy:
                                 seed_legacy_tasks(background)
                                 tasks=cache.tasks(state/'tasks', limit=32)
@@ -633,7 +697,10 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                         for path, job in tasks:
                             if path in background.futures:
                                 continue
-                            checking=bool(recheck_interval and (job.get('yandex_recheck') and job['state']!='applied' or recheck_due(job,recheck_interval)))
+                            checking=is_due_recheck(job,recheck_interval)
+                            if any(job.get('superseded_by_'+reason)
+                                   for reason in ('manifest', 'nextcloud', 'local_copy')):
+                                continue
                             if job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or checking or fallback_due(fallback,job)):
                                 if job['source'] != background.source:
                                     raise ValueError('Range task source mismatch')
@@ -659,30 +726,19 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                                     if retire_cached_copy(background, path, json.loads(path.read_text()), proofs):
                                         continue
                                 (rechecks if checking else eligible).append((priority, background, path))
-                                if checking:recheck_times[path]=(job['state']=='applied',yandex_checked_time(job))
+                                if checking:
+                                    recheck_times[path]=(job['state']=='applied',yandex_checked_time(job))
+                                    group=min(priority,1)
+                                    seen=discovered_candidates.setdefault(group,[])
+                                    if root not in seen:
+                                        seen.append(root)
+                                if checking:profile.milestone('first_recheck_candidate')
                         # Ready tasks need not wait for unrelated archives to finish discovery.
                         dispatch_regular(max(1, files-secondary_slots) if priority==0 and len(queues)>1 else files)
+                        dispatch_rechecks(early=True)
                 dispatch_regular(files, reserve_secondary=False)
-                checking_active=Counter(min(priorities[bg.root],1) for bg,_,_ in roots.values()
-                                        for path in bg.futures if is_recheck(bg,path))
-                rechecks.sort(key=lambda row:recheck_times[row[2]])
-                for group,limit in enumerate(recheck_limits):
-                    while checking_active[group]<limit:
-                        options=[row for row in rechecks if min(row[0],1)==group]
-                        if not options:break
-                        candidates=list(dict.fromkeys(row[1].root for row in options))
-                        previous=recheck_roots.get(group)
-                        root=candidates[(candidates.index(previous)+1)%len(candidates)] if previous in candidates else candidates[0]
-                        row=next(row for row in options if row[1].root==root);rechecks.remove(row)
-                        _,background,path=row
-                        with profile.stage('recheck_submit', path):
-                            job=json.loads(path.read_text())
-                            event=job.get('result',{}).get('event') or job['event']
-                            profile.milestone('first_recheck_submit')
-                            print('YANDEX RECHECK START: '+str(background.root)+job['item']['path'],flush=True)
-                            background.submit('range',job['item'],job['course'],job['attempt'],event,
-                                              force=job['state']=='applied',yandex_recheck=True)
-                        recheck_roots[group]=root;checking_active[group]+=1
+                dispatch_rechecks()
+                previous_candidates = discovered_candidates
                 for root, (background, lock, config) in list(roots.items()):
                     if root not in selected_roots and not background.futures:
                         background.close()
@@ -716,6 +772,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                 metrics.gauge('archives_owned',len(roots))
                 metrics.gauge('range_task_discovery_pending_archives',len(cache.scans))
                 metrics.gauge('range_task_discovery_reads',cache.task_reads)
+                metrics.add(range_discovery_passes=1,
+                            range_discovery_pass_wall_seconds=time.monotonic()-pass_started)
                 profile.milestone('first_pass')
                 # Finish bounded cold discovery promptly without spinning in steady state.
                 stopping.wait(.25 if cache.scans else 2)

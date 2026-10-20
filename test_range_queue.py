@@ -72,6 +72,7 @@ class DiscoveryProfileChecks(unittest.TestCase):
         self.assertEqual(self.metrics.counters['range_discovery_task_enumeration_calls'],1)
         self.assertEqual(self.metrics.counters['range_discovery_task_enumeration_entries'],5)
         self.assertEqual(self.metrics.counters['range_discovery_tasks_json_reads'],5)
+        self.assertEqual(self.metrics.counters['range_discovery_tasks_task_stats'],5)
 
     def test_manifest_profile_does_not_reload_unchanged_json(self):
         d.write_json(self.root/'courses.json',['Course'])
@@ -348,6 +349,9 @@ class SharedRangeChecks(unittest.TestCase):
                 self.assertEqual(len(tasks),40)
                 self.assertTrue(warm.tasks_complete(directory))
             self.assertEqual(warm.task_reads,0)
+            self.assertEqual(warm.task_stats,40, 'Cold restart validates each indexed task')
+            warm.tasks(directory)
+            self.assertEqual(warm.task_stats,40, 'Unchanged passes must not stat every task')
 
     def test_task_checkpoint_invalidates_when_tasks_are_created_changed_or_removed(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -498,6 +502,155 @@ class SharedRangeChecks(unittest.TestCase):
         for index in range(40):
             d.write_json(state / 'tasks' / f'zz-{index:02}.json', dict(kind='sha'))
         return state, queue
+
+    def test_recheck_starts_before_discovering_later_archive(self):
+        with tempfile.TemporaryDirectory() as folder:
+            first, personal = self._finished_archive_with_cached_range(Path(folder) / 'personal')
+            second, courses = self._finished_archive_with_cached_range(Path(folder) / 'courses')
+            path = first / 'tasks/00.json'
+            job = json.loads(path.read_text())
+            job.update(state='applied', result={'event': {'status': 'missing'}})
+            d.write_json(path, job)
+            d.write_json(first / 'local-copies.json', [])
+            stopping = Event()
+            submitted = []
+            original_tasks = q.JsonCache.tasks
+
+            def tasks(cache, directory, limit=None):
+                if directory == second / 'tasks':
+                    self.assertEqual(submitted, ['/Course/video.mp4'],
+                                     'Recheck waited for unrelated archive discovery')
+                    stopping.set()
+                return original_tasks(cache, directory, limit)
+
+            def submit(background, kind, item, *args, **kwargs):
+                if kwargs.get('yandex_recheck'):
+                    submitted.append(item['path'])
+
+            with patch.object(q.JsonCache, 'tasks', tasks), \
+                 patch.object(q.Background, 'submit', submit), \
+                 patch('report.update_report'):
+                q.run([personal, courses], files=2, secondary_slots=1,
+                      recheck_interval=1, recheck_files=2, stopping=stopping)
+            self.assertIn('/Course/video.mp4', submitted)
+
+    def test_done_verified_recheck_still_replays_before_applied(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state, queue = self._finished_archive_with_cached_range(Path(folder))
+            path = state / 'tasks/00.json'
+            job = json.loads(path.read_text())
+            job.update(state='done', yandex_recheck=True,
+                       result={'event': {'status': 'valid', 'range_recovered_complete': True}})
+            d.write_json(path, job)
+            d.write_json(state / 'local-copies.json', [])
+            stopping = Event()
+            submitted = []
+
+            def submit(background, kind, item, *args, **kwargs):
+                submitted.append((item['path'], kwargs.get('yandex_recheck')))
+
+            with patch.object(q.Background, 'submit', submit), \
+                 patch.object(stopping, 'wait', side_effect=lambda _: stopping.set() or True), \
+                 patch('report.update_report'):
+                q.run([queue], files=1, recheck_interval=1, recheck_files=1, stopping=stopping)
+            self.assertEqual(submitted, [('/Course/video.mp4', True)],
+                             'Unapplied done result must be replayed after a crash')
+
+    def test_pending_superseded_recheck_does_not_become_regular_range(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state, queue = self._finished_archive_with_cached_range(Path(folder))
+            path = state / 'tasks/00.json'
+            job = json.loads(path.read_text())
+            job.update(state='pending', yandex_recheck=True, superseded_by_nextcloud=True,
+                       result={'event': {'status': 'missing'}})
+            d.write_json(path, job)
+            d.write_json(state / 'local-copies.json', [])
+            stopping = Event()
+            submitted = []
+            with patch.object(q.Background, 'submit',
+                              side_effect=lambda *args, **kwargs: submitted.append(args[1]['path'])), \
+                 patch.object(stopping, 'wait',
+                              side_effect=lambda _: stopping.set() or True), \
+                 patch('report.update_report'):
+                q.run([queue], files=1, recheck_interval=1, recheck_files=1, stopping=stopping)
+            self.assertEqual(submitted, [], 'Superseded Recheck must never fall through to Range')
+
+    def test_early_rechecks_rotate_across_three_archives(self):
+        with tempfile.TemporaryDirectory() as folder:
+            archives = []
+            queue = None
+            for name in ('first', 'second', 'third'):
+                root = Path(folder) / name
+                state, candidate = self._finished_archive_with_cached_range(root)
+                queue = queue or candidate
+                path = state / 'tasks/00.json'
+                job = json.loads(path.read_text())
+                job.update(state='applied', result={'event': {'status': 'missing'}})
+                d.write_json(path, job)
+                d.write_json(state / 'local-copies.json', [])
+                archives.append(dict(destination=str(root), catalog=str(state / 'catalog.json'),
+                                     state='finished'))
+            d.write_json(queue, dict(archives=archives))
+            stopping = Event()
+            selected = []
+            passes = 0
+
+            def submit(background, kind, item, *args, **kwargs):
+                if kwargs.get('yandex_recheck'):
+                    selected.append(background.root.name)
+
+            def wait(_):
+                nonlocal passes
+                passes += 1
+                if passes >= 3:
+                    stopping.set()
+                return stopping.is_set()
+
+            with patch.object(q.Background, 'submit', submit), \
+                 patch.object(stopping, 'wait', side_effect=wait), \
+                 patch('report.update_report'):
+                q.run([queue], files=1, recheck_interval=1, recheck_files=1,
+                      stopping=stopping)
+            self.assertEqual(selected, ['first', 'second', 'third'],
+                             'Early dispatch must not starve later archives')
+
+    def test_recheck_revalidates_task_before_submit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state, queue = self._finished_archive_with_cached_range(Path(folder))
+            path = state / 'tasks/00.json'
+            job = json.loads(path.read_text())
+            job.update(state='applied', result={'event': {'status': 'missing'}})
+            d.write_json(path, job)
+            d.write_json(state / 'local-copies.json', [])
+            stopping = Event()
+            submitted = []
+            original_tasks = q.JsonCache.tasks
+            changed = []
+
+            def tasks(cache, directory, limit=None):
+                result = original_tasks(cache, directory, limit)
+                if directory == state / 'tasks' and not changed:
+                    saved = json.loads(path.read_text())
+                    saved['superseded_by_nextcloud'] = True
+                    d.write_json(path, saved)
+                    changed.append(True)
+                return result
+
+            def submit(background, kind, item, *args, **kwargs):
+                if kwargs.get('yandex_recheck'):
+                    submitted.append(item['path'])
+
+            def wait(_):
+                stopping.set()
+                return True
+
+            with patch.object(q.JsonCache, 'tasks', tasks), \
+                 patch.object(q.Background, 'submit', submit), \
+                 patch.object(stopping, 'wait', side_effect=wait), \
+                 patch('report.update_report'):
+                q.run([queue], recheck_interval=1, recheck_files=1, stopping=stopping)
+            self.assertTrue(changed)
+            self.assertEqual(submitted, [], 'Superseded task was rechecked')
 
     def test_incomplete_task_discovery_does_not_wait_two_seconds_between_batches(self):
         with tempfile.TemporaryDirectory() as folder:
