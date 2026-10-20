@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager
 import fcntl
+from functools import lru_cache
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+from threading import RLock
 import time
 import uuid as uuidlib
 
@@ -65,44 +67,52 @@ class OfflineIndex:
         self.current_uuid = str(uuidlib.UUID(current_uuid))
         path = Path(state_dir).expanduser()
         self.state_dir = path.parent if path.name == CATALOG else path
+        self.lock = RLock()
         self.stamp = None
         self.files = {}
         self._refresh()
 
     def _refresh(self):
-        current = (self.state_dir / CATALOG).stat()
-        stamp = (current.st_dev, current.st_ino, current.st_size,
-                 current.st_mtime_ns, current.st_ctime_ns)
-        if stamp == self.stamp:
-            return
-        saved = load(self.state_dir)
-        if saved is None:
-            raise ValueError('Configured volume catalog is missing')
-        files = {}
-        try:
-            for identity, volume in saved['volumes'].items():
-                rows = [row for archive in volume['archives'].values()
-                        for row in archive['files'].values()]
-                rows.extend(volume.get('supplementary', {}).values())
-                for row in rows:
-                    key = _content_key(row)
-                    if row['status'] != 'verified':
-                        continue
-                    local = row['local']
-                    if (not isinstance(local, str) or not local or Path(local).is_absolute()
-                            or '..' in Path(local).parts or local == '.'):
-                        raise ValueError('Unsafe catalog local path')
-                    if str(uuidlib.UUID(identity)) != self.current_uuid:
-                        files.setdefault(key, dict(volume_uuid=identity, local=local,
-                                                   size=key[1], sha256=key[0]))
-        except (AttributeError, KeyError, TypeError) as error:
-            raise ValueError('Damaged volume catalog file records') from error
-        self.files, self.stamp = files, stamp
+        with self.lock:
+            current = (self.state_dir / CATALOG).stat()
+            stamp = (current.st_dev, current.st_ino, current.st_size,
+                     current.st_mtime_ns, current.st_ctime_ns)
+            if stamp == self.stamp:
+                return
+            saved = load(self.state_dir)
+            if saved is None:
+                raise ValueError('Configured volume catalog is missing')
+            files = {}
+            try:
+                for identity, volume in saved['volumes'].items():
+                    rows = [row for archive in volume['archives'].values()
+                            for row in archive['files'].values()]
+                    rows.extend(volume.get('supplementary', {}).values())
+                    for row in rows:
+                        key = _content_key(row)
+                        if row['status'] != 'verified':
+                            continue
+                        local = row['local']
+                        if (not isinstance(local, str) or not local or Path(local).is_absolute()
+                                or '..' in Path(local).parts or local == '.'):
+                            raise ValueError('Unsafe catalog local path')
+                        if str(uuidlib.UUID(identity)) != self.current_uuid:
+                            files.setdefault(key, dict(volume_uuid=identity, local=local,
+                                                       size=key[1], sha256=key[0]))
+            except (AttributeError, KeyError, TypeError) as error:
+                raise ValueError('Damaged volume catalog file records') from error
+            self.files, self.stamp = files, stamp
 
     def lookup(self, item):
-        self._refresh()
-        proof = self.files.get(_content_key(item))
-        return dict(proof) if proof is not None else None
+        with self.lock:
+            self._refresh()
+            proof = self.files.get(_content_key(item))
+            return dict(proof) if proof is not None else None
+
+
+@lru_cache(maxsize=4)
+def _configured_index(directory, identity):
+    return OfflineIndex(directory, identity)
 
 
 def from_environment():
@@ -111,7 +121,9 @@ def from_environment():
         return None
     if not directory or not identity:
         raise ValueError('YDS_VOLUME_CATALOG and YDS_VOLUME_UUID must be configured together')
-    return OfflineIndex(directory, identity)
+    index = _configured_index(directory, identity)
+    index._refresh()
+    return index
 
 
 def _merge(*catalogs):

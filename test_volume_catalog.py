@@ -1,4 +1,5 @@
 """Sequential-disk catalog: offline volumes remain known without mounting them."""
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -74,6 +75,25 @@ class VolumeCatalogChecks(unittest.TestCase):
         self.online = {OLD: self.old}
         catalog.snapshot(self.old, OLD, self.host, archives=[archive])
         self.assertIsNone(index.lookup(item))
+
+    def test_environment_reuses_index_and_refreshes_shared_concurrent_readers(self):
+        archive, item, local = self.archive(self.old, 'Archive 1')
+        catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+        with patch.dict(os.environ, dict(YDS_VOLUME_CATALOG=str(self.host), YDS_VOLUME_UUID=NEW)):
+            index = catalog.from_environment()
+            with patch.object(catalog, 'load', wraps=catalog.load) as reading:
+                self.assertIs(catalog.from_environment(), index)
+                self.assertEqual(reading.call_count, 0)
+                local.unlink()
+                catalog.snapshot(self.old, OLD, self.host, archives=[archive])
+                reading.reset_mock()
+                def lookup(_):
+                    current = catalog.from_environment()
+                    return current is index, current.lookup(item)
+                with ThreadPoolExecutor(max_workers=8) as workers:
+                    results = list(workers.map(lookup, range(32)))
+                self.assertEqual(results, [(True, None)] * 32)
+                self.assertEqual(reading.call_count, 1)
 
     def test_configured_index_rejects_missing_corrupt_and_unsafe_proofs(self):
         with patch.dict(os.environ, {}, clear=True):
