@@ -434,11 +434,9 @@ def recheck_due(job, interval, timestamp=None):
     return (time.time() if timestamp is None else timestamp)-last>=interval
 
 def is_due_recheck(job, interval):
-    event = job.get('result', {}).get('event', {})
     return bool(interval and job.get('kind') == 'range'
                 and not any(job.get('superseded_by_' + reason)
                             for reason in ('manifest', 'nextcloud', 'local_copy'))
-                and not event.get('range_recovered_complete') and event.get('status') != 'valid'
                 and (job.get('yandex_recheck') and job.get('state') != 'applied'
                      or recheck_due(job, interval)))
 
@@ -700,9 +698,8 @@ def run(queues, files=4, per_file=2, requests=12, rps=12, stopping=None, seconda
                             if path in background.futures:
                                 continue
                             checking=is_due_recheck(job,recheck_interval)
-                            if (any(job.get('superseded_by_'+reason)
-                                    for reason in ('manifest', 'nextcloud', 'local_copy'))
-                                    or job.get('yandex_recheck') and not checking and job['state']!='applied'):
+                            if any(job.get('superseded_by_'+reason)
+                                   for reason in ('manifest', 'nextcloud', 'local_copy')):
                                 continue
                             if job['kind'] == 'range' and (job['state'] in ('pending', 'running', 'done') or checking or fallback_due(fallback,job)):
                                 if job['source'] != background.source:
